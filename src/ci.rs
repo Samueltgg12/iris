@@ -571,17 +571,22 @@ fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
         return Response::err("screenshot: missing 'path' arg");
     };
 
-    // Snapshot the framebuffer under the screen lock; unlock before the PNG
-    // encode so the refresh thread isn't blocked during disk I/O.
+    // Composite on the CPU: `screen.rgba` is only filled by a GL renderer, and
+    // windowless `--ci` has none. Unlock before the PNG encode.
     let (width, height, rgba_copy) = {
         let screen = display.screen().lock();
         let w = screen.width;
         let h = screen.height;
+        let mut sw = crate::compositor::SwCompositor::new();
+        if w > 0 && h > 0 {
+            sw.compose_pixels(&screen.compositor_source());
+        }
+        let pixels = sw.pixels();
         let mut out = Vec::with_capacity(w * h);
-        // `rgba` has row stride 2048; copy the visible window.
+        // Composited pixels have row stride 2048; copy the visible window.
         for y in 0..h {
             let base = y * 2048;
-            out.extend_from_slice(&screen.rgba[base..base + w]);
+            out.extend_from_slice(&pixels[base..base + w]);
         }
         (w, h, out)
     };

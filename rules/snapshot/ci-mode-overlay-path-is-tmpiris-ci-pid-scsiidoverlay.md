@@ -5,12 +5,17 @@
 
 # CI Mode Overlay Path is /tmp-Based, Not Image-Sibling
 
-When iris is invoked with `--ci`, the COW overlay file does NOT live next to the base image (`<base>.overlay`). It goes to `/tmp/iris-ci-<pid>-scsi<id>.overlay`. This isolates concurrent CI runs from each other and from any interactive session sharing the same base image.
+When iris is invoked with `--ci`, the COW overlay file does NOT live next to the base image (`<base>.overlay`). It goes to `<host temp dir>/iris-ci-<pid>-scsi<id>.overlay` (`std::env::temp_dir()`: `$TMPDIR` or `/tmp` on Unix, `%TEMP%` on Windows; a literal `/tmp` broke Windows, where it resolves to a nonexistent `\tmp` on the current drive).
+
+CHD disks don't use this overlay at all: `ChdHd` writes a `.diff.chd` beside the base instead, whatever `--ci` says. This isolates concurrent CI runs from each other and from any interactive session sharing the same base image.
 
 ## Where it's set
 `src/machine.rs:197`:
 ```rust
-let ci_overlay = format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id);
+let ci_overlay = std::env::temp_dir()
+    .join(format!("iris-ci-{}-scsi{}.overlay", ci_pid, id))
+    .to_string_lossy()
+    .into_owned();
 hpc3.add_scsi_device_with_overlay(id as usize, &path, dev.cdrom, discs, dev.overlay, &ci_overlay)
 ```
 

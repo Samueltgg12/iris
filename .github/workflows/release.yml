@@ -1,8 +1,7 @@
 # Build and release pipeline for IRIS.
 #
-# Manual trigger (workflow_dispatch) in one of two modes, a fortnightly
-# schedule (see "Scheduled releases" below), and a build-only run on every push
-# to main (see "Push builds" below):
+# Manual trigger (workflow_dispatch) in one of two modes, plus a fortnightly
+# schedule (see "Scheduled releases" below) and a build-only run per push to main:
 #
 #   publish_release UNCHECKED (the default)
 #     Builds every artifact on every platform and verifies the release contents,
@@ -18,15 +17,6 @@
 # dispatching from a topic branch tests that branch and dispatching from main
 # builds main. Set build_branch to override; a published tag follows the commit
 # that was actually built.
-#
-# ── Push builds ───────────────────────────────────────────────────────────────
-#
-# Every push (or merged PR) to main runs the full build in build-only mode:
-# signed + notarized artifacts on every platform, attached to the run, no tag,
-# no release. A push has no inputs, so the gate's publish_release default
-# ("false") applies and it can never publish. Pushes that only touch docs skip
-# the run (paths-ignore). A newer push to main cancels an in-flight push build;
-# manual and scheduled runs are never cancelled (see `concurrency`).
 #
 # ── Scheduled releases ────────────────────────────────────────────────────────
 #
@@ -100,9 +90,8 @@ on:
         required: false
         default: macos-26
 
-# Push builds share one group, so a newer push to main cancels the older build.
-# Every other run gets its own group (its run id) and is never cancelled - a
-# publishing run must not be killed halfway through by a merge.
+# A newer push to main cancels an older push build; manual and scheduled runs
+# get their own group and are never cancelled.
 concurrency:
   group: ${{ github.event_name == 'push' && 'release-push-main' || github.run_id }}
   cancel-in-progress: true
@@ -1086,6 +1075,125 @@ jobs:
             IRIS-gui-linux-riscv64-${{ needs.generate-version.outputs.version }}.deb
             IRIS-gui-linux-riscv64-${{ needs.generate-version.outputs.version }}.rpm
 
+  # ── Boot test ───────────────────────────────────────────────────────────────
+  # Boots IRIX 5.3 (image from the IRIX53_BOOT_IMAGE_URL secret) to a login prompt
+  # via scripts/ci-boot-test.sh; skipped if the secret is unset, gates the release.
+
+  boot-test:
+    name: Boot test (${{ matrix.os }}-${{ matrix.arch }})
+    needs:
+      - generate-version
+      - build-windows
+      - build-macos
+      - build-linux-packages
+    if: ${{ needs.generate-version.outputs.skip != 'true' }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    env:
+      VER: ${{ needs.generate-version.outputs.version }}
+      BOOT_TIMEOUT: 900
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runs-on: ubuntu-24.04
+          - os: macos
+            arch: arm64
+            runs-on: ${{ github.event.inputs.runner_image || 'macos-26' }}
+          - os: windows
+            arch: x64
+            runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check for the disk image secret
+        id: image
+        env:
+          IMAGE_URL: ${{ secrets.IRIX53_BOOT_IMAGE_URL }}
+        run: |
+          if [ -z "$IMAGE_URL" ]; then
+            echo "::warning::IRIX53_BOOT_IMAGE_URL is not set - boot test skipped."
+            echo "### Boot test skipped: \`IRIX53_BOOT_IMAGE_URL\` secret not set" >> $GITHUB_STEP_SUMMARY
+            echo "present=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if command -v sha256sum >/dev/null; then
+            HASH=$(printf '%s' "$IMAGE_URL" | sha256sum | cut -c1-16)
+          else
+            HASH=$(printf '%s' "$IMAGE_URL" | shasum -a 256 | cut -c1-16)
+          fi
+          echo "present=true" >> $GITHUB_OUTPUT
+          echo "hash=$HASH"   >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v5
+        if: ${{ steps.image.outputs.present == 'true' }}
+        with:
+          ref: ${{ inputs.build_branch || github.ref_name }}
+
+      - name: Download Core build
+        if: ${{ steps.image.outputs.present == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: IRIS-cli-${{ matrix.os }}-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: core-pkg
+
+      - name: Unpack Core build
+        if: ${{ steps.image.outputs.present == 'true' }}
+        run: |
+          mkdir -p core
+          if [ "${{ matrix.os }}" = windows ]; then
+            7z x -ocore "core-pkg/IRIS-cli-windows-${{ matrix.arch }}-${VER}.zip"
+          else
+            tar -C core -xzf "core-pkg/IRIS-cli-${{ matrix.os }}-${{ matrix.arch }}-${VER}.tar.gz"
+          fi
+          ls -la core
+
+      - name: Install runtime libraries
+        if: ${{ steps.image.outputs.present == 'true' && matrix.os == 'linux' }}
+        run: sudo apt-get update && sudo apt-get install -y libasound2t64
+
+      - name: Restore disk image
+        if: ${{ steps.image.outputs.present == 'true' }}
+        id: cache
+        uses: actions/cache/restore@v5
+        with:
+          path: boot-image
+          key: irix53-boot-image-${{ steps.image.outputs.hash }}
+
+      - name: Download disk image
+        if: ${{ steps.image.outputs.present == 'true' && steps.cache.outputs.cache-hit != 'true' }}
+        env:
+          IMAGE_URL: ${{ secrets.IRIX53_BOOT_IMAGE_URL }}
+        run: |
+          mkdir -p boot-image
+          curl -fL --retry 3 --retry-delay 10 -o boot-image/irix53.chd "$IMAGE_URL"
+          ls -la boot-image
+
+      - name: Save disk image to cache
+        if: ${{ steps.image.outputs.present == 'true' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: boot-image
+          key: irix53-boot-image-${{ steps.image.outputs.hash }}
+
+      - name: Boot IRIX 5.3 to the login prompt
+        if: ${{ steps.image.outputs.present == 'true' }}
+        run: bash scripts/ci-boot-test.sh core boot-image/irix53.chd boot-test "$BOOT_TIMEOUT"
+
+      - name: Upload boot test results
+        if: ${{ always() && steps.image.outputs.present == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: boot-test-${{ matrix.os }}-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: |
+            boot-test/*.png
+            boot-test/*.log
+            boot-test/boot-test.toml
+          if-no-files-found: warn
+
   # ── Release ───────────────────────────────────────────────────────────────────
 
   release:
@@ -1097,13 +1205,16 @@ jobs:
       - build-linux-appimage
       - build-linux-packages
       - build-linux-riscv64
+      - boot-test
     if: ${{ needs.generate-version.outputs.skip != 'true' }}
     runs-on: ubuntu-24.04
     steps:
+      # IRIS-* only: the boot-test-* screenshots and logs aren't release assets.
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
           path: artifacts
+          pattern: IRIS-*
 
       - name: Flatten artifacts
         run: |

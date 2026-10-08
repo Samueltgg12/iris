@@ -506,7 +506,12 @@ impl Machine {
                 (dev.path.clone(), vec![])
             };
             let result = if ci_enabled && dev.overlay && !dev.cdrom {
-                let ci_overlay = format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id);
+                // The host temp dir, not a literal /tmp: on Windows that resolves
+                // to \tmp on the current drive, which normally doesn't exist.
+                let ci_overlay = std::env::temp_dir()
+                    .join(format!("iris-ci-{}-scsi{}.overlay", ci_pid, id))
+                    .to_string_lossy()
+                    .into_owned();
                 hpc3.add_scsi_device_with_overlay(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay, &ci_overlay)
             } else {
                 hpc3.add_scsi_device(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay)
