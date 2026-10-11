@@ -416,7 +416,7 @@ In iris-gui the setting is **Keyboard** on the Display tab. There, ろ and the c
 ろ types `\` (never `_`) and 無変換/変換/かな do nothing. Use the
 standalone `iris` window if you need them.
 
-The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing.
+The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing. When the guest changes video mode (PROM, then IRIX during boot) the window snaps to the new resolution times the configured `scale` / `--2x`.
 
 ---
 
@@ -438,7 +438,7 @@ nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 # RAM bank sizes in MB: 0 (absent), 8, 16, 32, 64, 128; IP28 also 256/512.
 banks = [128, 128, 0, 0]
 
-scale = 1                   # window scale; --2x overrides
+scale = 1                   # window scale, kept across guest mode changes; --2x overrides
 headless = false            # no window, no REX3 (audio unaffected)
 no_audio = false            # no HAL2 / cpal (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing

@@ -14,6 +14,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### UI / input
 
+- **`--2x` and `scale = 2` survive boot.** The window opened at 2× but
+  snapped back to 1× as soon as the PROM or IRIX set a video mode. Every
+  guest mode change now sizes the window to the new resolution times the
+  configured scale. Right Ctrl + 1/2 still resize on demand, until the next
+  mode change.
 - **The status bar's Hz is the fast clock again on Indigo2 and IP28.** It
   counted both 8254 timers, timer 0 (the 100 Hz system clock) and timer 1
   (the 1000 Hz fast clock), so a healthy IP28 read 1100 Hz and looked like a

@@ -70,9 +70,11 @@ struct GlState {
 // RCtrl+1/2 hotkey — only *record* what they want here; `UiApp` applies it.
 #[derive(Clone, Copy, PartialEq)]
 enum ResizeRequest {
-    /// Emulated display changed mode: snap the window to 1x of the new size.
-    DisplayMode { w: u32, h: u32 },
-    /// RCtrl+1 / RCtrl+2: snap to an integer multiple of the current display.
+    /// Aspect-lock correction: set the window to exactly this size.
+    Fit { w: u32, h: u32 },
+    /// Snap to an integer multiple of the current display. Sent by RCtrl+1/2,
+    /// and by the renderer on every guest mode change with the configured
+    /// scale (`--2x` / `scale =`), so a 2x window stays 2x across boot.
     Scale(u32),
     /// RCtrl+F11: toggle borderless fullscreen. Same deferral rationale as the
     /// others — `set_fullscreen` inside a callback re-enters the wndproc with a
@@ -121,6 +123,8 @@ struct GlRenderer {
     // event thread wakes up to notice it, and with ControlFlow::Wait an idle
     // guest may produce no OS events at all for a long time.
     event_proxy: EventLoopProxy<()>,
+    // Configured window scale; each guest mode change snaps to this multiple.
+    scale: u32,
     // Current emulated display resolution (width, height), published for the
     // event thread so it can lock the window to the right aspect ratio.
     display_res: Arc<Mutex<(u32, u32)>>,
@@ -677,14 +681,12 @@ impl Renderer for GlRenderer {
         // thread's aspect lock sees it when it handles the resulting Resized
         // event (otherwise it would re-fit the window to the stale aspect).
         *self.display_res.lock() = (width as u32, height as u32);
-        // On display resolution change, snap the window to 1x of the new
-        // resolution — but only ever *ask*. This runs on REX3's refresh thread,
-        // and touching the window from here is what used to kill iris on
-        // Windows; see `ResizeRequest` for the full mechanism.
-        *self.resize_request.lock() = Some(ResizeRequest::DisplayMode {
-            w: width as u32,
-            h: (height + STATUS_BAR_HEIGHT) as u32,
-        });
+        // On display resolution change, snap the window to the configured
+        // scale of the new resolution — but only ever *ask*. This runs on
+        // REX3's refresh thread, and touching the window from here is what
+        // used to kill iris on Windows; see `ResizeRequest` for the full
+        // mechanism. `Scale` sizes from `display_res`, published just above.
+        *self.resize_request.lock() = Some(ResizeRequest::Scale(self.scale));
         let _ = self.event_proxy.send_event(());
     }
 
@@ -765,7 +767,7 @@ impl Ui {
     pub fn new(ps2: Arc<Ps2Controller>, display: Arc<dyn GfxDisplay>, scsi: Arc<Wd33c93a>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool) -> Self {
         // The Indy's default video mode is 1280×1024; open the window at that
         // size (plus the status bar). The renderer snaps to the real resolution
-        // via resize() once the PROM/IRIX programs its actual mode.
+        // via resize() once the PROM/IRIX programs its actual mode, keeping `scale`.
         let w = 1280 * scale;
         let h = (1024 + STATUS_BAR_HEIGHT as u32) * scale;
         let window_builder = WindowAttributes::default()
@@ -885,6 +887,7 @@ impl Ui {
             window_size: window_size.clone(),
             resize_request: resize_request.clone(),
             event_proxy: event_loop.create_proxy(),
+            scale,
             display_res: display_res.clone(),
             state:       None,
             compositor,
@@ -1169,7 +1172,7 @@ impl ApplicationHandler for UiApp {
                             size.width, size.height, self.last_win_size, dw, dh)
                         {
                             *self.resize_request.lock() =
-                                Some(ResizeRequest::DisplayMode { w, h });
+                                Some(ResizeRequest::Fit { w, h });
                         }
                     }
                     let new_size = (size.width, size.height);
@@ -1268,7 +1271,7 @@ impl ApplicationHandler for UiApp {
         }
 
         let (w, h) = match req {
-            ResizeRequest::DisplayMode { w, h } => (w, h),
+            ResizeRequest::Fit { w, h } => (w, h),
             ResizeRequest::Scale(s) => {
                 let (dw, dh) = *self.display_res.lock();
                 if dw == 0 || dh == 0 { return; }
