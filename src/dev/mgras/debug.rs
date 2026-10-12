@@ -13,7 +13,8 @@
 //! with repeats of one register and runs through a memory collapsed. Written
 //! from the CPU, HQ3 and RSS threads, so tracing slows the pipeline.
 //!
-//! `IRIS_MGRAS_TRACE=<file>` starts a full trace at power-on.
+//! `IRIS_MGRAS_TRACE=<file>` starts a full trace at power-on. All of it needs
+//! the `gputrace` feature; without it `tracing` is a constant false.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -88,9 +89,12 @@ impl MgrasTrace {
 }
 
 impl Mgras {
-    #[inline]
+    /// Whether a trace of `what` runs. A constant false without `gputrace`,
+    /// so every `if self.tracing(..)` on a bus or engine path compiles away,
+    /// formatting and all.
+    #[inline(always)]
     pub(super) fn tracing(&self, what: u32) -> bool {
-        self.trace_mask.load(Ordering::Relaxed) & what != 0
+        cfg!(feature = "gputrace") && self.trace_mask.load(Ordering::Relaxed) & what != 0
     }
 
     /// One CPU access outside the FIFOs (board offset, value read/written).
@@ -174,6 +178,9 @@ impl Mgras {
 
     /// Start the annotated trace into `path` for the categories in `mask`.
     pub(super) fn start_trace(&self, path: &str, mask: u32) -> std::io::Result<()> {
+        if !cfg!(feature = "gputrace") {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "needs a build with the gputrace feature (on with developer)"));
+        }
         let f = File::create(path)?;
         let mut t = self.trace.lock();
         t.out = Some(BufWriter::with_capacity(1 << 20, f));
@@ -235,7 +242,7 @@ impl Mgras {
             }
             ["trace", path, rest @ ..] => {
                 let mask = trace_mask(rest.first().copied().unwrap_or("all"));
-                self.start_trace(path, mask).map_err(|e| format!("mgras trace: cannot create {path}: {e}"))?;
+                self.start_trace(path, mask).map_err(|e| format!("mgras trace {path}: {e}"))?;
                 return e(writeln!(w, "tracing to {path} (mask {mask:#x})"));
             }
             ["dump", path] => {

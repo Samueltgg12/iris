@@ -834,11 +834,11 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 | `bt445 status` | BT445 RAMDAC state |
 | `bt445 identity` | Reset RAMDAC palette to linear identity ramp |
 | `bt445 debug <on\|off>` | BT445 trace **[DEV]** |
-| `gr2 [status]` / `gr2 trace <file> [hq,re3,cpu\|all]` | GR2 XZ/Extreme state and command trace |
+| `gr2 [status]` / `gr2 trace <file> [hq,re3,cpu\|all]` | GR2 XZ/Extreme state and command trace (trace: `gputrace` builds) |
 | `gr2 fbdump [DIR]` | GR2 framebuffer dump, including composed screen |
 | `re3 ...` | GR2 raster register inspection (see monitor `help`) |
 | `mgras [status]` | IMPACT state and inventory summary |
-| `mgras trace <file> [hq,rss,cpu,tex\|all]` | IMPACT command / raster / CPU / texture trace |
+| `mgras trace <file> [hq,rss,cpu,tex\|all]` | IMPACT command / raster / CPU / texture trace (`gputrace` builds) |
 | `mgras fbdump [DIR]` / `mgras shot <path>` | IMPACT framebuffer dump / screenshot |
 | `mgras rec <file>` / `mgras rec off` | Record / stop recording board accesses |
 | `rss ...` | IMPACT raster inspection (see monitor `help`) |

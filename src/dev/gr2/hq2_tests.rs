@@ -190,6 +190,7 @@ fn fifo_backpressure_never_duplicates_64bit_stores() {
 }
 
 #[test]
+#[cfg(feature = "gputrace")]
 fn trace_captures_annotated_hq_and_re3_traffic() {
     let g = live_gr2(Gr2Variant::Xz);
     let path = std::env::temp_dir().join(format!("gr2_trace_test_{}.log", std::process::id()));
@@ -316,12 +317,16 @@ fn xsgi_fin3_handshake_and_open_commands() {
 
     g.wait_idle();
     g.cmd_gr2(&["trace", "off"], &mut sink).unwrap();
-    let text = std::fs::read_to_string(&path).unwrap();
-    let _ = std::fs::remove_file(&path);
-    assert!(text.contains("exec 2D_ROP fg=0x0 planemask=0xffffff alu=3 flag=0x0"), "{text}");
-    assert!(text.contains("exec 2D_FAST_LINE_AUX [0x0, 0xffff, 0x0, 0x0, 0x0, 0x0] (6 words, not implemented)"), "{text}");
-    assert!(text.contains("exec 2D_END_PRIMITIVE 0x0"), "{text}");
-    assert!(text.contains("exec 2D_SYNC 0 -> FIN3"), "{text}");
+    // The decoded commands are checked through the trace, which needs it.
+    #[cfg(feature = "gputrace")]
+    {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("exec 2D_ROP fg=0x0 planemask=0xffffff alu=3 flag=0x0"), "{text}");
+        assert!(text.contains("exec 2D_FAST_LINE_AUX [0x0, 0xffff, 0x0, 0x0, 0x0, 0x0] (6 words, not implemented)"), "{text}");
+        assert!(text.contains("exec 2D_END_PRIMITIVE 0x0"), "{text}");
+        assert!(text.contains("exec 2D_SYNC 0 -> FIN3"), "{text}");
+    }
 }
 
 /// Xsgi DDX expInitHW (exp_init.c) verbatim, then colour and overlay boxes

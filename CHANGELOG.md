@@ -42,6 +42,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Build / features
 
+- **`gr2 trace` and `mgras trace` need `gputrace`, like `rex trace`.** On with
+  `developer`; plain and `lightning` builds add `--features gputrace`.
+  Without it the per-access trace check on GR2 and IMPACT register reads
+  and writes, and on every HQ2/RE3 and HQ3/RSS FIFO entry, is compiled out,
+  formatting and all, and the commands (and `IRIS_MGRAS_TRACE`) say the
+  build lacks the feature. `mgras rec` stays in every build.
 - **Perfetto tracing (`--features perfetto`).** `--perfetto FILE` or the
   monitor's `perfetto start FILE` records a trace that opens in
   ui.perfetto.dev. Events go into per-thread rings and a writer thread

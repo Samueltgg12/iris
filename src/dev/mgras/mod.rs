@@ -402,10 +402,10 @@ impl Hq3Sink for HqSink<'_> {
     fn note(&mut self, what: String) {
         self.0.note(what);
     }
-    fn tracing(&self) -> bool {
+    fn wants_trace(&self) -> bool {
         self.0.tracing(debug::TRACE_HQ)
     }
-    fn tracing_tex(&self) -> bool {
+    fn wants_trace_tex(&self) -> bool {
         self.0.tracing(debug::TRACE_TEX)
     }
     fn trace(&mut self, line: String) {

@@ -1,5 +1,6 @@
 //! GR2 introspection: monitor commands (`gr2 ...`, `re3 ...`) and the
-//! annotated FIFO trace (`gr2 trace <file> [hq|re3|all]`).
+//! annotated FIFO trace (`gr2 trace <file> [hq|re3|all]`), in `gputrace`
+//! builds; without the feature `tracing` is a constant false.
 //!
 //! Trace lines look like
 //!   `  12.345678 HQ  #000123 fifo[0x198 PUC_DRAWCHAR] = 0x00000008`
@@ -79,9 +80,12 @@ impl Gr2Trace {
 }
 
 impl Gr2 {
-    #[inline]
+    /// Whether a trace of `what` runs. A constant false without `gputrace`,
+    /// so every `if self.tracing(..)` on a bus or engine path compiles away,
+    /// formatting and all.
+    #[inline(always)]
     pub(super) fn tracing(&self, what: u32) -> bool {
-        self.trace_mask.load(Ordering::Relaxed) & what != 0
+        cfg!(feature = "gputrace") && self.trace_mask.load(Ordering::Relaxed) & what != 0
     }
 
     /// One CPU access outside the FIFOs (board offset, value read/written).
@@ -405,6 +409,9 @@ impl Gr2 {
                 } else {
                     writeln!(w, "trace not active")?;
                 }
+            }
+            Some(_) if !cfg!(feature = "gputrace") => {
+                writeln!(w, "gr2 trace needs a build with the gputrace feature (on with developer)")?;
             }
             Some(path) => {
                 // Categories: hq, re3, cpu, or combinations like hq,cpu; default all.

@@ -345,16 +345,31 @@ pub trait Hq3Sink {
     fn sys_mem(&mut self) -> Option<Arc<dyn BusDevice>>;
     /// Something not modelled yet (reported once).
     fn note(&mut self, what: String);
-    /// Whether the annotated trace wants HQ3 lines.
-    fn tracing(&self) -> bool {
+    /// Whether the annotated trace wants HQ3 lines (call `tracing`).
+    fn wants_trace(&self) -> bool {
         false
     }
-    /// Whether the annotated trace wants texture-load lines.
-    fn tracing_tex(&self) -> bool {
+    /// Whether the annotated trace wants texture-load lines (call
+    /// `tracing_tex`).
+    fn wants_trace_tex(&self) -> bool {
         false
     }
     /// One annotated trace line.
     fn trace(&mut self, _line: String) {}
+}
+
+/// The trace checks the HQ3 and GL code make once a command. `wants_trace*`
+/// are virtual calls, which cannot fold to a constant; these are false
+/// without `gputrace` before making the call, so the sites compile away.
+impl dyn Hq3Sink + '_ {
+    #[inline(always)]
+    pub fn tracing(&self) -> bool {
+        cfg!(feature = "gputrace") && self.wants_trace()
+    }
+    #[inline(always)]
+    pub fn tracing_tex(&self) -> bool {
+        cfg!(feature = "gputrace") && self.wants_trace_tex()
+    }
 }
 
 /// What the frontend has done, for `mgras stats`.
