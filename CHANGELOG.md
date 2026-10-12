@@ -42,6 +42,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Build / features
 
+- **`gpujit` turns on every graphics JIT** (`rex-jit` and `gr4-jit`):
+  `--features lightning,gpujit`.
 - **`gr2 trace` and `mgras trace` need `gputrace`, like `rex trace`.** On with
   `developer`; plain and `lightning` builds add `--features gputrace`.
   Without it the per-access trace check on GR2 and IMPACT register reads

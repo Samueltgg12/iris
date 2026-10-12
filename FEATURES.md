@@ -41,6 +41,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
+| `gpujit` | Every graphics JIT, so one name covers both. | `rex-jit`, `gr4-jit` |
 | `jitv2` | Experimental whole-page MIPS compiler; implies transparent caching. | `tcache`, `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `target-lexicon`, `region`, `wasmtime-jit-icache-coherence` |
 | `jitv2_opcodefusion` | Optional JIT fusion, off by default after live delay-slot failures. | `jitv2` |
 | `j2wp` | Compatibility alias for `jitv2`; no separate compiler mode. | `jitv2` |
@@ -678,5 +679,5 @@ triangles 2.5x.
 - `GR4_JIT_DISASM=1` prints each shader's machine code as it compiles.
 
 ```
-cargo run --release --features lightning,rex-jit,gr4-jit
+cargo run --release --features lightning,gpujit   # = lightning,rex-jit,gr4-jit
 ```
