@@ -231,6 +231,7 @@ impl<'a> E<'a> {
             i32s.extend([off!(gl.smp.max_level), off!(gl.smp.ls), off!(gl.smp.lt)]);
             i32s.extend((0..3).map(|k| off!(gl.env_c) + 4 * k));
             i32s.extend((0..3).map(|k| off!(gl.fog_c) + 4 * k));
+            i32s.extend((0..4).map(|k| off!(gl.blend_c) + 4 * k));
             for o in i32s {
                 invs.insert(o, ld(&mut b, I32, o));
             }
@@ -1564,28 +1565,44 @@ impl<'a> E<'a> {
                         .collect();
                     let nd3 = self.fone_minus(d[3]);
                     let sat = self.b.ins().smin(rgba[3], nd3);
+                    let kc: Vec<Value> = (0..4).map(|k| self.inv(off!(gl.blend_c) + 4 * k)).collect();
                     let mut out = [rgba[0]; 4];
                     for (kk, o) in out.iter_mut().enumerate() {
-                        let f = |e: &mut Self, code: u8| -> Value {
-                            match code {
-                                0 => e.i32c(0),
-                                2 => rgba[kk],
-                                3 => e.fone_minus(rgba[kk]),
-                                4 => rgba[3],
-                                5 => e.fone_minus(rgba[3]),
-                                6 => d[3],
-                                7 => e.fone_minus(d[3]),
-                                8 => d[kk],
-                                9 => e.fone_minus(d[kk]),
-                                10 if kk != 3 => sat,
-                                _ => e.i32c(fixed::ONE as i64),
+                        // `rss::blend_rgba`.
+                        let s = match bl.eq {
+                            3 => self.b.ins().smin(rgba[kk], d[kk]),
+                            4 => self.b.ins().smax(rgba[kk], d[kk]),
+                            eq => {
+                                let f = |e: &mut Self, code: u8| -> Value {
+                                    match code {
+                                        0 => e.i32c(0),
+                                        2 => rgba[kk],
+                                        3 => e.fone_minus(rgba[kk]),
+                                        4 => rgba[3],
+                                        5 => e.fone_minus(rgba[3]),
+                                        6 => d[3],
+                                        7 => e.fone_minus(d[3]),
+                                        8 => d[kk],
+                                        9 => e.fone_minus(d[kk]),
+                                        10 if kk != 3 => sat,
+                                        11 => kc[kk],
+                                        12 => e.fone_minus(kc[kk]),
+                                        13 => kc[3],
+                                        14 => e.fone_minus(kc[3]),
+                                        _ => e.i32c(fixed::ONE as i64),
+                                    }
+                                };
+                                let fs = f(self, bl.src);
+                                let fd = f(self, bl.dst);
+                                let a = self.fmul16(rgba[kk], fs);
+                                let b = self.fmul16(d[kk], fd);
+                                match eq {
+                                    1 => self.b.ins().isub(a, b),
+                                    2 => self.b.ins().isub(b, a),
+                                    _ => self.b.ins().iadd(a, b),
+                                }
                             }
                         };
-                        let fs = f(self, bl.src);
-                        let fd = f(self, bl.dst);
-                        let a = self.fmul16(rgba[kk], fs);
-                        let b = self.fmul16(d[kk], fd);
-                        let s = self.b.ins().iadd(a, b);
                         *o = self.fclamp16(s);
                     }
                     out

@@ -219,6 +219,8 @@ pub struct GlCtx {
     /// Shared-page offsets by log2 of a level's larger side (0 above 16).
     pub small_off: [u32; 16],
     pub small_boff: [u32; 16],
+    /// The constant blend colour (12.16, `rss::blend_const`).
+    pub blend_c: [i32; 4],
     /// Texture environment colour and alpha; fog colour (12.16).
     pub env_c: [i32; 3],
     pub env_a: i32,
@@ -411,7 +413,12 @@ fn gl_common(rss: &mut Rss, mut k: PipeKey) -> PipeKey {
     k.z = (zm & rss::ZMODE_TEST != 0).then_some((zm & 7) as u8);
     c.zmask = ((zm >> 4) & 0xFF_FFFF) as u64;
     let bf = rss.reg(reg::BLENDFACTOR);
-    k.blend = (bf & rss::BLEND_ENABLE != 0).then_some(Blend { src: (bf & 0xF) as u8, dst: ((bf >> 4) & 0xF) as u8 });
+    k.blend = (bf & rss::BLEND_ENABLE != 0).then_some(Blend {
+        src: (bf & 0xF) as u8,
+        dst: ((bf >> 4) & 0xF) as u8,
+        eq: ((bf >> rss::BLEND_EQ_SHIFT) & 7) as u8,
+    });
+    c.blend_c = rss.blend_constant();
     let m1 = rss.reg(te_reg::TEXMODE1);
     if m1 & te1::TEXMODE1_ENABLE != 0 {
         let m2 = rss.reg(te_reg::TEXMODE2);

@@ -279,8 +279,13 @@ fn gl_regs(rng: &mut Rng, regs: &mut Regs, tex_bias: f64) {
     regs.push((reg::STENCILMASK, { let opts = [0xFFFFu32, rng.u32() & 0xFFFF, 0xFF0F]; rng.pick(&opts) }));
     let zmask = { let opts = [0xFF_FFFFu32, rng.u32() & 0xFF_FFFF, 0]; rng.pick(&opts) };
     regs.push((reg::ZMODE, te(rng.chance(0.6), rng.below(8) as u32 | zmask << 4)));
-    let blend = (rng.below(16) as u32) | (rng.below(16) as u32) << 4 | if rng.chance(0.5) { rss_blend_enable() } else { 0 };
+    let blend = (rng.below(16) as u32)
+        | (rng.below(16) as u32) << 4
+        | (rng.below(6) as u32) << rss::BLEND_EQ_SHIFT
+        | if rng.chance(0.5) { rss_blend_enable() } else { 0 };
     regs.push((reg::BLENDFACTOR, blend));
+    regs.push((reg::BLENDCOLOR_RG, rng.u32() & 0x0FFF_0FFF));
+    regs.push((reg::BLENDCOLOR_BA, rng.u32() & 0x0FFF_0FFF));
     let tex_on = rng.chance(tex_bias);
     let m1 = (rng.u32() & 0xFFE) | tex_on as u32;
     regs.push((te::TEXMODE1, m1));
@@ -461,6 +466,7 @@ fn digits(k: &PipeKey) -> Vec<(u8, u32)> {
             (16, opt(k.z)),
             (17, opt(b.map(|b| b.src))),
             (18, opt(b.map(|b| b.dst))),
+            (34, opt(b.map(|b| b.eq))),
             (19, k.fog as u32),
             (20, k.tex.is_some() as u32),
         ]);
@@ -506,7 +512,8 @@ fn domain(prim: Prim, field: u8) -> Vec<u32> {
         11 => r(8),
         12 | 16 => r(9),
         13..=15 => r(7),
-        17 | 18 => r(12),
+        17 | 18 => r(16),
+        34 => r(6),
         21 => r(4),
         22 => vec![1, 2, 3, 4],
         23 => r(4),
