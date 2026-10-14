@@ -68,14 +68,62 @@ With it the JIT is 12% faster on the same test (about 2,050 against 1,830).
 When a raster speed-up shows up as a slowdown, look at the wake path
 first.
 
+## HQ2 -> RE3: batched, and unchanged registers skipped
+
+The span-building thread was slow, but not because of the span arithmetic.
+Every RE3 FIFO entry (about 13 per span) took the FIFO's producer lock and
+a SeqCst fence for the wake check. In the host benchmark
+(`hq2_tests::bench_gl_smooth_triangles`) that came to about 75% of HQ2's
+time; the float setup was about 6%.
+
+`hq_loop`'s Sink now does two things:
+
+- **Batching.** It stages entries and pushes them as one unit
+  (`GFifo::try_push_slice`: one lock, one tail release, one wake check).
+  It flushes at each IR write (span end), when the stage is full, before
+  anything that waits on RE3 (finish, reads, GEDMA) and when HQ2 runs out
+  of work.
+- **Skipping unchanged writes.** It keeps a shadow of the registers it has
+  sent and skips writes that would leave a register unchanged. The
+  exceptions always go through:
+  - IR and RWDATA (RWDATA is also written by RE3);
+  - the RGB / YX fan-outs, which drop the shadow of R, G, B / X, Y;
+  - anything after a CPU write to the RE3 window, which bumps
+    `re3_cpu_writes` and makes the shadow forget everything.
+
+This is exact: RE3 holds every register until its next write.
+
+Ordering: everything HQ2 sends stays in order. A CPU write straight to RE3
+registers can now land ahead of HQ2 entries still staged, which IRIX does
+not do while the GE is busy.
+
+Host benchmark, smooth Z-buffered triangles, JIT on:
+
+| Triangle legs | Before | After |
+|---|---|---|
+| 8 px | 64k tris/s | 390k |
+| 32 px | 36k | 138k |
+| 128 px | 6.9k | 16.3k |
+
+In IRIX (gltest):
+
+| Benchmark | Before | After |
+|---|---|---|
+| 8-px triangles | 66k tris/s | 153k (the guest CPU feeding GL is now the limit) |
+| 32-px triangles | 20k | 74k |
+| 300-px Z-buffered triangles, JIT | 2,050 | 3,790 |
+
 ## Where the time goes
 
-Profile of IRIX gltest --tribench (8-px triangles):
+Before the batching (8-px triangles):
 
-- **HQ2 thread: one core, saturated.** Three quarters of it is
-  `raster_poly`: edge walk, per-span float setup, and about 12 FIFO
-  register writes per span.
-- **RE3: about half a core.** The span JIT cannot speed small triangles
-  up; moving the polygon walk off HQ2 could.
+- **HQ2 thread: one core, saturated** in `raster_poly`, most of it the
+  per-entry FIFO handshake.
+- **RE3: about half a core.**
+
+After the batching (host benchmark, 32 px):
+
+- **RE3: one core.** About two thirds of it is the shader's pixel work.
+- **HQ2: waits on a full FIFO.** Its own span setup is about 5%.
 
 Fills gained 3× in the guest (78 to 245 Mpx/s, Z-buffered 58 to 115).

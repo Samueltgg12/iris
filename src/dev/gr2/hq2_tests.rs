@@ -2992,3 +2992,42 @@ fn gl_fragment_colour_index() {
     assert_eq!(gl_px(g, 3, 7) & 0xfff, 17);
     assert_eq!(gl_px(g, 4, 7) & 0xfff, 381);
 }
+
+/// HQ2 + RE3 throughput on smooth, Z-buffered triangles fed through the
+/// FIFO as libglcore sends them (`--ignored --nocapture`; `GR2_BENCH_N`
+/// triangles, default 20000, per size).
+#[test]
+#[ignore]
+fn bench_gl_smooth_triangles() {
+    let n: usize = std::env::var("GR2_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(20000);
+    let fl = |v: f32| v.to_bits();
+    for size in [8.0f32, 32.0, 128.0] {
+        let g = &live_gr2(Gr2Variant::Xz);
+        gl_setup_window_z(g, 23);
+        cmd(g, 0x013, 1);
+        cmd(g, 0x014, 1);
+        cmd(g, 0x024, 7);
+        cmd(g, 0x00a, 0x7fffff);
+        g.wait_idle();
+        let mut t = std::time::Instant::now();
+        // The first 1000 are a warm-up (shader compiles), not timed.
+        for i in 0..n + 1000 {
+            if i == 1000 {
+                g.wait_idle();
+                t = std::time::Instant::now();
+            }
+            let (x, y) = ((i * 37 % 250) as f32 + 10.0, (i * 53 % 150) as f32 + 10.0);
+            cmd(g, 0x0f0, 0);
+            cmd(g, 0x4f2, 0);
+            for (c, p) in [([1.0f32, 0., 0.], [x, y, 0.]), ([0., 1., 0.], [x + size, y, 0.5]), ([0., 0., 1.], [x, y + size, -0.5])] {
+                for v in c { cmd(g, 0x1982, fl(v)); }
+                for v in p { cmd(g, 0xa63, fl(v)); }
+            }
+            cmd(g, 0x0f1, 0);
+            cmd(g, 0x465, 0);
+        }
+        g.wait_idle();
+        let s = t.elapsed().as_secs_f64();
+        println!("{size:5} px legs: {:8.0} tris/s  {:6.1} Mpx/s", n as f64 / s, n as f64 * size as f64 * size as f64 / 2.0 / s / 1e6);
+    }
+}

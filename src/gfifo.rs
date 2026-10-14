@@ -227,6 +227,42 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         true
     }
 
+    /// Push `entries` (address, value) as one unit: all of them or, when the
+    /// lock is taken or there is not room for all, none (`false`). One lock
+    /// and one Release of `tail` for the lot.
+    pub fn try_push_slice(&self, entries: &[(u32, u64)]) -> bool {
+        let n = entries.len();
+        if n == 0 {
+            return true;
+        }
+        debug_assert!(n < DEPTH);
+        if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return false;
+        }
+        let tail = self.tail.load(Ordering::Relaxed);
+        // Free slots: one stays empty to tell full from empty.
+        let room = |head: usize| head.wrapping_sub(tail).wrapping_sub(1) & Self::MASK;
+        if room(self.shadow_head.get()) < n {
+            let head = self.slowest_head(tail);
+            self.shadow_head.set(head);
+            if room(head) < n {
+                self.lock.store(false, Ordering::Release);
+                return false;
+            }
+        }
+        for (i, &(addr, val)) in entries.iter().enumerate() {
+            // SAFETY: we hold the lock; these slots are free (checked above).
+            unsafe {
+                let slot = self.buf.as_ptr().add((tail + i) & Self::MASK) as *mut GFIFOEntry;
+                (*slot).addr = addr;
+                (*slot).val = val;
+            }
+        }
+        self.tail.store((tail + n) & Self::MASK, Ordering::Release);
+        self.lock.store(false, Ordering::Release);
+        true
+    }
+
     /// Push a batch token followed by its payload words, as one atomic unit.
     ///
     /// The token carries the count; the `vals.len()` entries after it carry the
