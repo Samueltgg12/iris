@@ -1598,7 +1598,9 @@ fn gl_raster_position_queries_valid_bias_and_update() {
     assert_eq!(ry, 60.0 + 49151.5);
     assert_eq!(rz, 0.5); // glOrtho maps z=0 to window z=0.5
     assert_eq!(rw, 1.0);
-    assert_eq!(dist, 0.0);
+    // The eye-space distance to the raster position (GL 1.1 2.12): (50,
+    // 60, 0) under an identity modelview.
+    assert!((dist - (50.0f32 * 50.0 + 60.0 * 60.0).sqrt()).abs() < 1e-3, "{dist}");
 
     // Raster color readback at 0x2C5..=0x2C8
     let cr = f32::from_bits(gl_return_mode(&m, 0x2C5));
@@ -3221,5 +3223,21 @@ fn gl_spin_and_return_reads_current_color_for_index_clear() {
         fifo_token(&m, 0x15, &[]);
         assert_eq!(gl_px(&m, 100, 100), index as u32, "other planes preserve background");
     }
+    m.stop_engines();
+}
+
+/// glGet(GL_CURRENT_RASTER_COLOR) is the colour glRasterPos latched, even
+/// after the current colour changes (drawing lets later colours through for
+/// IRIS GL's bitmaps; the query keeps OpenGL's latch).
+#[test]
+fn gl_raster_color_query_is_latched() {
+    let m = live_board();
+    x_server(&m);
+    gl_window_400x300(&m);
+    fifo_token(&m, 0x02, &[f(0.5), f(0.25), f(1.0), f(0.75)]);
+    fifo_token(&m, 0x38, &[f(5.0), f(5.0)]);
+    fifo_token(&m, 0x02, &[f(0.0), f(0.0), f(0.0), f(0.0)]);
+    let v: Vec<f32> = (0x2C5..=0x2C8).map(|a| f32::from_bits(gl_return_mode(&m, a))).collect();
+    assert_eq!(v, [0.5, 0.25, 1.0, 0.75]);
     m.stop_engines();
 }

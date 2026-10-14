@@ -41,6 +41,9 @@
 //!
 //! Not yet: point size, textured lines and points, texgen, 1D/3D textures.
 
+#[path = "glquery.rs"]
+mod query;
+
 use super::hq3::Hq3Sink;
 use super::te1::{self, reg as te_reg};
 use crate::dev::gl::light::{Lighting, MAX_LIGHTS};
@@ -235,6 +238,13 @@ mod tok {
     pub const BLEND_EQUATION: u32 = 0x060;
     /// glBlendColorEXT: four floats (EXT_blend_color).
     pub const BLEND_COLOR: u32 = 0x0D9;
+    pub const FOG_INDEX: u32 = 0x0B8;
+    pub const LINE_SMOOTH: u32 = 0x069;
+    pub const POLYGON_OFFSET: u32 = 0x0E7;
+    /// State queries: copy a light's / material's parameter to GE
+    /// 0x32E..0x331 (`query`).
+    pub const GET_MATERIALFV: u32 = 0x0EE;
+    pub const GET_LIGHTFV: u32 = 0x0EF;
     pub const DEPTH_TEST: u32 = 0x066;
     pub const DITHER: u32 = 0x067;
     pub const LINE_STIPPLE_ON: u32 = 0x06A;
@@ -376,6 +386,8 @@ pub struct Gl {
     mv: Stack<32>,
     proj: Stack<4>,
     tex: Stack<4>,
+    /// SGI_color_matrix's stack (glMatrixMode(GL_COLOR)).
+    cm: Stack<2>,
     mvp: Mat4,
     mvp_dirty: u32,
     vp: Viewport,
@@ -553,6 +565,8 @@ pub struct Gl {
     /// XFRFACTOR as libGLcore set it (the raster engine's x zoom /
     /// decimation step, 8.8).
     pub xfr_factor: u32,
+    /// What state queries return (`query::Query`).
+    q: query::Query,
 }
 
 impl Gl {
@@ -578,6 +592,8 @@ impl Gl {
         self.mv.init();
         self.proj.init();
         self.tex.init();
+        self.cm.init();
+        self.q.init();
         self.mvp = math::IDENT;
         self.depth_range = [0.0, 1.0];
         self.vp.set(0.0, 0.0, 1.0, 1.0, 0.0, 1.0, ZMAX);
@@ -619,6 +635,7 @@ impl Gl {
         match self.matrix_mode {
             0x1701 => &mut self.proj,
             0x1702 => &mut self.tex,
+            0x1800 => &mut self.cm,
             _ => &mut self.mv,
         }
     }
@@ -668,6 +685,13 @@ impl Gl {
         let v: Vec<f32> = d[1..].iter().map(|&w| f32::from_bits(w)).collect();
         let g = |k: usize| v.get(k).copied().unwrap_or(0.0);
         let mv = *self.mv.get();
+        let pname = match cmd {
+            tok::LIGHT_AMBIENT => 0x1200,
+            tok::LIGHT_DIFFUSE => 0x1201,
+            tok::LIGHT_SPECULAR => 0x1202,
+            c => 0x1203 + (c - tok::LIGHT_POSITION),
+        };
+        self.q.light(i, pname, [g(0), g(1), g(2), g(3)], &mv);
         let l = &mut self.lt.lights[i as usize];
         match cmd {
             tok::LIGHT_AMBIENT => l.ambient = [g(0), g(1), g(2)],
@@ -698,6 +722,7 @@ impl Gl {
         let (face, pname) = (d[0], d[1]);
         let v: Vec<f32> = d[2..].iter().map(|&w| f32::from_bits(w)).collect();
         let g = |k: usize| v.get(k).copied().unwrap_or(0.0);
+        self.q.material(face, pname, [g(0), g(1), g(2), g(3)]);
         let faces: &[usize] = match face {
             0x404 => &[0],
             0x405 => &[1],
@@ -746,7 +771,6 @@ impl Gl {
             0x897 => Some(0xAB9 + self.tex.top * 16),
             0x29F => Some(if self.ci != 0 { self.index_mask } else { self.color_mask }),
             0xB7E..=0xB81 => Some(self.clear_color[(addr - 0xB7E) as usize].to_bits()),
-            0xB86 => Some((self.clear_depth as f32 / ZMAX).to_bits()),
             0xB87 => Some((self.clear_index as f32).to_bits()),
             0xB88 => Some(self.clear_stencil),
             0xB91..=0xB94 => Some(match addr {
@@ -769,8 +793,6 @@ impl Gl {
             0xB9C => Some(self.scissor_test),
             0xBB1 => Some(self.point_size.to_bits()),
             0xBB2 => Some(self.line_width.to_bits()),
-            0xBBA => Some(self.line_repeat + 1),
-            0x1FC => Some(self.dither),
             // Scissor box 0 (window coordinates inclusive: xmin, xmax, ymin, ymax):
             // 0x200 returns (xmax << 16) | xmin, 0x202 returns (ymax << 16) | ymin.
             // Read by libGLcore __glMgrim_DrawPixels for scissor box clipping.
@@ -794,8 +816,6 @@ impl Gl {
             // Bit 2 (0x4) is the valid flag tested by libGLcore (__glMgrDoGet);
             // bit 0 (0x1) is tested by other callers. Return 0x7 when valid.
             0x2D0 => Some(if self.raster_valid != 0 { 0x7 } else { 0 }),
-            0x2BF => Some(0.0f32.to_bits()),
-            0x2C5..=0x2C8 => Some(self.raster_color[(addr - 0x2C5) as usize].to_bits()),
             0x3A..=0x49 => {
                 let m = match self.matrix_mode {
                     0x1701 => self.proj.get(),
@@ -806,7 +826,7 @@ impl Gl {
             }
             0x4A..=0x59 => Some(self.proj.get()[(addr - 0x4A) as usize].to_bits()),
             0x6A..=0x79 => Some(self.tex.get()[(addr - 0x6A) as usize].to_bits()),
-            _ => None,
+            _ => self.query_word(addr),
         }
     }
 
@@ -905,6 +925,7 @@ impl Gl {
             tok::LIGHT_MODEL_AMBIENT => {
                 let a = args_f32(d);
                 self.lt.amb_sum = [a[0], a[1], a[2]];
+                self.q.lmodel_ambient = a;
             }
             tok::LIGHT_MODEL_LOCAL_VIEWER => self.lt.local_viewer = on,
             tok::LIGHT_MODEL_TWO_SIDE => self.lt.two_sided = on,
@@ -914,6 +935,7 @@ impl Gl {
             }
             tok::COLOR_MATERIAL_FRONT | tok::COLOR_MATERIAL_BACK | tok::COLOR_MATERIAL_BOTH => {
                 self.lt.cmat_face = cmd - tok::COLOR_MATERIAL_FRONT;
+                self.q.cmat = [[0x404, 0x405, 0x408][(cmd - tok::COLOR_MATERIAL_FRONT) as usize], w0];
                 self.lt.cmat_param = match w0 {
                     0x1600 => 1,
                     0x1200 => 2,
@@ -942,13 +964,20 @@ impl Gl {
             }
             tok::FOG => self.lt.fog_on = on,
             tok::FOG_MODE => {
+                self.q.fog_mode = w0;
                 self.lt.fog_mode = match w0 { 0x2601 => 0, 0x801 => 2, _ => 1 };
                 self.update_fog();
             }
             tok::FOG_COLOR => {
                 let a = args_f32(d);
                 self.lt.fog_color = [a[0], a[1], a[2]];
+                self.q.fog_color = a;
             }
+            tok::FOG_INDEX => self.q.fog_index = w0,
+            tok::LINE_SMOOTH => self.q.line_smooth = on,
+            tok::POLYGON_OFFSET if d.len() >= 2 => self.q.poly_offset = [f32::from_bits(w0), f32::from_bits(d[1])],
+            tok::GET_LIGHTFV if d.len() >= 2 => self.q.get_light(w0, d[1]),
+            tok::GET_MATERIALFV if d.len() >= 2 => self.q.get_material(w0, d[1]),
             tok::FOG_START | tok::FOG_END | tok::FOG_DENSITY => {
                 let v = f32::from_bits(w0);
                 match cmd {
@@ -983,7 +1012,10 @@ impl Gl {
             tok::ALPHA_TEST => self.set_state(|g| g.alpha_test = on, sink),
             tok::ALPHA_FUNC if d.len() >= 2 => self.set_state(|g| (g.alpha_func, g.alpha_ref) = (w0 & 7, d[1].min(0xFFF)), sink),
             tok::BLEND => self.set_state(|g| g.blend = on, sink),
-            tok::BLEND_FUNC if d.len() >= 2 => self.set_state(|g| (g.blend_src, g.blend_dst) = (blend_code(w0), blend_code(d[1])), sink),
+            tok::BLEND_FUNC if d.len() >= 2 => {
+                self.q.blend_func = [w0, d[1]];
+                self.set_state(|g| (g.blend_src, g.blend_dst) = (blend_code(w0), blend_code(d[1])), sink)
+            }
             tok::BLEND_EQUATION => self.set_state(|g| g.blend_eq = w0, sink),
             tok::BLEND_COLOR if d.len() >= 4 => self.set_state(|g| g.blend_color = args_f32(d).map(|c| c.clamp(0.0, 1.0)), sink),
             tok::LOGIC_OP_ON => self.set_state(|g| g.logic = on, sink),
@@ -1047,6 +1079,10 @@ impl Gl {
                 self.raster = [w.x, w.y, w.z];
                 self.raster_color = w.c;
                 self.raster_valid = (w.ok != 0 && inside) as u32;
+                let e = math::xform(self.mv.get(), args_f32(d));
+                self.q.raster_dist = (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
+                self.q.raster_color = w.c;
+                self.q.raster_tex = math::xform(self.tex.get(), self.texcoord);
             }
             tok::UPDATE_RASTER_POS => {
                 let a = args_f32(d);

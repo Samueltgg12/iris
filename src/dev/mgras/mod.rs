@@ -288,6 +288,10 @@ pub struct Mgras {
     unhandled: SpinLock<HashSet<String>>,
     /// HQ3 flags: the HQ3 thread raises them, the CPU sets and clears them.
     flags: AtomicU32,
+    /// `mgras probe` slots: GE readbacks in a range answer a chosen word
+    /// (bits 63:48 first address, 47:32 last + 1, 31:0 the answer; 0 is
+    /// unused). For mapping how libGLcore decodes GE state words.
+    probe: [AtomicU64; 8],
     /// Owned by the HQ3 thread (others only while the board is idle).
     eng: UnsafeCell<Hq3Engine>,
     /// Raster engine 0, owned by its RSS thread (others only while the
@@ -398,6 +402,9 @@ impl Hq3Sink for HqSink<'_> {
         self.0.refresh_general();
         was
     }
+    fn readback_probe(&self, addr: u32) -> Option<u32> {
+        self.0.probe_answer(addr)
+    }
     fn sys_mem(&mut self) -> Option<Arc<dyn BusDevice>> {
         let mem = self.0.mem.lock().clone()?;
         Some(match self.0.mem_rec.lock().clone() {
@@ -420,6 +427,32 @@ impl Hq3Sink for HqSink<'_> {
 }
 
 impl Mgras {
+    /// The `mgras probe` answer for GE readback address `addr`, if any.
+    pub(super) fn probe_answer(&self, addr: u32) -> Option<u32> {
+        self.probe.iter().find_map(|p| {
+            let v = p.load(Ordering::Relaxed);
+            let (lo, end) = ((v >> 48) as u32, ((v >> 32) & 0xFFFF) as u32);
+            (end != 0 && (lo..end).contains(&addr)).then_some(v as u32)
+        })
+    }
+
+    /// Set (`Some((first, last, answer))`) or clear (`None`) probe slots;
+    /// false when all are taken.
+    pub(super) fn set_probe(&self, p: Option<(u32, u32, u32)>) -> bool {
+        match p {
+            None => {
+                for s in &self.probe {
+                    s.store(0, Ordering::Relaxed);
+                }
+                true
+            }
+            Some((lo, hi, v)) => {
+                let w = (lo as u64 & 0xFFFF) << 48 | ((hi as u64 + 1) & 0xFFFF) << 32 | v as u64;
+                self.probe.iter().any(|s| s.compare_exchange(0, w, Ordering::Relaxed, Ordering::Relaxed).is_ok())
+            }
+        }
+    }
+
     /// Build the board in place on the heap: its multi-megabyte state is
     /// zero-initialised without touching the stack, and only the fields that
     /// are not valid zeroed are written.

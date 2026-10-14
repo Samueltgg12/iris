@@ -217,6 +217,17 @@ impl Mgras {
         };
         match args {
             [] | ["status"] => return e(self.mgras_status(w)),
+            ["probe", "off"] => {
+                self.set_probe(None);
+                return e(writeln!(w, "readback probes cleared"));
+            }
+            ["probe", _, _, _] => {
+                let (lo, hi, v) = (num(1, 0), num(2, 0), num(3, 0));
+                if !self.set_probe(Some((lo, hi, v))) {
+                    return Err("mgras probe: all 8 slots taken (mgras probe off)".into());
+                }
+                return e(writeln!(w, "GE readbacks {lo:#x}..={hi:#x} answer {v:#x}"));
+            }
             ["rec", "off"] => {
                 let what = self.submit.lock().as_ref().map(|r| { let r = r.lock(); format!("{} ({} records)", r.path, r.records) });
                 self.set_recording(None).map_err(|e| format!("mgras rec: {e}"))?;
@@ -611,6 +622,7 @@ fn help(w: &mut dyn Write) -> std::io::Result<()> {
     for l in [
         "mgras [status]                    board summary",
         "mgras hq                          HQ3 flags, enables, engine, DMA/RE-interface registers, FIFOs",
+        "mgras probe LO HI VALUE | off     GE readbacks at LO..=HI answer VALUE (mapping libGLcore's decoding)",
         "mgras ge [n] [start] [count]      GE11 microcode lines",
         "mgras ucode [start] [count]       HQ3 microcode RAM",
         "mgras vc3 | vc3 sram <a> [n]      VC3 registers, cursor, DID runs / SRAM words",

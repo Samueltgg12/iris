@@ -349,6 +349,10 @@ pub trait Hq3Sink {
     fn take_flags(&mut self, _mask: u32) -> u32 {
         0
     }
+    /// `mgras probe`: a forced answer for GE readback address `addr`.
+    fn readback_probe(&self, _addr: u32) -> Option<u32> {
+        None
+    }
     /// A GL batch starts (true) or ends: the RSS saves / restores the raster
     /// registers the batch loads.
     fn gl_bracket(&mut self, _enter: bool) {}
@@ -998,7 +1002,7 @@ impl Hq3Engine {
             self.stats.cp_tokens[cmd as usize] += 1;
             self.gl.end_raster(sink);
             let addr = data.first().copied().unwrap_or(0);
-            let v = self.gl.state_word(addr).unwrap_or(addr);
+            let v = sink.readback_probe(addr).or_else(|| self.gl.state_word(addr)).unwrap_or(addr);
             self.ge_return = Some([0, v]);
             sink.set_flags(host::FLAG_GE_DATA);
         } else if cmd == cmd::CP_RETURN_MODE {
@@ -1006,7 +1010,7 @@ impl Hq3Engine {
             // Addresses the GE HLE knows answer from its state; others read
             // 0 and are reported once each, so the layout can be mapped.
             let addr = data.first().copied().unwrap_or(0);
-            let v = self.gl.state_word(addr).unwrap_or_else(|| {
+            let v = sink.readback_probe(addr).or_else(|| self.gl.state_word(addr)).unwrap_or_else(|| {
                 sink.note(format!("GE state readback at {addr:#x} ({:x?}) answered 0", data.get(1..).unwrap_or(&[])));
                 0
             });
