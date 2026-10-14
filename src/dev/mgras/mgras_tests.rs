@@ -844,6 +844,41 @@ fn gl_blend_equation_logic_op_xors() {
     m.stop_engines();
 }
 
+/// Every blend equation (EXT_blend_subtract, EXT_blend_minmax) and the
+/// constant colour factors (EXT_blend_color), from the GL tokens to the
+/// pixel: destination (0.25, 0.5, 1.0) drawn unblended first.
+#[test]
+fn gl_blend_equations_and_constant_colour() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    let near = |p: u32, want: [f32; 3], what: &str| {
+        for (k, w) in want.iter().enumerate() {
+            let got = ((p >> (8 * k)) & 0xFF) as i32;
+            assert!((got - (w * 255.0).round() as i32).abs() <= 2, "{what}: {p:#08x} component {k} want {w}");
+        }
+    };
+    let case = |eq: u32, func: [u32; 2], konst: Option<[f32; 4]>, src: [f32; 4], want: [f32; 3], what: &str| {
+        fifo_token(&m, 0x65, &[0]);
+        gl_color4(&m, [0.25, 0.5, 1.0, 1.0]);
+        gl_full_quad(&m);
+        fifo_token(&m, 0x60, &[eq]);
+        fifo_token(&m, 0x3F, &func);
+        if let Some(k) = konst {
+            fifo_token(&m, 0xD9, &k.map(f));
+        }
+        fifo_token(&m, 0x65, &[1]);
+        gl_color4(&m, src);
+        gl_full_quad(&m);
+        near(gl_px(&m, 200, 150), want, what);
+    };
+    case(0x800A, [1, 1], None, [1.0, 1.0, 1.0, 1.0], [0.75, 0.5, 0.0], "SUBTRACT ONE ONE");
+    case(0x800B, [1, 1], None, [0.25, 0.25, 0.25, 1.0], [0.0, 0.25, 0.75], "REVERSE_SUBTRACT ONE ONE");
+    case(0x8007, [0, 0], None, [0.5, 0.5, 0.5, 1.0], [0.25, 0.5, 0.5], "MIN ignores the factors");
+    case(0x8008, [0, 0], None, [0.5, 0.5, 0.5, 1.0], [0.5, 0.5, 1.0], "MAX ignores the factors");
+    case(0x8006, [0x8001, 0], Some([0.5, 0.25, 1.0, 0.5]), [1.0, 1.0, 1.0, 1.0], [0.5, 0.25, 1.0], "CONSTANT_COLOR ZERO");
+    case(0x8006, [0x8004, 0x8003], Some([0.0, 0.0, 0.0, 0.25]), [1.0, 1.0, 1.0, 1.0], [0.8125, 0.875, 1.0], "ONE_MINUS_CONSTANT_ALPHA CONSTANT_ALPHA");
+    m.stop_engines();
+}
+
 /// The classic stencil mask: a triangle writes stencil 1 with colour
 /// writes off, then a full quad drawn where stencil == 1.
 #[test]

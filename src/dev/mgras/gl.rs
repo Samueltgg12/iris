@@ -233,6 +233,8 @@ mod tok {
     /// GL_BLEND enable the colour logic op instead (EXT_blend_logic_op):
     /// IRIS GL's logicop(), e.g. AutoCAD's XOR crosshair.
     pub const BLEND_EQUATION: u32 = 0x060;
+    /// glBlendColorEXT: four floats (EXT_blend_color).
+    pub const BLEND_COLOR: u32 = 0x0D9;
     pub const DEPTH_TEST: u32 = 0x066;
     pub const DITHER: u32 = 0x067;
     pub const LINE_STIPPLE_ON: u32 = 0x06A;
@@ -300,6 +302,8 @@ mod re {
     pub const COLORMASKLSBSA: u32 = 0x163;
     pub const COLORMASKLSBSB: u32 = 0x164;
     pub const BLENDFACTOR: u32 = 0x165;
+    pub const BLENDCOLOR_RG: u32 = 0x16B;
+    pub const BLENDCOLOR_BA: u32 = 0x16C;
     pub const STENCILMODE: u32 = 0x166;
     pub const STENCILMASK: u32 = 0x167;
     pub const ZMODE: u32 = 0x168;
@@ -440,6 +444,8 @@ pub struct Gl {
     logic_op: u32,
     /// glBlendEquationEXT's enum; 0 (never set) is GL_FUNC_ADD.
     blend_eq: u32,
+    /// glBlendColorEXT, clamped to [0, 1] (the default is 0, 0, 0, 0).
+    blend_color: [f32; 4],
     /// Stencil: on, function, ref, compare mask, ops (fail, zfail, zpass),
     /// write mask, clear value.
     stencil: u32,
@@ -979,6 +985,7 @@ impl Gl {
             tok::BLEND => self.set_state(|g| g.blend = on, sink),
             tok::BLEND_FUNC if d.len() >= 2 => self.set_state(|g| (g.blend_src, g.blend_dst) = (blend_code(w0), blend_code(d[1])), sink),
             tok::BLEND_EQUATION => self.set_state(|g| g.blend_eq = w0, sink),
+            tok::BLEND_COLOR if d.len() >= 4 => self.set_state(|g| g.blend_color = args_f32(d).map(|c| c.clamp(0.0, 1.0)), sink),
             tok::LOGIC_OP_ON => self.set_state(|g| g.logic = on, sink),
             tok::LOGIC_OP => self.set_state(|g| g.logic_op = w0 & 0xF, sink),
             tok::STENCIL_TEST => self.set_state(|g| g.stencil = on, sink),
@@ -2091,7 +2098,21 @@ impl Gl {
         // the logic op on rather than blending.
         let blend_logic = self.blend != 0 && self.blend_eq == GL_LOGIC_OP;
         let blend = self.blend != 0 && !blend_logic;
-        sink.rss_write(re::BLENDFACTOR, if blend { 1 << 8 | self.blend_dst << 4 | self.blend_src } else { 0 }, false);
+        let eq = match self.blend_eq {
+            GL_FUNC_SUBTRACT => super::rss::BLEND_EQ_SUBTRACT,
+            GL_FUNC_REVERSE_SUBTRACT => super::rss::BLEND_EQ_REVERSE_SUBTRACT,
+            GL_MIN => super::rss::BLEND_EQ_MIN,
+            GL_MAX => super::rss::BLEND_EQ_MAX,
+            _ => super::rss::BLEND_EQ_ADD,
+        };
+        sink.rss_write(
+            re::BLENDFACTOR,
+            if blend { eq << super::rss::BLEND_EQ_SHIFT | 1 << 8 | self.blend_dst << 4 | self.blend_src } else { 0 },
+            false,
+        );
+        let k = self.blend_color.map(|c| (c * 4095.0).round() as u32);
+        sink.rss_write(re::BLENDCOLOR_RG, k[0] << 16 | k[1], false);
+        sink.rss_write(re::BLENDCOLOR_BA, k[2] << 16 | k[3], false);
         let op = if self.logic != 0 || blend_logic { self.logic_op } else { 3 };
         sink.rss_write(re::PP1FILLMODE, (self.pp1_base() & !(0xF << 26)) | op << 26, false);
         let (lsb, msb) = self.color_write_masks();
@@ -2940,15 +2961,23 @@ fn lerp_window(a: &Wv, b: &Wv, t: f32) -> Wv {
     v
 }
 
-/// A GL blend factor enum as the PP1 code (see rss.rs).
+/// A GL blend factor enum as the PP1 code (see `rss::blend_rgba`).
 fn blend_code(e: u32) -> u32 {
     match e {
         0 => 0,
         1 => 1,
         0x300..=0x308 => e - 0x300 + 2,
+        // EXT_blend_color's CONSTANT_COLOR .. ONE_MINUS_CONSTANT_ALPHA.
+        0x8001..=0x8004 => e - 0x8001 + 11,
         _ => 1,
     }
 }
+
+/// Blend equations (EXT_blend_minmax, EXT_blend_subtract).
+const GL_MIN: u32 = 0x8007;
+const GL_MAX: u32 = 0x8008;
+const GL_FUNC_SUBTRACT: u32 = 0x800A;
+const GL_FUNC_REVERSE_SUBTRACT: u32 = 0x800B;
 
 /// A token's float arguments: missing ones read as GL's defaults for
 /// vertices and colours (0, 0, 0, 1).

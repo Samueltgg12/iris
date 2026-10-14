@@ -95,6 +95,8 @@ pub mod reg {
     pub const DRBSIZE: u32 = 0x16E;
     pub const ZMODE: u32 = 0x168;
     pub const BLENDFACTOR: u32 = 0x165;
+    pub const BLENDCOLOR_RG: u32 = 0x16B;
+    pub const BLENDCOLOR_BA: u32 = 0x16C;
     pub const STENCILMODE: u32 = 0x166;
     pub const STENCILMASK: u32 = 0x167;
     pub const AFUNCMODE: u32 = 0x169;
@@ -330,6 +332,76 @@ pub const OP_GL_LINE: u32 = 0x2;
 /// NOTEQUAL GEQUAL ALWAYS, "incoming OP stored".
 pub(super) const TEST_ENABLE: u32 = 1 << 3;
 pub(super) const BLEND_ENABLE: u32 = 1 << 8;
+
+/// Blending, everything OpenGL 1.1 and IMPACT's extensions name
+/// (EXT_blend_color, EXT_blend_minmax, EXT_blend_subtract; GL_LOGIC_OP is
+/// the GE's business: it becomes PP1's logic op). Only the GE HLE writes
+/// these, so beyond the factors' 4-bit fields the encoding is ours (SGI's
+/// diagnostics set BlendSfactor / BlendDfactor and nothing else):
+///   BlendFactor (0x165) source 3:0, destination 7:4, enable 8, equation
+///     11:9 (`BLEND_EQ_*`). Factor codes 0..=10 in OpenGL order (ZERO ONE
+///     SRC_COLOR ONE_MINUS_SRC_COLOR SRC_ALPHA ONE_MINUS_SRC_ALPHA
+///     DST_ALPHA ONE_MINUS_DST_ALPHA DST_COLOR ONE_MINUS_DST_COLOR
+///     SRC_ALPHA_SATURATE), then 11 CONSTANT_COLOR, 12
+///     ONE_MINUS_CONSTANT_COLOR, 13 CONSTANT_ALPHA, 14
+///     ONE_MINUS_CONSTANT_ALPHA.
+///   BlendcolorRG (0x16B) red 27:16, green 11:0; BlendcolorBA (0x16C) blue
+///     27:16, alpha 11:0: the constant colour, 12 bits a component.
+pub(super) const BLEND_EQ_SHIFT: u32 = 9;
+pub(super) const BLEND_EQ_ADD: u32 = 0;
+pub(super) const BLEND_EQ_SUBTRACT: u32 = 1;
+pub(super) const BLEND_EQ_REVERSE_SUBTRACT: u32 = 2;
+pub(super) const BLEND_EQ_MIN: u32 = 3;
+pub(super) const BLEND_EQ_MAX: u32 = 4;
+
+/// The constant blend colour, 12.16 (`BlendcolorRG` / `BA`).
+pub(super) fn blend_const(rg: u32, ba: u32) -> [i32; 4] {
+    let c = |v: u32| ((v & 0xFFF) as i32) << 16;
+    [c(rg >> 16), c(rg), c(ba >> 16), c(ba)]
+}
+
+/// One blend factor for component `k` (12.16).
+#[inline]
+fn blend_factor(code: u32, k: usize, s: &[i32; 4], d: &[i32; 4], kc: &[i32; 4]) -> i32 {
+    use fixed::ONE;
+    match code {
+        0 => 0,
+        1 => ONE,
+        2 => s[k],
+        3 => ONE - s[k],
+        4 => s[3],
+        5 => ONE - s[3],
+        6 => d[3],
+        7 => ONE - d[3],
+        8 => d[k],
+        9 => ONE - d[k],
+        10 => if k == 3 { ONE } else { s[3].min(ONE - d[3]) },
+        11 => kc[k],
+        12 => ONE - kc[k],
+        13 => kc[3],
+        14 => ONE - kc[3],
+        _ => ONE,
+    }
+}
+
+/// Source `s` blended onto destination `d` (12.16 components) as
+/// BlendFactor `bf` says, the constant colour `kc`; clamped.
+pub(super) fn blend_rgba(bf: u32, kc: &[i32; 4], s: &[i32; 4], d: &[i32; 4]) -> [i32; 4] {
+    use fixed::mul;
+    let (sf, df) = (bf & 0xF, (bf >> 4) & 0xF);
+    let eq = (bf >> BLEND_EQ_SHIFT) & 7;
+    [0, 1, 2, 3].map(|k| {
+        let a = || mul(s[k], blend_factor(sf, k, s, d, kc));
+        let b = || mul(d[k], blend_factor(df, k, s, d, kc));
+        fixed::clamp(match eq {
+            BLEND_EQ_SUBTRACT => a().wrapping_sub(b()),
+            BLEND_EQ_REVERSE_SUBTRACT => b().wrapping_sub(a()),
+            BLEND_EQ_MIN => s[k].min(d[k]),
+            BLEND_EQ_MAX => s[k].max(d[k]),
+            _ => a().wrapping_add(b()),
+        })
+    })
+}
 const FILL_POLY_STIPPLE: u32 = 1 << 2;
 /// Polygon stipple RAM in the indirect device space (SGI's POLYSTIP_RAM).
 pub const POLY_STIPPLE_RAM: u32 = 0xA000_0000;
@@ -2218,24 +2290,7 @@ impl Rss {
             let blend = self.reg(reg::BLENDFACTOR);
             let c = if blend & BLEND_ENABLE != 0 && !logic {
                 let d = [0, 8, 16, 24].map(|s| (fixed::widen((dst >> s) & 0xFF, 2) << 16) as i32);
-                let f = |code: u32, k: usize| -> i32 {
-                    match code {
-                        0 => 0,
-                        1 => ONE,
-                        2 => rgba[k],
-                        3 => ONE - rgba[k],
-                        4 => rgba[3],
-                        5 => ONE - rgba[3],
-                        6 => d[3],
-                        7 => ONE - d[3],
-                        8 => d[k],
-                        9 => ONE - d[k],
-                        10 => if k == 3 { ONE } else { rgba[3].min(ONE - d[3]) },
-                        _ => ONE,
-                    }
-                };
-                let (sf, df) = (blend & 0xF, (blend >> 4) & 0xF);
-                [0, 1, 2, 3].map(|k| fixed::clamp(mul(rgba[k], f(sf, k)).wrapping_add(mul(d[k], f(df, k)))))
+                blend_rgba(blend, &self.blend_constant(), &rgba, &d)
             } else {
                 rgba
             };
@@ -2244,6 +2299,11 @@ impl Rss {
             fixed::to_index(rgba[0]) & 0xFFF
         };
         self.put_in(b, ux as i32, uy as i32, src, back);
+    }
+
+    /// The constant blend colour (`blend_const`).
+    pub(super) fn blend_constant(&self) -> [i32; 4] {
+        blend_const(self.reg(reg::BLENDCOLOR_RG), self.reg(reg::BLENDCOLOR_BA))
     }
 
     /// `fragment_color` into a 12:12:12 buffer: blending reads and the
@@ -2257,24 +2317,7 @@ impl Rss {
         let c = if blend & BLEND_ENABLE != 0 && !logic {
             let d = unpack36(dst).map(|c| (c << 16) as i32);
             let d = [d[0], d[1], d[2], ONE];
-            let f = |code: u32, k: usize| -> i32 {
-                match code {
-                    0 => 0,
-                    1 => ONE,
-                    2 => rgba[k],
-                    3 => ONE - rgba[k],
-                    4 => rgba[3],
-                    5 => ONE - rgba[3],
-                    6 => d[3],
-                    7 => ONE - d[3],
-                    8 => d[k],
-                    9 => ONE - d[k],
-                    10 => if k == 3 { ONE } else { rgba[3].min(ONE - d[3]) },
-                    _ => ONE,
-                }
-            };
-            let (sf, df) = (blend & 0xF, (blend >> 4) & 0xF);
-            [0, 1, 2, 3].map(|k| fixed::clamp(mul(rgba[k], f(sf, k)).wrapping_add(mul(d[k], f(df, k)))))
+            blend_rgba(blend, &self.blend_constant(), &rgba, &d)
         } else {
             rgba
         };

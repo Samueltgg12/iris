@@ -20,6 +20,9 @@
 
 use std::fmt;
 
+/// Packed blend states: off, or 15 x 15 factors x 5 equations.
+const BLEND_RADIX: u64 = 1 + 15 * 15 * 5;
+
 /// The primitive whose pixel loop the shader runs.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -193,12 +196,14 @@ pub struct Stencil {
     pub zpass: u8,
 }
 
-/// Blend factors, 0..=10 in BlendFactor's order (codes above 10 act as
-/// ONE and are folded into 1).
+/// Blend factors, 0..=14 in BlendFactor's order (`rss::blend_rgba`; 15
+/// acts as ONE and is folded into 1), and the equation (`rss::BLEND_EQ_*`,
+/// 0..=4; MIN and MAX ignore the factors, which fold to 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Blend {
     pub src: u8,
     pub dst: u8,
+    pub eq: u8,
 }
 
 /// Texturing: the environment (TEXMODE1 bits 2:1), components (1..=4),
@@ -435,8 +440,9 @@ impl PipeKey {
                 self.blend = None;
             }
             if let Some(b) = self.blend.as_mut() {
-                let f = |c: u8| if c > 10 { 1 } else { c };
-                *b = Blend { src: f(b.src), dst: f(b.dst) };
+                let f = |c: u8| if c > 14 { 1 } else { c };
+                let eq = if b.eq > 4 { 0 } else { b.eq };
+                *b = if matches!(eq, 3 | 4) { Blend { src: 0, dst: 0, eq } } else { Blend { src: f(b.src), dst: f(b.dst), eq } };
             }
             self.tex = self.tex.map(Tex::normalized);
         } else {
@@ -472,7 +478,7 @@ impl PipeKey {
                 1 + 8 * 216,
             );
             e.put(k.z.map_or(0, |f| f as u64 + 1), 9);
-            e.put(k.blend.map_or(0, |b| 1 + b.src as u64 + 11 * b.dst as u64), 1 + 121);
+            e.put(k.blend.map_or(0, |b| 1 + b.src as u64 + 15 * (b.dst as u64 + 15 * b.eq as u64)), BLEND_RADIX);
             e.put(k.tex.map_or(0, |t| 1 + t.code()), 1 + Tex::RADIX);
             e.put(k.fog as u64, 2);
         } else {
@@ -519,9 +525,9 @@ impl PipeKey {
                 0 => None,
                 n => Some(n as u8 - 1),
             };
-            k.blend = match d.get(122) {
+            k.blend = match d.get(BLEND_RADIX) {
                 0 => None,
-                n => Some(Blend { src: ((n - 1) % 11) as u8, dst: ((n - 1) / 11) as u8 }),
+                n => Some(Blend { src: ((n - 1) % 15) as u8, dst: ((n - 1) / 15 % 15) as u8, eq: ((n - 1) / 225) as u8 }),
             };
             k.tex = match d.get(1 + Tex::RADIX) {
                 0 => None,
@@ -541,7 +547,7 @@ impl PipeKey {
     /// group on): the packed form must stay below it.
     pub fn max_packed() -> u128 {
         let common: u128 = 6 * 2 * 5 * 4 * Pix::ALL.len() as u128 * 17 * 2;
-        let gl: u128 = 2 * 9 * (1 + 8 * 216) * 9 * 122 * (1 + Tex::RADIX as u128) * 2;
+        let gl: u128 = 2 * 9 * (1 + 8 * 216) * 9 * BLEND_RADIX as u128 * (1 + Tex::RADIX as u128) * 2;
         let d2: u128 = 2 * 2 * 8 * 6;
         common * gl.max(d2)
     }
@@ -584,7 +590,7 @@ impl fmt::Display for PipeKey {
                 write!(f, " z={z}")?;
             }
             if let Some(b) = k.blend {
-                write!(f, " blend={}/{}", b.src, b.dst)?;
+                write!(f, " blend={}/{}/eq{}", b.src, b.dst, b.eq)?;
             }
             if let Some(t) = k.tex {
                 write!(
@@ -651,7 +657,7 @@ mod tests {
             alpha: Some(6),
             stencil: Some(Stencil { func: 7, fail: 5, zfail: 4, zpass: 3 }),
             z: Some(7),
-            blend: Some(Blend { src: 10, dst: 9 }),
+            blend: Some(Blend { src: 10, dst: 9, eq: 2 }),
             tex: Some(tex),
             fog: true,
             ..PipeKey::default()
@@ -663,7 +669,7 @@ mod tests {
 
     #[test]
     fn normalisation_folds_what_draws_alike() {
-        let a = PipeKey { prim: Prim::Tri, rgb: false, blend: Some(Blend { src: 4, dst: 5 }), ..PipeKey::default() };
+        let a = PipeKey { prim: Prim::Tri, rgb: false, blend: Some(Blend { src: 4, dst: 5, eq: 0 }), ..PipeKey::default() };
         assert_eq!(a.pack(), PipeKey { prim: Prim::Tri, ..PipeKey::default() }.pack());
         let s = PipeKey { prim: Prim::Fill, tex: Some(Tex::default()), alpha: Some(1), ..PipeKey::default() };
         assert_eq!(s.pack(), PipeKey::default().pack());
