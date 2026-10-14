@@ -818,6 +818,32 @@ fn gl_logic_op_xor_and_colour_mask() {
     m.stop_engines();
 }
 
+/// IRIS GL's logicop() (AutoCAD's XOR crosshair, traced): glBlendEquationEXT
+/// (GL_LOGIC_OP), then GL_BLEND enables the logic op instead of blending.
+/// A line XORed twice leaves the background, and blending is back once the
+/// equation is GL_FUNC_ADD again.
+#[test]
+fn gl_blend_equation_logic_op_xors() {
+    let m = gl_board([0.0, 0.0, 0.5]);
+    let bg = gl_px(&m, 200, 150);
+    fifo_token(&m, 0x60, &[0x0BF1]);
+    fifo_token(&m, 0x65, &[1]);
+    fifo_token(&m, 0x40, &[6]);
+    gl_color4(&m, [1.0, 1.0, 1.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(gl_px(&m, 200, 150), bg ^ 0xFF_FFFF, "XORed once");
+    gl_full_quad(&m);
+    assert_eq!(gl_px(&m, 200, 150), bg, "XORed twice: the background");
+    // Back to blending: ONE, ONE adds.
+    fifo_token(&m, 0x40, &[3]);
+    fifo_token(&m, 0x60, &[0x8006]);
+    fifo_token(&m, 0x3F, &[1, 1]);
+    gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(gl_px(&m, 200, 150), bg | 0xFF, "blending again");
+    m.stop_engines();
+}
+
 /// The classic stencil mask: a triangle writes stencil 1 with colour
 /// writes off, then a full quad drawn where stencil == 1.
 #[test]
