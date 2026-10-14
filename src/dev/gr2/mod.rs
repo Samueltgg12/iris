@@ -216,6 +216,11 @@ pub struct Gr2 {
     threads: Mutex<Vec<thread::JoinHandle<()>>>,
     hq_thread: Mutex<Option<thread::Thread>>,
     re3_thread: Mutex<Option<thread::Thread>>,
+    /// The engine threads parked (`sleep`): producers unpark one only then,
+    /// so a push reads a line nobody writes instead of taking the thread's
+    /// slot lock and unparking it every time. Each on its own cache line.
+    hq_asleep: crossbeam_utils::CachePadded<AtomicBool>,
+    re3_asleep: crossbeam_utils::CachePadded<AtomicBool>,
 
     pub screen: Mutex<Rex3Screen>,
     pub renderer: Mutex<Option<Box<dyn Renderer>>>,
@@ -400,10 +405,39 @@ impl Gr2 {
         }
     }
 
-    fn wake(slot: &Mutex<Option<thread::Thread>>) {
+    fn unpark(slot: &Mutex<Option<thread::Thread>>) {
         if let Some(t) = slot.lock().as_ref() {
             t.unpark();
         }
+    }
+
+    /// After a push: unpark the consumer if it is asleep. The fence pairs
+    /// with `sleep`'s: either this sees the thread asleep, or the thread
+    /// sees the push before it parks.
+    fn wake(asleep: &AtomicBool, slot: &Mutex<Option<thread::Thread>>) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if asleep.load(Ordering::Relaxed) {
+            Self::unpark(slot);
+        }
+    }
+
+    /// An engine thread with nothing to do: park for up to 2 ms, unless
+    /// `has_work` finds a push made before `asleep` was raised.
+    fn sleep(asleep: &AtomicBool, has_work: impl FnOnce() -> bool) {
+        asleep.store(true, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if !has_work() {
+            thread::park_timeout(std::time::Duration::from_millis(2));
+        }
+        asleep.store(false, Ordering::Relaxed);
+    }
+
+    fn wake_hq(&self) {
+        Self::wake(&self.hq_asleep, &self.hq_thread);
+    }
+
+    fn wake_re3(&self) {
+        Self::wake(&self.re3_asleep, &self.re3_thread);
     }
 
     // ── board ID registers ───────────────────────────────────────────────────
@@ -540,7 +574,7 @@ impl Gr2 {
                     }
                     return BUS_BUSY;
                 }
-                Self::wake(&self.hq_thread);
+                self.wake_hq();
             }
             HQUCODE..HQUCODE_END => r.hq.ucode[((off - HQUCODE) >> 2) as usize] = val,
             GEWIN..GEWIN_END => r.ge.write(((off - GEWIN) >> 10) as usize, ((off >> 2) & 0xff) as usize, val),
@@ -551,7 +585,7 @@ impl Gr2 {
                 if !self.hq_fifo.try_push(hq2::HQ_TOKEN_GEDMA, val as u64) {
                     return BUS_BUSY;
                 }
-                Self::wake(&self.hq_thread);
+                self.wake_hq();
             }
             // FIN3 write port (HQ2.h): Xsgi writes 0 after seeing FIN3;
             // the kernel restores a context's saved FIN3 here.
@@ -563,7 +597,7 @@ impl Gr2 {
                     return BUS_BUSY;
                 }
                 r.hq.write(off - HQREGS, val, &mut r.ge);
-                Self::wake(&self.hq_thread);
+                self.wake_hq();
             }
             HQREGS..HQREGS_END => {
                 if off - HQREGS == hq2::HQ_FIN2 {
@@ -627,7 +661,7 @@ impl Gr2 {
         if !self.re3_fifo.try_push(reg as u32, val as u64) {
             return BUS_BUSY;
         }
-        Self::wake(&self.re3_thread);
+        self.wake_re3();
         BUS_OK
     }
 
@@ -646,7 +680,7 @@ impl Gr2 {
             if !self.re3_fifo.try_push(re3::RE3_OP_READ_ADVANCE, 0) {
                 return BusRead32::busy();
             }
-            Self::wake(&self.re3_thread);
+            self.wake_re3();
         }
         BusRead32::ok(v)
     }
@@ -668,7 +702,7 @@ impl Gr2 {
                     }
                     std::hint::spin_loop();
                 }
-                Gr2::wake(&self.0.re3_thread);
+                self.0.wake_re3();
             }
             /// Wait for RE3 to finish everything queued; false if stopped first.
             fn drain_re3(&self) -> bool {
@@ -694,7 +728,7 @@ impl Gr2 {
                     }
                     std::hint::spin_loop();
                 }
-                Gr2::wake(&self.0.re3_thread);
+                self.0.wake_re3();
             }
             fn finish(&mut self, flag: usize) {
                 // The host polls the flag to learn the request is done, so it
@@ -780,7 +814,7 @@ impl Gr2 {
                 self.hq_fifo.flush_head();
                 self.hq_busy.store(false, Ordering::Release);
                 if backoff.is_completed() {
-                    thread::park_timeout(std::time::Duration::from_millis(2));
+                    Self::sleep(&self.hq_asleep, || self.hq_fifo.peek().is_some());
                 } else {
                     backoff.snooze();
                 }
@@ -865,7 +899,7 @@ impl Gr2 {
                 self.re3_fifo.flush_head();
                 self.re3_busy.store(false, Ordering::Release);
                 if backoff.is_completed() {
-                    thread::park_timeout(std::time::Duration::from_millis(2));
+                    Self::sleep(&self.re3_asleep, || self.re3_fifo.peek().is_some());
                 } else {
                     backoff.snooze();
                 }
@@ -961,7 +995,7 @@ impl Gr2 {
                 }
                 return BUS_BUSY;
             }
-            Self::wake(&self.hq_thread);
+            self.wake_hq();
             return BUS_OK;
         }
         if (RE3_REGS..RE3_REGS_END).contains(&off) {
@@ -969,7 +1003,7 @@ impl Gr2 {
             if !self.re3_fifo.try_push2(reg, hi as u64, reg + 1, lo as u64) {
                 return BUS_BUSY;
             }
-            Self::wake(&self.re3_thread);
+            self.wake_re3();
             return BUS_OK;
         }
         let st = self.reg_write(off, hi);
@@ -1002,8 +1036,8 @@ impl Device for Gr2 {
         }
         self.hq_fifo.push(u32::MAX, 0);
         self.re3_fifo.push(re3::RE3_OP_EXIT, 0);
-        Self::wake(&self.hq_thread);
-        Self::wake(&self.re3_thread);
+        Self::unpark(&self.hq_thread);
+        Self::unpark(&self.re3_thread);
         for t in self.threads.lock().drain(..) {
             let _ = t.join();
         }

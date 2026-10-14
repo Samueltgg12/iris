@@ -50,6 +50,24 @@ shaders. `Gr2::new` sets `IRIS_GR2_JIT`'s mode.
   subpixel fraction in y when |DX| = 1.0. FLAT positions are always
   `x0 + i`, whatever DX says. Other SHADED spans clip per pixel.
 
+## A faster RE3 can make the board slower
+
+At first the JIT made long Z-buffered spans about 35% slower (gltest
+--tribench --trisize 300 --depth: 1,210 tris/s against 1,870). The shaders
+were not slow; the HQ2 thread was paying for RE3 being idle:
+
+- **Every HQ2 push took RE3's thread-slot mutex and unparked it.**
+- **A consumer that keeps catching up parks and re-reads the producer's
+  FIFO lines far more often.**
+
+The JIT made RE3 idle much more of the time. The fix is the mgras one
+(6e76140b): a thread raises a cache-padded `*_asleep` flag before it parks,
+and producers unpark only when that flag is up (`Gr2::wake` / `sleep`).
+With it the JIT is 12% faster on the same test (about 2,050 against 1,830).
+
+When a raster speed-up shows up as a slowdown, look at the wake path
+first.
+
 ## Where the time goes
 
 Profile of IRIX gltest --tribench (8-px triangles):
