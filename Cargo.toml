@@ -174,8 +174,11 @@ rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelif
 # Cranelift-based JIT for IMPACT (GR4) raster shaders: RSS/TE1 pixel
 # pipelines monomorphised on a 64-bit key (src/dev/mgras/rss_jit).
 gr4-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
-# Every graphics JIT: `--features gpujit` for `rex-jit,gr4-jit`.
-gpujit = ["rex-jit", "gr4-jit"]
+# Cranelift-based JIT for GR2 (XZ / Extreme) RE3 spans: SHADED / FLAT
+# span pipelines monomorphised on a packed key (src/dev/gr2/re3_jit).
+gr2-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
+# Every graphics JIT: `--features gpujit` for `rex-jit,gr4-jit,gr2-jit`.
+gpujit = ["rex-jit", "gr4-jit", "gr2-jit"]
 # JIT v2: physical-page PIC region compiler (see rules/jitv2/jit-v2-design.md).
 # Unconditionally-correct-at-publish redesign, replacing the speculative v1
 # tiered JIT (removed). Whole-page compilation implies transparent caching.

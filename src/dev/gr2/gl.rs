@@ -51,6 +51,11 @@ pub const T_CLEAR_COLOR_DEPTH: u32 = 0x0a0;
 /// Colour-index clear (libglcore clear_ci, C1|0x104): index (f32); DATA
 /// 0, 0, 0. gr_osview clears its window with index 46 this way.
 pub const T_CLEAR_CI: u32 = 0x3104;
+/// Colour-index clear with depth (CZClear on a CI visual): index, f32 on
+/// C1|0x0A0 or an integer on ITOF|C1|0x0A0 (pixtest, IRIX 6.5.22); DATA 0,
+/// 0, 0, depth, 0xFFFFFFFF as for 0x0A0.
+pub const T_CLEAR_CI_DEPTH: u32 = 0x30a0;
+pub const T_CLEAR_CI_DEPTH_I: u32 = 0x70a0;
 /// Window rectangle, sent by the kernel at context restore: x0; DATA y0 (GL,
 /// bottom-up), w, h, 0x10, 0, 1, (x1 << 11) | x0, (y1 << 10) | y0, 0 x 6.
 pub const T_WINDOW: u32 = 0x1e5;
@@ -181,15 +186,33 @@ pub const T_CLIP_PLANE: u32 = 0x02f;
 /// sends all three to the token; IRIS GL rectzoom sends the first to the
 /// token and the zooms on DATA (snoop: 0, 6.0, 6.0).
 pub const T_PIXEL_ZOOM: u32 = 0x0bb;
-/// Pixel read through the mailbox (IRIS GL readpixels / rectread, OpenGL
-/// ReadColor, Fetch, Pack1): x on the token; DATA y, width, height, then
-/// three words (1, 0, 0 seen; meaning unknown). Window-relative, GL y up,
-/// y = the bottom row. The microcode puts the pixels in shram from the
-/// mailbox word 0x4022, one per word (as the 0x0AC DMA read decodes them,
-/// rows top first), and raises FIN3 itself: libgl polls version bit 0
-/// without sending a Finish, then copies the words, acks FIN3 at 0x6B000
-/// and sends READ_DONE. Unimplemented, snoop spun on FIN3 for its whole
-/// time slice.
+/// glCopyPixels of colour (__glExpFastCopyPixels, after 0x0A7 / 0x0A8 = 0
+/// and 0x0BB = 0.0, |zoom x|, |zoom y| as whole numbers): token 0; DATA
+/// source y, destination y, height, source x, destination x, width (window
+/// coordinates, GL y up). libglcore takes its slow path (DrawPixels of a
+/// ReadPixels) for pixel transfer, zoom below 1 or negative, and blending
+/// or logic op with different read and draw buffers.
+pub const T_COPY_PIXELS: u32 = 0x0ba;
+
+/// Which pixel zoom (0x0BB) a pixel row applies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PixZoom {
+    None,
+    /// x only: OpenGL rows (0x0B2), libglcore repeats rows for y.
+    X,
+    /// Both, rows in 0x0B8's bottom-first order.
+    Both,
+}
+/// Pixel read through the mailbox (IRIS GL readpixels / lrectread, OpenGL
+/// ReadColor, Fetch, Pack1): x on the token; DATA y, width, height, words
+/// a row, 0, 0 (IRIS GL sends 1 for the words, one pixel a word).
+/// Window-relative, GL y up, y = the bottom row. The microcode puts the
+/// pixels in shram from the mailbox word 0x4022 at 0x0A7's packing (as the
+/// 0x0AC DMA read decodes them), rows BOTTOM first (libglcore Pack1 of a
+/// 13x5 colour-index image; IRIS GL lrectread walks its chunks upwards
+/// too), and raises FIN3 itself: libgl polls version bit 0 without sending
+/// a Finish, then copies the words, acks FIN3 at 0x6B000 and sends
+/// READ_DONE. Unimplemented, snoop spun on FIN3 for its whole time slice.
 pub const T_READ_RECT: u32 = 0x0ad;
 pub const T_IRIS_SBOXF: u32 = 0x053;
 /// swaptmesh (gl_i_swaptmesh): swap the two vertices a tmesh (bgntmesh =
@@ -261,9 +284,12 @@ pub const T_BITMAP: u32 = 0x18c;
 pub const T_BITMAP_TALL: u32 = 0x18d;
 pub const T_BITMAP_HUGE: u32 = 0x18e;
 const BITMAP_HDR: usize = 6;
-/// Pixel read setup (__glExpReadPixelsKDMA, Fetch, ReadColor): read setup
-/// 0x0A7 / 0x0A8 = 0 and read mode 0x0BC (1 before a pixel DMA read, 0
-/// before READ_RECT). Meaning unknown; the HLE ignores them.
+/// Pixel setup before pixel reads and draws (__glExpReadPixelsKDMA, Fetch,
+/// ReadColor, DrawPixels): 0x0A7 = the packing of the pixel words that
+/// follow (0 = one 32-bit pixel a word, 1 = two 16-bit, 2 = four 8-bit,
+/// first pixel in the MSB; colour-index UNSIGNED_BYTE / SHORT images,
+/// pixtest), 0x0A8 = 0 (meaning unknown), read mode 0x0BC (1 before a pixel
+/// DMA read, 0 before READ_RECT).
 pub const T_READ_SETUP_A: u32 = 0x0a7;
 pub const T_READ_SETUP_B: u32 = 0x0a8;
 pub const T_READ_MODE: u32 = 0x0bc;
@@ -421,9 +447,14 @@ pub struct GlState {
     /// last IRIS GL normal leaves what follows unlit (see T_IRIS_COLOR).
     /// [0] = set, [1] spare (keeps GlState free of padding).
     iris_unlit: [u32; 2],
-    /// Spare word: GlState is 8-byte aligned (`span`), so its 4-byte
-    /// fields must add up to an even count or the struct gets tail padding
-    /// (asserted below). Drop or add one when a field changes size.
+    /// Stencil planes of the window's visual (0x00E: 0, or 4 on XZ's z20
+    /// s4 visuals). GlState is 8-byte aligned (`span`), so its 4-byte fields
+    /// must add up to an even count or the struct gets tail padding
+    /// (asserted below): add a spare word when adding or dropping one.
+    st_bits: u32,
+    /// Pixel word packing (0x0A7): 0 = 32-bit, 1 = 2 x 16, 2 = 4 x 8.
+    pix_pack: u32,
+    /// Spare (keeps the count of 4-byte fields even, see st_bits).
     pad: u32,
     /// Vertices drawn / primitives emitted since the last trace note.
     pub stats_vertices: u32,
@@ -735,7 +766,7 @@ impl Hq2Engine {
         use super::ReadDecode;
         let g = &self.gl;
         if g.read_src[0] == 2 {
-            return ReadDecode::Depth;
+            return ReadDecode::Depth { sbits: g.st_bits.min(8) };
         }
         let bank = (g.swap ^ (g.read_src[1] & 1)) & 1;
         match g.pixfmt {
@@ -743,6 +774,7 @@ impl Hq2Engine {
             re3::PIXFMT_CI12 => ReadDecode::Ci12 { bank },
             re3::PIXFMT_CI8 => ReadDecode::Ci8 { bank },
             re3::PIXFMT_RGB8 => ReadDecode::Rgb8 { bank },
+            re3::PIXFMT_RGB4 => ReadDecode::Rgb4 { bank },
             _ => ReadDecode::Rgb24,
         }
     }
@@ -757,19 +789,25 @@ impl Hq2Engine {
         use super::{ReadDest, ReadImage};
         self.gl.ensure_init();
         // Room in shram above the mailbox.
+        // DATA y, width, height, words a row, 0, 0 (libglcore Pack1 and
+        // its span reads); packing from 0x0A7. IRIS GL sends 1 for the
+        // words (2x2 readpixels) with a pixel a word: trust the count only
+        // for packed pixels, where OpenGL is the only sender.
         let (w, rows) = (a[2].min(2048), a[3].min(4096));
-        let rows = rows.min((0x8000 - READBACK_SHRAM as u32) / w.max(1));
+        let wpr = if self.gl.pix_pack != 0 && a[4] != 0 { a[4].min(2048) } else { w };
+        let rows = rows.min((0x8000 - READBACK_SHRAM as u32) / wpr.max(1));
         let mut s2d = self.s2d;
-        s2d.buf_select = 0;
+        s2d.buf_select = self.gl.pix_pack;
         s2d.buf_offset = 0;
         let req = ReadImage {
             x: self.gl.win[0] + a[0] as i32,
             top: self.gl.win[1] + a[1] as i32 + rows as i32 - 1,
             w,
             rows,
-            words_per_row: w,
+            words_per_row: wpr,
             s2d,
             decode: self.gl_read_decode(),
+            bottom_up: true,
         };
         out.read_image(&req, ReadDest::Shram(READBACK_SHRAM));
     }
@@ -783,7 +821,13 @@ impl Hq2Engine {
         self.gl.ensure_init();
         let (w, rows, wpr) = (a[2], a[3], a[4].max(1));
         let mut s2d = self.s2d;
-        s2d.buf_select = match (w + wpr - 1) / wpr { 4 => 2, 2 => 1, _ => 0 };
+        // OpenGL says the packing on 0x0A7; IRIS GL lrectread does not
+        // send it: pixels per word from the width and words a row.
+        s2d.buf_select = if self.gl.pix_pack != 0 {
+            self.gl.pix_pack
+        } else {
+            match w.div_ceil(wpr) { 4 => 2, 2 => 1, _ => 0 }
+        };
         s2d.buf_offset = 0;
         let req = ReadImage {
             x: self.gl.win[0] + a[0] as i32,
@@ -793,6 +837,7 @@ impl Hq2Engine {
             words_per_row: wpr,
             s2d,
             decode: self.gl_read_decode(),
+            bottom_up: false,
         };
         out.read_image(&req, ReadDest::Gedma);
     }
@@ -908,7 +953,7 @@ impl Hq2Engine {
             T_VIEWPORT => 7,
             T_SCISSOR => 4,
             T_CLEAR_COLOR | T_CLEAR_CI => 4,
-            T_CLEAR_COLOR_DEPTH => 6,
+            T_CLEAR_COLOR_DEPTH | T_CLEAR_CI_DEPTH | T_CLEAR_CI_DEPTH_I => 6,
             T_WINDOW => 15,
             light::T_LIGHTING | light::T_TWO_SIDED => 2,
             light::T_NORMALIZE | light::T_NORMALIZE_B | light::T_FOG_ON | light::T_MATERIAL_COMMIT => 1,
@@ -926,6 +971,7 @@ impl Hq2Engine {
             T_READ_RECT => 7,
             T_GET_ORIGIN | T_IRIS_GET_COLOR | T_PIX_START | T_PIX_END => 1,
             T_PIX_RECT => 5,
+            T_COPY_PIXELS => 7,
             T_RASTER_POS => 4,
             T_BITMAP => (BITMAP_HDR + 9) as u32,
             T_BITMAP_TALL => (BITMAP_HDR + 17) as u32,
@@ -1239,7 +1285,8 @@ impl Hq2Engine {
                 light::command(&mut g.lt, cmd, &a[..]);
             }
             T_LOGIC_OP => g.logic_op = a[0] & 0xf,
-            T_READ_DONE | T_READ_SETUP_A | T_READ_SETUP_B | T_READ_MODE => {}
+            T_READ_SETUP_A => g.pix_pack = a[0] & 3,
+            T_READ_DONE | T_READ_SETUP_B | T_READ_MODE => {}
             T_GET_COLOR => {
                 let c = g.color;
                 for (k, v) in c.iter().enumerate() {
@@ -1285,6 +1332,7 @@ impl Hq2Engine {
                 }
             }
             T_PIXEL_ZOOM => g.pzoom = [f(a[1]), f(a[2])],
+            T_COPY_PIXELS => self.gl_copy_pixels(&a, out),
             T_READ_RECT => self.gl_mailbox_read(&a, out),
             T_IRIS_SETCPOS => {
                 // Screen coordinates (getcpos x + count).
@@ -1312,13 +1360,23 @@ impl Hq2Engine {
                 }
             }
             T_PIX_RECT => {
-                let w = (a[2] as usize).min(self.pix_n as usize);
-                let mut words = [0u32; super::PIX_WORDS];
-                words[..w].copy_from_slice(&self.pix[..w]);
+                // DATA y, pixels, words, flag: the words hold the pixels at
+                // 0x0A7's packing, first pixel in the MSB.
+                let per = match g.pix_pack { 2 => 4usize, 1 => 2, _ => 1 };
+                let bits = 32 / per as u32;
+                let nw = (self.pix_n as usize).min(super::PIX_WORDS);
+                let w = (a[2] as usize).min(nw * per);
+                let mut words = [0u32; super::PIX_WORDS * 4];
+                for (n, p) in words[..w].iter_mut().enumerate() {
+                    let v = self.pix[n / per];
+                    *p = if per == 1 { v } else { (v >> (32 - bits * (1 + (n % per) as u32))) & ((1 << bits) - 1) };
+                }
                 if a[4] != 0 {
                     words[..w].reverse();
                 }
-                self.gl_pixel_row(a[0] as i32, a[1] as i32, 0, w as u32, 1, 0, &words[..w], false, out);
+                // libglcore repeats rows itself and sends the x zoom as a
+                // whole number (__glExpFastDrawPixels): replicate in x.
+                self.gl_pixel_row(a[0] as i32, a[1] as i32, 0, w as u32, 1, 0, &words[..w], PixZoom::X, out);
                 self.pix_n = 0;
             }
             T_IRIS_GETCPOS => {
@@ -1357,7 +1415,7 @@ impl Hq2Engine {
             T_DEPTH_MASK => g.zmask = a[0] & 0x00ff_ffff,
             T_STENCIL_MODE => g.st.copy_from_slice(&a[..7]),
             T_STENCIL_WMASK => g.st_wmask = a[0] & 0xff,
-            T_STENCIL_CONFIG => {}
+            T_STENCIL_CONFIG => g.st_bits = a[0] & 0xff,
             T_STENCIL_CLEAR => {
                 let (v, m) = ((a[0] & 0xff) << re3::ZBUF_STENCIL_SHIFT, (a[1] & 0xff) << re3::ZBUF_STENCIL_SHIFT);
                 self.gl_zfill(v, m, out);
@@ -1380,10 +1438,11 @@ impl Hq2Engine {
             }
             // Visual of the window being bound: 4 = 24-bit RGB, 2 = 12-bit
             // RGB, 10 = 12-bit colour index (showmap) (inferred from traces).
-            // Visual code from the kernel (inferred from 1, 2, 4, 9, 10 in
+            // Visual code from the kernel (inferred from 0, 1, 2, 4, 9, 10 in
             // traces and the DDX's matching 2D MODE numbers): bit 3 = colour
-            // index, low bits = depth (1 = 8, 2 = 12, 4 = 24 bits).
+            // index, low bits = depth (0 = 4, 1 = 8, 2 = 12, 4 = 24 bits).
             T_MAKECURRENT => match a[0] {
+                0 => g.pixfmt = re3::PIXFMT_RGB4,
                 4 => g.pixfmt = 0,
                 2 => g.pixfmt = re3::PIXFMT_RGB12,
                 1 => g.pixfmt = re3::PIXFMT_RGB8,
@@ -1392,6 +1451,11 @@ impl Hq2Engine {
                 _ => {}
             },
             T_CLEAR_CI => self.gl_clear([f(a[0]) / 255.0, 0.0, 0.0, 1.0], out),
+            T_CLEAR_CI_DEPTH | T_CLEAR_CI_DEPTH_I => {
+                let i = if cmd == T_CLEAR_CI_DEPTH_I { a[0] as i32 as f32 } else { f(a[0]) };
+                self.gl_clear([i / 255.0, 0.0, 0.0, 1.0], out);
+                self.gl_zfill(a[4] & 0x00ff_ffff, 0x00ff_ffff, out);
+            }
             T_CLEAR_COLOR | T_CLEAR_COLOR_DEPTH => {
                 let c = [f(a[0]), f(a[1]), f(a[2]), 1.0];
                 self.gl_clear(c, out);
@@ -1436,6 +1500,8 @@ impl Hq2Engine {
             T_SCISSOR => format!("GL_SCISSOR ({}, {})-({}, {})", g.scissor[0], g.scissor[1], g.scissor[2], g.scissor[3]),
             T_SHADE_MODEL => format!("GL_SHADE_MODEL {}", if g.smooth != 0 { "smooth" } else { "flat" }),
             T_CLEAR_CI => format!("GL_CLEAR index {} rect {:?}", f(a[0]), g.clip_rect()),
+            T_CLEAR_CI_DEPTH | T_CLEAR_CI_DEPTH_I => format!("GL_CLEAR index {} depth {:#x} rect {:?}",
+                if cmd == T_CLEAR_CI_DEPTH_I { a[0] as i32 as f32 } else { f(a[0]) }, a[4], g.clip_rect()),
             T_CLEAR_COLOR | T_CLEAR_COLOR_DEPTH => format!("GL_CLEAR rgb ({}, {}, {}) rect {:?}", f(a[0]), f(a[1]), f(a[2]), g.clip_rect()),
             c if c & LOADV != 0 => format!("GL vertex routine {:#x}", c & 0x1ff),
             c if BEGIN_TOKENS.contains(&c) || END_TOKENS.contains(&c) => super::index_label(c),
@@ -1463,6 +1529,9 @@ impl Hq2Engine {
                 if g.cpos[2] != 0 { " invalid" } else { "" }),
             T_GET_COLOR | T_GET_NORMAL | T_GET_RASTERPOS => format!("{} -> shram[{:#x}]", super::index_label(cmd), READBACK_SHRAM),
             T_READ_DONE => "GL_READ_DONE".to_string(),
+            T_COPY_PIXELS => format!("GL_COPY_PIXELS ({}, {}) {}x{} -> ({}, {}) zoom {} x {} from bank {}",
+                a[4] as i32, a[1] as i32, a[6], a[3], a[5] as i32, a[2] as i32, g.pzoom[0], g.pzoom[1],
+                (g.swap ^ (g.read_src[1] & 1)) & 1),
             T_PIXEL_ZOOM => format!("GL_PIXEL_ZOOM {} x {} ({})", f(a[1]), f(a[2]), f(a[0])),
             T_READ_RECT => format!("GL_READ_RECT ({}, {}) {}x{} [{:#x} {:#x} {:#x}] {} -> shram[{:#x}], FIN3",
                 a[0] as i32, a[1] as i32, a[2], a[3], a[4], a[5], a[6], self.gl_read_desc(), READBACK_SHRAM),
@@ -1500,6 +1569,7 @@ impl Hq2Engine {
                 re3::PIXFMT_CI12 => "CI12",
                 re3::PIXFMT_CI8 => "CI8",
                 re3::PIXFMT_RGB8 => "RGB8",
+                re3::PIXFMT_RGB4 => "RGB4",
                 _ => "RGB24",
             }),
             _ => return None,
@@ -1665,6 +1735,14 @@ impl Hq2Engine {
         }
         self.gl_setup(out);
         let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32) << 11;
+        // Colour index: the first word is the index itself (libglcore adds
+        // 0.5 to round), wrapped to the visual's bits.
+        let mask = match self.gl.pixfmt {
+            re3::PIXFMT_CI12 => 0xfff,
+            re3::PIXFMT_CI8 => 0xff,
+            _ => 0,
+        };
+        let c = if mask != 0 { [((c[0].floor() as i64) & mask) as f32 / 255.0, 0.0, 0.0, 1.0] } else { c };
         let rgb = to_fixed(c, self.gl.cmax());
         self.gl_color_regs(rgb, out);
         out.reg(re3::REG_DR, 0);
@@ -1795,7 +1873,7 @@ impl Hq2Engine {
     /// 0xAABBGGRR (cpack order). Drawn as runs of equal pixels, clipped to
     /// the window, with integer pixel zoom for 0x0B8.
     pub(super) fn gl_pixel_row(&mut self, x: i32, y: i32, row: u32, w: u32, h: u32, fmt: u32, words: &[u32],
-                               zoomed: bool, out: &mut dyn Re3Sink) {
+                               zoom: PixZoom, out: &mut dyn Re3Sink) {
         let g = &self.gl;
         let (per_word, bits) = match fmt { 2 => (4usize, 8u32), 1 => (2, 16), _ => (1, 32) };
         let px = |n: usize| -> u32 {
@@ -1814,9 +1892,13 @@ impl Hq2Engine {
                 [u(0), u(8), u(16), u(24)]
             }
         };
-        let z = |v: f32| if zoomed && v >= 1.0 { v.round() as i32 } else { 1 };
-        let (zx, zy) = (z(g.pzoom[0]), z(g.pzoom[1]));
-        let from_bottom = if zoomed { row as i32 } else { h.saturating_sub(1 + row) as i32 };
+        let z = |v: f32| if v >= 1.0 { v.round() as i32 } else { 1 };
+        let (zx, zy) = match zoom {
+            PixZoom::None => (1, 1),
+            PixZoom::X => (z(g.pzoom[0]), 1),
+            PixZoom::Both => (z(g.pzoom[0]), z(g.pzoom[1])),
+        };
+        let from_bottom = if zoom == PixZoom::Both { row as i32 } else { h.saturating_sub(1 + row) as i32 };
         let (wx, wy) = (g.win[0] + x, g.win[1] + y + from_bottom * zy);
         let cmax = g.cmax();
         self.gl_setup(out);
@@ -1837,6 +1919,37 @@ impl Hq2Engine {
             }
             n = e;
         }
+        self.gl_done(out);
+    }
+
+    /// 0x0BA: copy a rectangle of the read buffer to the draw buffer, each
+    /// visible piece of the destination on its own (RE3 scissor = the piece).
+    fn gl_copy_pixels(&mut self, a: &[u32], out: &mut dyn Re3Sink) {
+        let g = &self.gl;
+        let (sy, dy, h, sx, dx, w) = (a[1] as i32, a[2] as i32, a[3] as i32, a[4] as i32, a[5] as i32, a[6] as i32);
+        let z = |v: f32| if v >= 1.0 { v.round() as u32 } else { 1 };
+        let (zx, zy) = (z(g.pzoom[0]), z(g.pzoom[1]));
+        let bits = match g.pixfmt {
+            re3::PIXFMT_RGB12 | re3::PIXFMT_CI12 => 12,
+            re3::PIXFMT_RGB8 | re3::PIXFMT_CI8 => 8,
+            re3::PIXFMT_RGB4 => 4,
+            _ => 0,
+        };
+        let mode = re3::copy_mode(zx, zy, bits, (g.swap ^ (g.read_src[1] & 1)) & 1);
+        let (wx, wy) = (g.win[0], g.win[1]);
+        let (rects, n) = g.visible_rects();
+        self.gl_setup(out);
+        for r in &rects[..n] {
+            out.reg(re3::REG_XMIN, r[0] as u32);
+            out.reg(re3::REG_XMAX, (r[2] - 1) as u32);
+            out.reg(re3::REG_YMIN, r[1] as u32);
+            out.reg(re3::REG_YMAX, (r[3] - 1) as u32);
+            out.copy(wx + sx, wy + sy, w, h, wx + dx, wy + dy, mode);
+        }
+        out.reg(re3::REG_XMIN, 0);
+        out.reg(re3::REG_XMAX, re3::FB_W as u32 - 1);
+        out.reg(re3::REG_YMIN, 0);
+        out.reg(re3::REG_YMAX, re3::FB_H as u32 - 1);
         self.gl_done(out);
     }
 

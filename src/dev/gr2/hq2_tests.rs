@@ -2731,9 +2731,10 @@ fn iris_rectzoom_token_then_data() {
     assert_eq!(gl_px(g, 103, 50) & 0xfff, 0x301);
 }
 
-/// IRIS GL readpixels / rectread (snoop): 0x0AD x; DATA y, w, h, 1, 0, 0.
-/// The pixels land in shram from the mailbox (0x4022), one per word, and
-/// the microcode raises FIN3 itself (libgl polls without a Finish).
+/// IRIS GL readpixels / lrectread (snoop): 0x0AD x; DATA y, w, h, 1, 0, 0.
+/// The pixels land in shram from the mailbox (0x4022), one per word, rows
+/// bottom first (as libglcore's Pack1 takes them), and the microcode
+/// raises FIN3 itself (libgl polls without a Finish).
 #[test]
 fn iris_read_rect_to_mailbox_and_fin3() {
     let g = &live_gr2(Gr2Variant::Xz);
@@ -2752,7 +2753,7 @@ fn iris_read_rect_to_mailbox_and_fin3() {
         assert!(t.elapsed() < std::time::Duration::from_secs(2), "FIN3 never set");
     }
     let sh: Vec<u32> = (0..4).map(|i| r32(g, (0x4022 + i) * 4) & 0xfff).collect();
-    assert_eq!(sh, vec![0x205, 0x206, 0x211, 0x212], "top row first, one pixel per word");
+    assert_eq!(sh, vec![0x211, 0x212, 0x205, 0x206], "bottom row first, one pixel per word");
 }
 
 /// Zoomed pixel DMA (0x0B8, snoop's rectzoom 6 view): the kernel's
@@ -2856,4 +2857,138 @@ fn iris_lmcolor_change_lost_on_material_bind() {
     let p = gl_px(g, 30, 30);
     assert_eq!(p & 0xff, 0, "no red: the bind replaced the tracked colour ({p:06x})");
     assert!((p >> 8) & 0xff > 0x80, "green material ({p:06x})");
+}
+
+/// One OpenGL glDrawPixels row (__glExpFastDrawPixels): 0x0A7 = packing,
+/// 0x0BB = 0, zoom x, 1; 0x0B1; the words on 0x071 (+ DATA); 0x0B2 x;
+/// DATA y, pixels, words, flag; 0x0B3.
+fn gl_draw_row(g: &Gr2, pack: u32, zoom_x: f32, x: u32, y: u32, n: u32, words: &[u32]) {
+    cmd(g, 0x0a7, pack);
+    for v in [0.0f32, zoom_x, 1.0] { cmd(g, 0x0bb, v.to_bits()); }
+    cmd(g, 0x0b1, 0);
+    cmd(g, 0x071, words[0]);
+    for &w in &words[1..] { data(g, w); }
+    cmd(g, 0x0b2, x);
+    for v in [y, n, words.len() as u32, 0] { data(g, v); }
+    cmd(g, 0x0b3, 0);
+}
+
+/// Colour-index glDrawPixels of UNSIGNED_BYTE (pixtest --ci 8): four
+/// indices a word, first in the MSB (0x0A7 = 2); an integer x zoom
+/// replicates each pixel (libglcore repeats the rows itself).
+#[test]
+fn gl_draw_pixels_packed_indices_and_x_zoom() {
+    let g = &live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 9); // MakeCurrent: 8-bit colour index
+    gl_draw_row(g, 2, 1.0, 10, 20, 5, &[0x1122_3344, 0x5500_0000]);
+    gl_draw_row(g, 2, 2.0, 10, 21, 3, &[0x0102_0300]);
+    g.wait_idle();
+    let row = |y: i32, n: i32| (10..10 + n).map(|x| gl_px(g, x, y) & 0xff).collect::<Vec<_>>();
+    assert_eq!(row(20, 6), vec![0x11, 0x22, 0x33, 0x44, 0x55, 0]);
+    assert_eq!(row(21, 7), vec![1, 1, 2, 2, 3, 3, 0]);
+}
+
+/// glCopyPixels (__glExpFastCopyPixels): 0x0BB = 0, |zoom x|, |zoom y|;
+/// 0x0BA 0; DATA source y, destination y, height, source x, destination x,
+/// width (window coordinates). Each source pixel covers zoom x by zoom y.
+#[test]
+fn gl_copy_pixels_with_zoom() {
+    let g = &live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    gl_draw_row(g, 0, 1.0, 10, 20, 3, &[0xff00_00ff, 0xff00_ff00, 0xffff_0000]);
+    for v in [0.0f32, 2.0, 2.0] { cmd(g, 0x0bb, v.to_bits()); }
+    cmd(g, 0x0ba, 0);
+    for v in [20, 40, 1, 10, 50, 3] { data(g, v); }
+    g.wait_idle();
+    for y in [40, 41] {
+        let row = (50..57).map(|x| gl_px(g, x, y)).collect::<Vec<_>>();
+        assert_eq!(row, vec![0xff, 0xff, 0xff00, 0xff00, 0xff_0000, 0xff_0000, 0], "row {y}");
+    }
+    assert_eq!(gl_px(g, 50, 42), 0, "two rows only");
+    assert_eq!(gl_px(g, 10, 20), 0xff, "source kept");
+}
+
+/// Colour-index clear with depth (ITOF|C1|0x0A0, pixtest --ci 8): integer
+/// index 3; DATA 0, 0, 0, depth, ~0.
+#[test]
+fn gl_clear_index_and_depth() {
+    let g = &live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 9);
+    cmd(g, 0x70a0, 3);
+    for v in [0, 0, 0, 0xf_ffff, 0xffff_ffff] { data(g, v); }
+    g.wait_idle();
+    assert_eq!(gl_px(g, 0, 0) & 0xff, 3);
+    assert_eq!(gl_px(g, 399, 299) & 0xff, 3);
+}
+
+/// A z20 s4 visual (0x00E = 4): a depth read (0x10A = 2, 0; READ_RECT)
+/// returns Z in bits 19:0 with the stencil above it in 23:20. libglcore's
+/// depth reads drop everything above Z (Z write mask 0x0FFFFF).
+#[test]
+fn gl_depth_read_puts_4_bit_stencil_above_z() {
+    let g = &live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x00e, 4);
+    cmd(g, 0x004, 4);
+    cmd(g, 0x70a0, 0);
+    for v in [0, 0, 0, 0x1_2345, 0xffff_ffff] { data(g, v); }
+    cmd(g, 0x0a1, 5);
+    data(g, 0xf);
+    cmd(g, 0x10a, 2);
+    cmd(g, 0x10a, 0);
+    cmd(g, 0x0a7, 0);
+    w32(g, 0x6b000, 0);
+    cmd(g, 0x0ad, 7);
+    for v in [9, 1, 1, 1, 0, 0] { data(g, v); }
+    let t = std::time::Instant::now();
+    while r32(g, 0x6a040) & 1 == 0 {
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "FIN3 never set");
+    }
+    assert_eq!(r32(g, 0x4022 * 4), 0x51_2345);
+}
+
+/// 4-bit 1:2:1 TrueColor (Xsgi visual 0x24, MakeCurrent 0): R in bit 3, G
+/// 2:1, B 0, in both 4-bit banks; reads widen it to 8 bits a component.
+#[test]
+fn gl_rgb4_clear_and_read() {
+    let g = &live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 0);
+    cmd(g, 0x104, 1.0f32.to_bits());
+    for v in [0.5f32, 0.0, 1.0] { data(g, v.to_bits()); }
+    g.wait_idle();
+    assert_eq!(gl_px(g, 5, 5) & 0xff, 0xcc, "R | G 2 = 0xC in both banks");
+    cmd(g, 0x10a, 0);
+    cmd(g, 0x10a, 0);
+    cmd(g, 0x0a7, 0);
+    w32(g, 0x6b000, 0);
+    cmd(g, 0x0ad, 5);
+    for v in [5, 1, 1, 1, 0, 0] { data(g, v); }
+    let t = std::time::Instant::now();
+    while r32(g, 0x6a040) & 1 == 0 {
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "FIN3 never set");
+    }
+    assert_eq!(r32(g, 0x4022 * 4), 0xff00_aaff);
+}
+
+/// A software fragment on a colour-index visual (pixtest --ci 12, FLOAT
+/// indices): ITOF 0x02B x + 6144; ITOF DATA y + 6144, z; C1 DATA the index
+/// (f32, libglcore adds 0.5); DATA 0, 0, 0. The index wraps to the visual.
+#[test]
+fn gl_fragment_colour_index() {
+    let g = &live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 10); // 12-bit colour index
+    for (x, i) in [(3u32, 17.5f32), (4, 4096.0 + 381.5)] {
+        cmd(g, 0x402b, 6144 + x);
+        cmd(g, 0x41df, 6144 + 7);
+        cmd(g, 0x41df, 0);
+        cmd(g, 0x31df, i.to_bits());
+        for _ in 0..3 { data(g, 0); }
+    }
+    g.wait_idle();
+    assert_eq!(gl_px(g, 3, 7) & 0xfff, 17);
+    assert_eq!(gl_px(g, 4, 7) & 0xfff, 381);
 }

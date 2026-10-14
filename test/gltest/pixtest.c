@@ -56,7 +56,7 @@ static int npass = 0, nfail = 0, nskip = 0, nxfail = 0;
 /* Cases where IRIX's libGLcore itself departs from GL 1.1 on IMPACT (the
    board does what it is told): reported XFAIL / XPASS, not counted as
    failures. */
-static const struct { const char *name; const char *why; } xfails[] = {
+static const struct { const char *name; const char *why; int gr2_only; } xfails[] = {
     { "read/RGBA/UNSIGNED_BYTE/scale-bias",
       "libGLcore sends no pixel transfer for glReadPixels (plain read)" },
     { "read/RGBA/UNSIGNED_BYTE/map256",
@@ -95,13 +95,38 @@ static const struct { const char *name; const char *why; } xfails[] = {
       "libGLcore's glBitmap starts at UNPACK_SKIP_PIXELS / 8 bytes, dropping the bits" },
     { "bitmap/lsb-rowlen40-skip11,1",
       "libGLcore's glBitmap starts at UNPACK_SKIP_PIXELS / 8 bytes, dropping the bits" },
+    /* GR2 (XZ / Extreme), libGLcore EXPRESS: pixel transfer, colour-index
+       maps and textures are all done on the host. */
+    { "draw/COLOR_INDEX/UNSIGNED_BYTE/shift-1-offset0",
+      "libGLcore EXPRESS rounds a right-shifted UNSIGNED_BYTE index (17 >> 1 = 8.5 -> 9) before the I_TO_* lookup", 1 },
+    { "gettex/RGBA8/LUMINANCE/UNSIGNED_BYTE",
+      "libGLcore EXPRESS (software textures) returns luminance as R + G + B, clamped (ReadPixels' rule), not R", 1 },
+    { "gettex/RGBA8/LUMINANCE_ALPHA/UNSIGNED_BYTE",
+      "libGLcore EXPRESS (software textures) returns luminance as R + G + B, clamped (ReadPixels' rule), not R", 1 },
+    { "stencil/draw-read/UNSIGNED_BYTE",
+      "libGLcore EXPRESS's stencil Fetch masks the depth word with 0xF; z20 s4 keeps the stencil above Z (bits 23:20; inferred from its depth reads)", 1 },
+    { "stencil/draw/shift-offset-mask",
+      "libGLcore EXPRESS's stencil Fetch masks the depth word with 0xF; z20 s4 keeps the stencil above Z (bits 23:20; inferred from its depth reads)", 1 },
+    { "ci8/read/UNSIGNED_SHORT/swap",
+      "libGLcore EXPRESS's Pack1 read (READ_RECT through the mailbox) ignores GL_PACK_SWAP_BYTES", 1 },
+    { "ci12/read/UNSIGNED_SHORT/swap",
+      "libGLcore EXPRESS's Pack1 read (READ_RECT through the mailbox) ignores GL_PACK_SWAP_BYTES", 1 },
+    { "stencil/copy",
+      "libGLcore EXPRESS's stencil Fetch masks the depth word with 0xF; z20 s4 keeps the stencil above Z (bits 23:20; inferred from its depth reads)", 1 },
 };
+
+static int gr2;
 
 static const char *xfail_why(const char *name)
 {
     unsigned i;
+    /* On GR2 its own entries first (their reasons replace IMPACT's). */
+    if (gr2)
+        for (i = 0; i < sizeof xfails / sizeof xfails[0]; i++)
+            if (xfails[i].gr2_only && !strcmp(name, xfails[i].name))
+                return xfails[i].why;
     for (i = 0; i < sizeof xfails / sizeof xfails[0]; i++)
-        if (!strcmp(name, xfails[i].name))
+        if (!xfails[i].gr2_only && !strcmp(name, xfails[i].name))
             return xfails[i].why;
     return 0;
 }
@@ -507,8 +532,9 @@ static int to8(double c)
     return (int)floor(c * 255.0 + 0.5);
 }
 
-/* Compare an RGBA8 read-back with expected values (alpha ignored when the
-   visual has none: it reads 255). tol in byte units. */
+/* Compare an RGBA8 read-back with expected values. Without alpha planes
+   alpha reads 1.0 before any pixel transfer: 255, or the expected value
+   when the case applied its transfer to 1.0. tol in byte units. */
 static void compare8(const char *what, int x0, int y0, int w, int h,
                      const unsigned char *got, const unsigned char *exp, int tol)
 {
@@ -516,8 +542,8 @@ static void compare8(const char *what, int x0, int y0, int w, int h,
     for (i = 0; i < w * h; i++)
         for (k = 0; k < 4; k++) {
             int e = exp[i * 4 + k], g = got[i * 4 + k];
-            if (k == 3 && !have_alpha)
-                e = 255;
+            if (k == 3 && !have_alpha && abs(255 - g) <= tol)
+                continue;
             if (abs(e - g) > tol) {
                 if (bad == 0)
                     note("%s (%d,%d) comp %d got %d want %d [got %02x%02x%02x%02x want %02x%02x%02x%02x]",
@@ -1232,6 +1258,8 @@ static void t_depth_stencil(void)
     float zin[13 * 5], zout[13 * 5 + 8];
     unsigned int zu[13 * 5];
     unsigned char sin[13 * 5], sout[13 * 5 + 8];
+    GLint dbits = 0;
+    double ztol;
     if (begin("depth/draw-read/FLOAT")) {
         if (!have_depth) skip("no depth buffer");
         else {
@@ -1268,9 +1296,14 @@ static void t_depth_stencil(void)
             glDrawPixels(w, h, GL_DEPTH_COMPONENT, GL_FLOAT, zin);
             glDisable(GL_DEPTH_TEST);
             glReadPixels(40, 50, w, h, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, zu);
+            /* Two steps of the buffer's depth (no tighter than
+               2^-20): a 20-bit buffer (GR2 z20 s4) is widened by shifting
+               (libGLcore), a step low, on top of its own rounding of z. */
+            glGetIntegerv(GL_DEPTH_BITS, &dbits);
+            ztol = dbits > 0 && dbits <= 20 ? 2.0 / (1 << dbits) : 1.0 / (1 << 20);
             for (i = 0; i < w * h; i++) {
                 double got = zu[i] / 4294967295.0;
-                if (fabs(got - zin[i]) > 1.0 / (1 << 20))
+                if (fabs(got - zin[i]) > ztol)
                     note("(%d,%d) depth %08x = %.7f want %.7f", i % w, i / w, zu[i], got, zin[i]);
             }
             end();
@@ -2424,6 +2457,10 @@ int main(int argc, char **argv)
                         GLX_STENCIL_SIZE, 1, None };
     int attr_noalpha[] = { GLX_RGBA, GLX_DOUBLEBUFFER, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8,
                            GLX_BLUE_SIZE, 8, GLX_DEPTH_SIZE, 16, None };
+    /* GR2 (XZ / Extreme): 8,8,8 only single buffered (24 planes). */
+    int attr_sb[] = { GLX_RGBA, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8,
+                      GLX_DEPTH_SIZE, 16, GLX_STENCIL_SIZE, 1, None };
+    int attr_sb_plain[] = { GLX_RGBA, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, None };
     XVisualInfo *vi;
     XSetWindowAttributes swa;
     XEvent ev;
@@ -2476,6 +2513,10 @@ int main(int argc, char **argv)
         vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_full);
         if (!vi)
             vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_noalpha);
+        if (!vi)
+            vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_sb);
+        if (!vi)
+            vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_sb_plain);
     }
     if (!vi) {
         fprintf(stderr, "no RGB visual\n");
@@ -2501,6 +2542,10 @@ int main(int argc, char **argv)
     XIfEvent(dpy, &ev, wait_map, (char *)win);
     ctx = glXCreateContext(dpy, vi, 0, True);
     glXMakeCurrent(dpy, win, ctx);
+    {
+        const char *rn = (const char *)glGetString(GL_RENDERER);
+        gr2 = rn && (!strncmp(rn, "GR", 2) || !strncmp(rn, "GU", 2));
+    }
     ext = (const char *)glGetString(GL_EXTENSIONS);
     ext_abgr = ext && strstr(ext, "GL_EXT_abgr") != 0;
     ext_packed = ext && strstr(ext, "GL_EXT_packed_pixels") != 0;

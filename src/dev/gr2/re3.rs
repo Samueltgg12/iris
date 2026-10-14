@@ -163,6 +163,15 @@ pub fn describe_ir(reg: &[u32; 64], ir: u32) -> String {
 pub const RE3_OP_COPY_A: u32 = 0xFFFF_1001;
 /// Second half (executes): val = dx | dy<<16. Coordinates are linear, y bottom-up.
 pub const RE3_OP_COPY_B: u32 = 0xFFFF_1002;
+/// RE3_OP_COPY_B bits 63:32 for a GL copy (glCopyPixels; the microcode's
+/// copy, emulated): zoom x (7:0) and y (15:8), integer >= 1; the pixel
+/// depth of the visual's buffers / 4 (17:16: 0 = 24-bit, no banks) and the
+/// read buffer's bank (18); bit 19 set (nonzero = GL copy). The source
+/// pixel is taken from the read bank and replicated into every bank, so
+/// PIXMASK picks the draw buffer, as for drawing.
+pub fn copy_mode(zx: u32, zy: u32, bits: u32, bank: u32) -> u32 {
+    (zx & 0xff) | ((zy & 0xff) << 8) | (((bits / 4) & 3) << 16) | ((bank & 1) << 18) | 1 << 19
+}
 /// CPU consumed RWDATA during a READBUF stream; fetch the next pixel.
 pub const RE3_OP_READ_ADVANCE: u32 = 0xFFFF_1003;
 /// Emulator-private stand-in for RE3's (unidentified) packing-mode register:
@@ -183,6 +192,10 @@ pub const PIXFMT_CI8: u32 = 3;
 /// 8-bit 3:3:2 TrueColor (Xsgi visual masks: R 7:5, B 4:3, G 2:0), packed
 /// from 8:8:8 by truncation and written as v | v << 8 like PIXFMT_CI8.
 pub const PIXFMT_RGB8: u32 = 4;
+/// 4-bit 1:2:1 TrueColor (Xsgi visual 0x24 masks: R 3, G 2:1, B 0), packed
+/// from 8:8:8 by truncation and written as v | v << 4 (bank 1 = bits 7:4,
+/// libglcore's write masks shifted by the depth).
+pub const PIXFMT_RGB4: u32 = 5;
 /// Emulator-private depth control (the enables and write mask have no
 /// documented RE3 register): val = test enable (bit 0) | func (bits 3:1,
 /// GL order NEVER..ALWAYS) | Z write mask << 8 (24 bits). Depth is tested
@@ -263,6 +276,9 @@ pub struct Re3 {
     pub ctx: Re3Context,
     pub vram: [u32; FB_W * FB_H],
     pub zbuf: [u32; FB_W * FB_H],
+    /// The span JIT's state (`re3_jit`): mode, memoised shaders, counts.
+    #[cfg(feature = "gr2-jit")]
+    pub jit: super::re3_jit::JitState,
 }
 
 impl Re3 {
@@ -271,6 +287,10 @@ impl Re3 {
     pub fn write_reg(&mut self, reg: usize, val: u32) -> bool {
         let reg = reg & 63;
         let v = val & REGMASK[reg];
+        #[cfg(feature = "gr2-jit")]
+        if super::re3_jit::shapes_key(reg) && self.ctx.reg[reg] != v {
+            self.jit.invalidate();
+        }
         self.ctx.reg[reg] = v;
         match reg {
             REG_RGB => {
@@ -300,6 +320,44 @@ impl Re3 {
             }
             _ => false,
         }
+    }
+
+    /// The private operations that shape span pipelines (RE3_OP_PIXFMT,
+    /// RE3_OP_ZCTL, RE3_OP_STENCIL, RE3_OP_BLEND).
+    pub fn set_pixfmt(&mut self, v: u32) {
+        #[cfg(feature = "gr2-jit")]
+        if self.ctx.pixfmt != v {
+            self.jit.invalidate();
+        }
+        self.ctx.pixfmt = v;
+    }
+
+    pub fn set_zctl(&mut self, v: u32) {
+        #[cfg(feature = "gr2-jit")]
+        if self.ctx.zctl & 0xf != v & 0xf {
+            self.jit.invalidate();
+        }
+        self.ctx.zctl = v;
+    }
+
+    pub fn set_stencil(&mut self, v: u64) {
+        #[cfg(feature = "gr2-jit")]
+        {
+            // Enable, function and the three ops; the rest is span data.
+            let shape = |s: u64| s & (0xf | 0xfff << 28);
+            if shape(self.ctx.stencil) != shape(v) {
+                self.jit.invalidate();
+            }
+        }
+        self.ctx.stencil = v;
+    }
+
+    pub fn set_blend(&mut self, v: u32) {
+        #[cfg(feature = "gr2-jit")]
+        if self.ctx.blend != v {
+            self.jit.invalidate();
+        }
+        self.ctx.blend = v;
     }
 
     fn load_iterators(&mut self) {
@@ -337,6 +395,10 @@ impl Re3 {
 
     fn execute(&mut self) {
         self.load_iterators();
+        #[cfg(feature = "gr2-jit")]
+        if super::re3_jit::run(self, self.ctx.reg[REG_IR]) {
+            return;
+        }
         match self.ctx.reg[REG_IR] {
             IR_SHADED => self.draw_shaded_span(),
             IR_FLAT => self.draw_flat_span(5),
@@ -418,6 +480,10 @@ impl Re3 {
             let v = if self.ctx.reg[REG_PIXMASK] & 0xff == 0 { (p >> 8) & 0xff } else { p & 0xff };
             return rgb332_to_888(v);
         }
+        if self.ctx.pixfmt == PIXFMT_RGB4 {
+            let v = if self.ctx.reg[REG_PIXMASK] & 0xf == 0 { (p >> 4) & 0xf } else { p & 0xf };
+            return rgb121_to_888(v);
+        }
         [p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff]
     }
 
@@ -437,6 +503,10 @@ impl Re3 {
         if c.pixfmt == PIXFMT_RGB8 {
             let v = (rgb & 0xe0) | ((rgb >> 19) & 0x18) | ((rgb >> 13) & 0x07);
             return v | (v << 8);
+        }
+        if c.pixfmt == PIXFMT_RGB4 {
+            let v = ((rgb >> 4) & 0x8) | ((rgb >> 13) & 0x6) | ((rgb >> 23) & 0x1);
+            return v | (v << 4);
         }
         rgb & 0x00ff_ffff
     }
@@ -704,6 +774,48 @@ impl Re3 {
         }
     }
 
+    /// GL copy (see copy_mode): source rectangle at (sx, sy) to (dx, dy),
+    /// each pixel repeated zx x zy times, through the logic op, write masks,
+    /// scissor and WID test. The source is read first, so overlap is safe.
+    pub fn copy_rect_gl(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32, mode: u32) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let (zx, zy) = ((mode & 0xff).max(1) as i32, ((mode >> 8) & 0xff).max(1) as i32);
+        let bits = ((mode >> 16) & 3) * 4;
+        let bank = (mode >> 18) & 1;
+        let pix = |v: u32| -> u32 {
+            if bits == 0 {
+                return v;
+            }
+            let m = (1u32 << bits) - 1;
+            let c = (v >> (bits * bank)) & m;
+            (v & 0xff00_0000) | c | (c << bits)
+        };
+        let mut src = vec![0u32; (w * h) as usize];
+        for j in 0..h {
+            for i in 0..w {
+                let (x, y) = (sx + i, sy + j);
+                if x >= 0 && y >= 0 && (x as usize) < FB_W && (y as usize) < FB_H {
+                    src[(j * w + i) as usize] = pix(self.vram[y as usize * FB_W + x as usize]);
+                }
+            }
+        }
+        let mask = ((self.ctx.reg[REG_AUXMASK] & 0xff) << 24) | self.ctx.reg[REG_PIXMASK];
+        for j in 0..h * zy {
+            for i in 0..w * zx {
+                let (x, y) = (dx + i, dy + j);
+                if !self.clip(x, y) {
+                    continue;
+                }
+                let off = y as usize * FB_W + x as usize;
+                if self.wid_ok(IR_WRITEBUF, off) {
+                    self.store(off, src[((j / zy) * w + i / zx) as usize], mask);
+                }
+            }
+        }
+    }
+
     /// Emulator-private screen-to-screen copy of the planes selected by
     /// PIXMASK/AUXMASK. Linear coordinates, y bottom-up; overlap-safe.
     pub fn copy_rect(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32) {
@@ -773,7 +885,15 @@ fn unpack(data: u32, n: u32, mode: u32) -> u32 {
     }
 }
 
-/// 8-bit 3:3:2 (R 7:5, B 4:3, G 2:0) to 8:8:8 values [R, G, B].
+/// 4-bit 1:2:1 (R 3, G 2:1, B 0) to 8:8:8 values [R, G, B].
+pub fn rgb121_to_888(v: u32) -> [u32; 3] {
+    [((v >> 3) & 1) * 255, ((v >> 1) & 3) * 85, (v & 1) * 255]
+}
+
+/// 3:3:2 (R 7:5, B 4:3, G 2:0) to 8 bits a component by bit replication,
+/// which is also GL's rounded fixed-point conversion for every 3- and
+/// 2-bit value (4 -> 0x92, not 0x91).
 pub fn rgb332_to_888(v: u32) -> [u32; 3] {
-    [((v >> 5) & 7) * 255 / 7, (v & 7) * 255 / 7, ((v >> 3) & 3) * 255 / 3]
+    let c3 = |c: u32| (c << 5) | (c << 2) | (c >> 1);
+    [c3((v >> 5) & 7), c3(v & 7), ((v >> 3) & 3) * 0x55]
 }

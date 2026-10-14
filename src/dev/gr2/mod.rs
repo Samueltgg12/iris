@@ -25,6 +25,8 @@ pub mod gr2comp;
 pub mod gr2disp;
 pub mod hq2;
 pub mod re3;
+#[cfg(feature = "gr2-jit")]
+pub mod re3_jit;
 pub mod vc1;
 pub mod xmap5;
 
@@ -34,6 +36,9 @@ mod re3_tests;
 #[cfg(test)]
 #[path = "hq2_tests.rs"]
 mod hq2_tests;
+#[cfg(all(test, feature = "gr2-jit"))]
+#[path = "re3_jit_tests.rs"]
+mod re3_jit_tests;
 
 use std::cell::{Cell, UnsafeCell};
 use std::io::Write as IoWrite;
@@ -260,6 +265,8 @@ impl Gr2 {
             addr_of_mut!((*p).cycles).write(Cell::new(CyclesPtr::dangling()));
             addr_of_mut!((*p).trace).write(Mutex::new(debug::Gr2Trace::new()));
             addr_of_mut!((*p).trace_mask).write(AtomicU32::new(0));
+            #[cfg(feature = "gr2-jit")]
+            addr_of_mut!((*(*p).re3.get()).jit.mode).write(re3_jit::default_mode());
             let a = a.assume_init();
             a.power_on();
             a
@@ -678,9 +685,9 @@ impl Gr2 {
             fn reg(&mut self, reg: usize, val: u32) {
                 self.push(reg as u32 | re3::RE3_SRC_HQ, val as u64);
             }
-            fn copy(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32) {
+            fn copy(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32, mode: u32) {
                 let a = (sx as u16 as u64) | ((sy as u16 as u64) << 16) | ((w as u16 as u64) << 32) | ((h as u16 as u64) << 48);
-                let b = (dx as u16 as u64) | ((dy as u16 as u64) << 16);
+                let b = (dx as u16 as u64) | ((dy as u16 as u64) << 16) | ((mode as u64) << 32);
                 while !self.0.re3_fifo.try_push2(re3::RE3_OP_COPY_A, a, re3::RE3_OP_COPY_B, b) {
                     if self.stopped() {
                         return;
@@ -720,7 +727,7 @@ impl Gr2 {
                 // SAFETY: RE3 is drained and idle; VRAM and Z are only read
                 // here, as the display thread does.
                 let re3 = unsafe { &*self.0.re3.get() };
-                let plane: &[u32] = if req.decode == hq2::ReadDecode::Depth { &re3.zbuf } else { &re3.vram };
+                let plane: &[u32] = if matches!(req.decode, hq2::ReadDecode::Depth { .. }) { &re3.zbuf } else { &re3.vram };
                 let read = |x: i32, y: i32| {
                     if x < 0 || y < 0 || x as usize >= re3::FB_W || y as usize >= re3::FB_H {
                         0
@@ -805,7 +812,12 @@ impl Gr2 {
                     re3::RE3_OP_COPY_B => {
                         let a = self.copy_a.get();
                         let f = |v: u64, s: u32| (v >> s) as u16 as i16 as i32;
-                        re3.copy_rect(f(a, 0), f(a, 16), f(a, 32), f(a, 48), f(val, 0), f(val, 16));
+                        let mode = (val >> 32) as u32;
+                        if mode == 0 {
+                            re3.copy_rect(f(a, 0), f(a, 16), f(a, 32), f(a, 48), f(val, 0), f(val, 16));
+                        } else {
+                            re3.copy_rect_gl(f(a, 0), f(a, 16), f(a, 32), f(a, 48), f(val, 0), f(val, 16), mode);
+                        }
                         true
                     }
                     re3::RE3_OP_READ_ADVANCE => {
@@ -813,19 +825,19 @@ impl Gr2 {
                         false
                     }
                     re3::RE3_OP_PIXFMT => {
-                        re3.ctx.pixfmt = val as u32;
+                        re3.set_pixfmt(val as u32);
                         false
                     }
                     re3::RE3_OP_ZCTL => {
-                        re3.ctx.zctl = val as u32;
+                        re3.set_zctl(val as u32);
                         false
                     }
                     re3::RE3_OP_STENCIL => {
-                        re3.ctx.stencil = val;
+                        re3.set_stencil(val);
                         false
                     }
                     re3::RE3_OP_BLEND => {
-                        re3.ctx.blend = val as u32;
+                        re3.set_blend(val as u32);
                         false
                     }
                     re3::RE3_OP_ALPHA => {

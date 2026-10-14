@@ -41,7 +41,8 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
-| `gpujit` | Every graphics JIT; the recommended build. Hosts that forbid JIT code (the Mac App Store sandbox) set `IRIS_NO_JIT` at run time. | `rex-jit`, `gr4-jit` |
+| `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
+| `gpujit` | Every graphics JIT; the recommended build. Hosts that forbid JIT code (the Mac App Store sandbox) set `IRIS_NO_JIT` at run time. | `rex-jit`, `gr4-jit`, `gr2-jit` |
 | `jitv2` | Experimental whole-page MIPS compiler; implies transparent caching. | `tcache`, `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `target-lexicon`, `region`, `wasmtime-jit-icache-coherence` |
 | `jitv2_opcodefusion` | Optional JIT fusion, off by default after live delay-slot failures. | `jitv2` |
 | `j2wp` | Compatibility alias for `jitv2`; no separate compiler mode. | `jitv2` |
@@ -476,7 +477,7 @@ Build variants:
 ```
 cargo run --release --features lightning,gpujit      # recommended for best speed
 cargo run --release --features lightning             # disable emulator breakpoints for a little bit more speed
-cargo run --release --features gpujit                # enable the graphics JITs (rex-jit + gr4-jit)
+cargo run --release --features gpujit                # enable the graphics JITs (rex-jit + gr4-jit + gr2-jit)
 cargo run --release --features jitv2,gpujit          # MIPS JIT v2 (experimental; see "JIT compilers")
 cargo run --release --features idle-pause            # park the CPU thread while the guest idles instead of spinning a host core
 cargo run --release --features ci_clock              # synthetic deterministic CP0 Count clock (CI/snapshot validator only; loses realtime desktop timing)
@@ -681,6 +682,32 @@ triangles 2.5x.
 - `mgras jit [on|off|sync|list]` in the monitor shows and changes it.
 - `GR4_JIT_DISASM=1` prints each shader's machine code as it compiles.
 
+### GR2 span JIT (`--features gr2-jit`)
+
+`gr2-jit` compiles GR2's RE3 span pipelines (`src/dev/gr2/re3_jit`), on the
+pattern of `gr4-jit`. On GR2 the HQ2/GE7 side walks primitives and RE3 draws
+spans, so the unit is an RE3 instruction: SHADED (every iterator steps per
+pixel, with depth, stencil and blending) and FLAT / FLAT4. The state that
+shapes a span's pipeline reduces to a key: the instruction, frame-buffer
+pixel format and dither, raster op, pattern mode, window-ID test, depth and
+stencil tests and blend factors. Masks, scissor, colours and steps, stencil
+references and pattern bits are read from the RE3 registers as the shader
+starts. Row spans (DX = 1, DY = 0, what GL fills send) and FLAT spans are
+clipped to the scissor once, not per pixel.
+
+Shaders compile on a background thread; until a span's shader is ready the
+interpreter draws it. They are bit-exact with the interpreter:
+`src/dev/gr2/re3_jit_tests.rs` sweeps the keys and compares whole boards
+(`GR2_JIT_SWEEP=<factor>`, `GR2_JIT_SEED=<n>`). Fills run about 3x faster
+(a 24-bit quad fill went from 78 to 245 Mpx/s in IRIX, Z-buffered from 58
+to 115), smooth shading 2-3x. Small triangles gain nothing: the HQ2 side
+(edge walking and span setup) bounds them, not RE3.
+
+- `IRIS_GR2_JIT=off|on|sync` sets the starting mode. `sync` compiles on
+  first use and waits.
+- `gr2 jit [on|off|sync|list]` in the monitor shows and changes it.
+- `GR2_JIT_DISASM=1` prints each shader's machine code as it compiles.
+
 ```
-cargo run --release --features lightning,gpujit   # = lightning,rex-jit,gr4-jit
+cargo run --release --features lightning,gpujit   # = lightning,rex-jit,gr4-jit,gr2-jit
 ```
