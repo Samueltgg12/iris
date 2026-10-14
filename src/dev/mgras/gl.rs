@@ -229,6 +229,10 @@ mod tok {
     /// glEnable / glDisable, 1 / 0 (3 / 0 for dither).
     pub const ALPHA_TEST: u32 = 0x064;
     pub const BLEND: u32 = 0x065;
+    /// glBlendEquationEXT (1 word, the GL enum). GL_LOGIC_OP (0x0BF1) makes
+    /// GL_BLEND enable the colour logic op instead (EXT_blend_logic_op):
+    /// IRIS GL's logicop(), e.g. AutoCAD's XOR crosshair.
+    pub const BLEND_EQUATION: u32 = 0x060;
     pub const DEPTH_TEST: u32 = 0x066;
     pub const DITHER: u32 = 0x067;
     pub const LINE_STIPPLE_ON: u32 = 0x06A;
@@ -434,6 +438,8 @@ pub struct Gl {
     /// Colour logic op: on, op index.
     logic: u32,
     logic_op: u32,
+    /// glBlendEquationEXT's enum; 0 (never set) is GL_FUNC_ADD.
+    blend_eq: u32,
     /// Stencil: on, function, ref, compare mask, ops (fail, zfail, zpass),
     /// write mask, clear value.
     stencil: u32,
@@ -972,6 +978,7 @@ impl Gl {
             tok::ALPHA_FUNC if d.len() >= 2 => self.set_state(|g| (g.alpha_func, g.alpha_ref) = (w0 & 7, d[1].min(0xFFF)), sink),
             tok::BLEND => self.set_state(|g| g.blend = on, sink),
             tok::BLEND_FUNC if d.len() >= 2 => self.set_state(|g| (g.blend_src, g.blend_dst) = (blend_code(w0), blend_code(d[1])), sink),
+            tok::BLEND_EQUATION => self.set_state(|g| g.blend_eq = w0, sink),
             tok::LOGIC_OP_ON => self.set_state(|g| g.logic = on, sink),
             tok::LOGIC_OP => self.set_state(|g| g.logic_op = w0 & 0xF, sink),
             tok::STENCIL_TEST => self.set_state(|g| g.stencil = on, sink),
@@ -2080,8 +2087,12 @@ impl Gl {
         };
         sink.rss_write(re::STENCILMODE, st, false);
         sink.rss_write(re::STENCILMASK, self.st_wmask << 8 | self.st_cmask, false);
-        sink.rss_write(re::BLENDFACTOR, if self.blend != 0 { 1 << 8 | self.blend_dst << 4 | self.blend_src } else { 0 }, false);
-        let op = if self.logic != 0 { self.logic_op } else { 3 };
+        // EXT_blend_logic_op: with the GL_LOGIC_OP equation, GL_BLEND turns
+        // the logic op on rather than blending.
+        let blend_logic = self.blend != 0 && self.blend_eq == GL_LOGIC_OP;
+        let blend = self.blend != 0 && !blend_logic;
+        sink.rss_write(re::BLENDFACTOR, if blend { 1 << 8 | self.blend_dst << 4 | self.blend_src } else { 0 }, false);
+        let op = if self.logic != 0 || blend_logic { self.logic_op } else { 3 };
         sink.rss_write(re::PP1FILLMODE, (self.pp1_base() & !(0xF << 26)) | op << 26, false);
         let (lsb, msb) = self.color_write_masks();
         sink.rss_write(re::COLORMASKLSBSA, lsb, false);
@@ -2904,6 +2915,9 @@ fn normalised_q<const N: usize>(q: [[f64; 3]; N]) -> [[f64; 3]; N] {
     }
     q.map(|v| v.map(|c| c / m))
 }
+
+/// GL_LOGIC_OP as a blend equation (EXT_blend_logic_op).
+const GL_LOGIC_OP: u32 = 0x0BF1;
 
 /// x | y << 16 for the RE4's integer xy registers.
 fn xy(x: i32, y: i32) -> u32 {
