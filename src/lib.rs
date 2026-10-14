@@ -78,6 +78,7 @@ pub mod build_features {
     pub const JITV2:     bool = cfg!(feature = "jitv2");
     pub const REX_JIT:   bool = cfg!(feature = "rex-jit");
     pub const GR4_JIT:   bool = cfg!(feature = "gr4-jit");
+    pub const GR2_JIT:   bool = cfg!(feature = "gr2-jit");
     /// Lightning build strips breakpoint checks and the traceback buffer
     /// from the MIPS executor hot path. Interactive debugging (GDB stub,
     /// monitor breakpoints) is non-functional in this build.
@@ -120,6 +121,7 @@ pub mod build_features {
             ("idle-pause", cfg!(feature = "idle-pause")),
             ("rex-jit", cfg!(feature = "rex-jit")),
             ("gr4-jit", cfg!(feature = "gr4-jit")),
+            ("gr2-jit", cfg!(feature = "gr2-jit")),
             ("lightning", cfg!(feature = "lightning")),
             ("hostcall", cfg!(feature = "hostcall")),
             ("hostgl", cfg!(feature = "hostgl")),

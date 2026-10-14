@@ -159,6 +159,11 @@ static int list_visuals = 0;          /* --listvisuals */
 static int use_pbuffer = 0;           /* --pbuffer */
 static int do_check = 0;              /* --check */
 static int check_fails = 0;
+/* GR2 (XZ / Extreme): libGLcore EXPRESS reads stencil as the low 4 bits
+   of the depth word, but a z20 s4 visual keeps it above Z (Z in 19:0, the
+   Z write mask libGLcore sends being 0x0FFFFF): stencil readbacks are
+   reported, not checked. */
+static int gr2_stencil_xfail = 0;
 static int got_rgba[4], got_z, got_s, got_dbl;
 
 /* GLX_SGIX_fbconfig + GLX_SGIX_pbuffer: IRIX's libGL has them. */
@@ -1364,6 +1369,10 @@ static void check_read(const char *m, int kind, GLenum err, const unsigned long 
         printf("glprim: check %s FAIL gl error 0x%x\n", m, (unsigned)err);
         check_fails++;
     }
+    if (kind != RB_COLOR && kind != RB_DEPTH && gr2_stencil_xfail) {
+        printf("glprim: check %s XFAIL (libGLcore EXPRESS reads stencil from Z's low bits)\n", m);
+        return;
+    }
     if (kind == RB_COLOR && !strcmp(m, "back") && got_dbl) {
         check_sample(m, lbl[0], kind, V(0), 1, 1, 1);
         check_sample(m, lbl[4], kind, V(4), back_rgb[0], back_rgb[1], back_rgb[2]);
@@ -1723,6 +1732,10 @@ int main(int argc, char **argv) {
     }
     got_rgba[0] = got.r; got_rgba[1] = got.g; got_rgba[2] = got.b; got_rgba[3] = got.a;
     got_z = got.z; got_s = got.s; got_dbl = got.db;
+    {
+        const char *rn = (const char *)glGetString(GL_RENDERER);
+        gr2_stencil_xfail = got_s == 4 && rn && (!strncmp(rn, "GR", 2) || !strncmp(rn, "GU", 2));
+    }
     print_cfg(use_pbuffer ? "glprim: config fbconfig" : "glprim: config visual", &got);
 
     printf("glprim: prim=%s %s %s vtx=%s color=%s%s visual=0x%lx depth=%d/%d bits db=%d/%d "

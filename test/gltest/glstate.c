@@ -38,7 +38,7 @@ static int npass, nfail, nskip, nxfail;
 /* Where a driver itself departs from the GL spec (the board does as told),
    checked in its command stream: reported XFAIL / XPASS, not failures.
    IRIX 6.5.22 libGLcore on IMPACT. */
-static const struct { const char *name; const char *why; } xfails[] = {
+static const struct { const char *name; const char *why; int gr2_only; } xfails[] = {
     { "enable/POLYGON_OFFSET_LINE/on", "libGLcore: glGetBooleanv(GL_POLYGON_OFFSET_LINE) is GL_INVALID_ENUM" },
     { "enable/POLYGON_OFFSET_LINE/off", "libGLcore: glGetBooleanv(GL_POLYGON_OFFSET_LINE) is GL_INVALID_ENUM" },
     { "enable/POLYGON_OFFSET_POINT/on", "libGLcore: glGetBooleanv(GL_POLYGON_OFFSET_POINT) is GL_INVALID_ENUM" },
@@ -54,13 +54,25 @@ static const struct { const char *name; const char *why; } xfails[] = {
     { "frag/BLEND_COLOR_EXT", "libGLcore sends glBlendColorEXT but answers the query with zeros" },
     { "lightmodel/AMBIENT", "libGLcore sends the light model ambient's RGB only" },
     { "eval/MAP1_VERTEX_3", "libGLcore returns the control points transposed" },
+    /* GR2 (XZ / Extreme), IRIX 6.5.22 libGLcore EXPRESS: it answers every
+       query from its own state except the current and raster colour,
+       index and normal (__glExpDoGet), and textures are all software. */
+    { "current/RASTER_DISTANCE", "libGLcore EXPRESS keeps the raster position itself and returns eye z (negative in front of the eye), not the distance", 1 },
+    { "texlevel/RED_SIZE", "libGLcore EXPRESS (software textures): an RGBA8 level reports 24 bits a component", 1 },
+    { "texlevel/GREEN_SIZE", "libGLcore EXPRESS (software textures): an RGBA8 level reports 24 bits a component", 1 },
+    { "texlevel/BLUE_SIZE", "libGLcore EXPRESS (software textures): an RGBA8 level reports 24 bits a component", 1 },
+    { "texlevel/ALPHA_SIZE", "libGLcore EXPRESS (software textures): an RGBA8 level reports 24 bits a component", 1 },
+    { "fb/INDEX_WRITEMASK", "libGLcore EXPRESS drops glIndexMask in RGBA mode", 1 },
+    { "fb/INDEX_CLEAR_VALUE", "libGLcore EXPRESS drops glClearIndex in RGBA mode", 1 },
 };
+
+static int gr2;
 
 static const char *xfail_why(const char *name)
 {
     unsigned i;
     for (i = 0; i < sizeof xfails / sizeof xfails[0]; i++)
-        if (!strcmp(name, xfails[i].name))
+        if (!strcmp(name, xfails[i].name) && (gr2 || !xfails[i].gr2_only))
             return xfails[i].why;
     return 0;
 }
@@ -237,6 +249,15 @@ static void want_i(GLenum pname, int n, ...)
     va_end(ap);
     glGetIntegerv(pname, got);
     cmp_i("glGetIntegerv", got, want, n);
+}
+
+/* A stencil mask as the visual keeps it: its low GL_STENCIL_BITS bits
+   (GR2's 4-bit stencil; IMPACT's 8 bits keep these test values whole). */
+static int stencil_bits(int v)
+{
+    GLint sb = 0;
+    glGetIntegerv(GL_STENCIL_BITS, &sb);
+    return sb > 0 && sb < 31 ? v & ((1 << sb) - 1) : v;
 }
 
 /* glGetBooleanv(pname) against n booleans. */
@@ -750,23 +771,24 @@ static void t_texture(void)
 {
     GLuint tex = 0;
     static GLubyte img[16 * 8 * 4];
-    static const struct { GLenum p; const char *n; GLint v; } tp[] = {
-        { GL_TEXTURE_MIN_FILTER, "MIN_FILTER", GL_LINEAR_MIPMAP_NEAREST },
-        { GL_TEXTURE_MAG_FILTER, "MAG_FILTER", GL_NEAREST },
-        { GL_TEXTURE_WRAP_S, "WRAP_S", GL_CLAMP },
-        { GL_TEXTURE_WRAP_T, "WRAP_T", GL_CLAMP },
+    /* e: the extension the value needs (0 = GL 1.1). */
+    static const struct { GLenum p; const char *n; GLint v; const char *e; } tp[] = {
+        { GL_TEXTURE_MIN_FILTER, "MIN_FILTER", GL_LINEAR_MIPMAP_NEAREST, 0 },
+        { GL_TEXTURE_MAG_FILTER, "MAG_FILTER", GL_NEAREST, 0 },
+        { GL_TEXTURE_WRAP_S, "WRAP_S", GL_CLAMP, 0 },
+        { GL_TEXTURE_WRAP_T, "WRAP_T", GL_CLAMP, 0 },
 #ifdef GL_TEXTURE_WRAP_R_EXT
-        { GL_TEXTURE_WRAP_R_EXT, "WRAP_R_EXT", GL_CLAMP },
+        { GL_TEXTURE_WRAP_R_EXT, "WRAP_R_EXT", GL_CLAMP, "GL_EXT_texture3D" },
 #endif
 #ifdef GL_CLAMP_TO_EDGE_SGIS
-        { GL_TEXTURE_WRAP_S, "WRAP_S/CLAMP_TO_EDGE", GL_CLAMP_TO_EDGE_SGIS },
+        { GL_TEXTURE_WRAP_S, "WRAP_S/CLAMP_TO_EDGE", GL_CLAMP_TO_EDGE_SGIS, "GL_SGIS_texture_edge_clamp" },
 #endif
 #ifdef GL_CLAMP_TO_BORDER_SGIS
-        { GL_TEXTURE_WRAP_T, "WRAP_T/CLAMP_TO_BORDER", GL_CLAMP_TO_BORDER_SGIS },
+        { GL_TEXTURE_WRAP_T, "WRAP_T/CLAMP_TO_BORDER", GL_CLAMP_TO_BORDER_SGIS, "GL_SGIS_texture_border_clamp" },
 #endif
 #ifdef GL_TEXTURE_MIN_LOD_SGIS
-        { GL_TEXTURE_BASE_LEVEL_SGIS, "BASE_LEVEL_SGIS", 1 },
-        { GL_TEXTURE_MAX_LEVEL_SGIS, "MAX_LEVEL_SGIS", 3 },
+        { GL_TEXTURE_BASE_LEVEL_SGIS, "BASE_LEVEL_SGIS", 1, "GL_SGIS_texture_lod" },
+        { GL_TEXTURE_MAX_LEVEL_SGIS, "MAX_LEVEL_SGIS", 3, "GL_SGIS_texture_lod" },
 #endif
     };
     unsigned j;
@@ -782,6 +804,12 @@ static void t_texture(void)
     }
     for (j = 0; j < sizeof tp / sizeof tp[0]; j++) {
         GLint got = -12345;
+        if (tp[j].e && !has_ext(tp[j].e)) {
+            char nm[64];
+            sprintf(nm, "texparam/%s", tp[j].n);
+            skip_case(nm, "extension missing");
+            continue;
+        }
         if (!begin("texparam/%s", tp[j].n))
             continue;
         glBindTexture(GL_TEXTURE_2D, tex);
@@ -931,7 +959,7 @@ static void t_fragment(void)
         glStencilFunc(GL_NOTEQUAL, 3, 0x7F);
         want_i(GL_STENCIL_FUNC, 1, GL_NOTEQUAL);
         want_i(GL_STENCIL_REF, 1, 3);
-        want_i(GL_STENCIL_VALUE_MASK, 1, 0x7F);
+        want_i(GL_STENCIL_VALUE_MASK, 1, stencil_bits(0x7F));
         end();
     }
     if (begin("frag/STENCIL_OP")) {
@@ -993,7 +1021,7 @@ static void t_fragment(void)
     }
     if (begin("fb/STENCIL_WRITEMASK")) {
         glStencilMask(0x35);
-        want_i(GL_STENCIL_WRITEMASK, 1, 0x35);
+        want_i(GL_STENCIL_WRITEMASK, 1, stencil_bits(0x35));
         end();
     }
     if (begin("fb/INDEX_WRITEMASK")) {
@@ -1286,6 +1314,9 @@ int main(int argc, char **argv)
 {
     int attr[] = { GLX_RGBA, GLX_DOUBLEBUFFER, GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8,
                    GLX_ALPHA_SIZE, 8, GLX_DEPTH_SIZE, 16, GLX_STENCIL_SIZE, 1, None };
+    /* GR2: no alpha planes; take depth and stencil over colour depth. */
+    int attr_zs[] = { GLX_RGBA, GLX_DOUBLEBUFFER, GLX_RED_SIZE, 1, GLX_DEPTH_SIZE, 16,
+                      GLX_STENCIL_SIZE, 1, None };
     int attr_min[] = { GLX_RGBA, GLX_DOUBLEBUFFER, GLX_RED_SIZE, 1, None };
     XVisualInfo *vi;
     XSetWindowAttributes swa;
@@ -1310,6 +1341,8 @@ int main(int argc, char **argv)
         return 255;
     vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr);
     if (!vi)
+        vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_zs);
+    if (!vi)
         vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_min);
     if (!vi)
         return 255;
@@ -1326,7 +1359,12 @@ int main(int argc, char **argv)
     ext = (const char *)glGetString(GL_EXTENSIONS);
     if (!ext)
         ext = "";
-    printf("glstate: %s %s %s\n", glGetString(GL_VENDOR), glGetString(GL_RENDERER), glGetString(GL_VERSION));
+    {
+        const char *rn = (const char *)glGetString(GL_RENDERER);
+        gr2 = rn && (!strncmp(rn, "GR", 2) || !strncmp(rn, "GU", 2));
+    }
+    printf("glstate: %s %s %s (visual 0x%x)\n", glGetString(GL_VENDOR), glGetString(GL_RENDERER),
+           glGetString(GL_VERSION), (unsigned)vi->visualid);
     if (verbose)
         printf("extensions: %s\n", ext);
     glViewport(0, 0, WIN, WIN);

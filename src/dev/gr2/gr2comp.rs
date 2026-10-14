@@ -118,13 +118,16 @@ pub fn pixel_rgb(p: u32, mode: u32, xm: &Xmap5) -> u32 {
                 let b = (buf >> 8) & 0xf;
                 ((r * 0x11) << 16) | ((g * 0x11) << 8) | (b * 0x11)
             }
+            0 | 1 => {
+                // 4-bit 1:2:1: R 3, G 2:1, B 0 (the Xsgi TrueColor visual
+                // 0x24's masks: red 0x8, green 0x6, blue 0x1).
+                let [r, g, b] = super::re3::rgb121_to_888(buf & 0xf);
+                (r << 16) | (g << 8) | b
+            }
             _ => {
                 // 8-bit 3:3:2: R 7:5, B 4:3, G 2:0 (the Xsgi TrueColor
                 // visual's masks: red 0xE0, green 0x07, blue 0x18).
-                let v = buf & 0xff;
-                let r = ((v >> 5) & 7) * 255 / 7;
-                let g = (v & 7) * 255 / 7;
-                let b = ((v >> 3) & 3) * 255 / 3;
+                let [r, g, b] = super::re3::rgb332_to_888(buf & 0xff);
                 (r << 16) | (g << 8) | b
             }
         },

@@ -253,8 +253,14 @@ pub enum ReadDecode {
     Ci8 { bank: u32 },
     /// GL 8-bit 3:3:2 RGB in 8-bit `bank`, widened as Rgb24.
     Rgb8 { bank: u32 },
-    /// GL depth: Z right-justified (libglcore shifts it up by 32 - bits).
-    Depth,
+    /// GL 4-bit 1:2:1 RGB in 4-bit `bank` (bits 3:0 / 7:4), widened as Rgb24.
+    Rgb4 { bank: u32 },
+    /// GL depth: Z right-justified (libglcore shifts it up by 32 - bits),
+    /// with `sbits` stencil bits above it in the 24-bit word (a z20 s4
+    /// visual: Z 19:0, stencil 23:20). Inferred: every libglcore depth read
+    /// drops what is above Z (the DMA path shifts by 32 - 20, Fetch masks
+    /// 0xFFFFF), while its stencil Fetch masks the same word with 0xF.
+    Depth { sbits: u32 },
 }
 
 /// Where a screen-to-host read goes.
@@ -281,6 +287,8 @@ pub struct ReadImage {
     /// first-pixel slot (buf_offset); the planes for Planes2d.
     pub s2d: State2d,
     pub decode: ReadDecode,
+    /// Rows bottom first (GL mailbox reads, 0x0AD) instead of top first.
+    pub bottom_up: bool,
 }
 
 impl ReadImage {
@@ -298,7 +306,7 @@ impl ReadImage {
         let off = self.s2d.buf_offset.min(per_word - 1) as i32;
         let wpr = self.words_per_row as usize;
         for r in 0..self.rows as usize {
-            let gy = self.top - r as i32;
+            let gy = if self.bottom_up { self.top - (self.rows as i32 - 1) + r as i32 } else { self.top - r as i32 };
             for k in 0..wpr {
                 let Some(d) = dst.get_mut(r * wpr + k) else { return };
                 let mut word = 0;
@@ -332,7 +340,15 @@ impl ReadImage {
                 let [r, g, b] = re3::rgb332_to_888((vram >> (8 * (bank & 1))) & 0xff);
                 0xff00_0000 | r | (g << 8) | (b << 16)
             }
-            ReadDecode::Depth => vram & 0x00ff_ffff,
+            ReadDecode::Rgb4 { bank } => {
+                let [r, g, b] = re3::rgb121_to_888((vram >> (4 * (bank & 1))) & 0xf);
+                0xff00_0000 | r | (g << 8) | (b << 16)
+            }
+            ReadDecode::Depth { sbits } => {
+                let zbits = 24 - sbits;
+                let s = (vram >> re3::ZBUF_STENCIL_SHIFT) & ((1u32 << sbits) - 1);
+                (vram & ((1u32 << zbits) - 1)) | (s << zbits)
+            }
         }
     }
 }
@@ -556,7 +572,9 @@ impl Hq2Regs {
 /// Where the interpreter's output goes: RE3 register writes and private ops.
 pub trait Re3Sink {
     fn reg(&mut self, reg: usize, val: u32);
-    fn copy(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32);
+    /// Screen-to-screen copy; `mode` 0 = raw (2D), else a GL copy
+    /// (re3::copy_mode: zoom, read bank, logic op and WID test).
+    fn copy(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32, mode: u32);
     /// Raise a finish flag (FIN1/FIN2/FIN3), as the microcode does when it
     /// completes a request the host is waiting on.
     fn finish(&mut self, flag: usize);
@@ -1086,8 +1104,8 @@ impl Hq2Engine {
             let row = self.img_rows_done;
             if self.cmd == HQ2_GL_DMA_WRITE || self.cmd == HQ2_GL_DMA_WRITE_ZOOM {
                 let words = self.img_row;
-                let zoomed = self.cmd == HQ2_GL_DMA_WRITE_ZOOM;
-                self.gl_pixel_row(x as i32, y as i32, row, w, rows, fmt, &words[..wpr.min(IMG_ROW_WORDS)], zoomed, out);
+                let zoom = if self.cmd == HQ2_GL_DMA_WRITE_ZOOM { gl::PixZoom::Both } else { gl::PixZoom::None };
+                self.gl_pixel_row(x as i32, y as i32, row, w, rows, fmt, &words[..wpr.min(IMG_ROW_WORDS)], zoom, out);
             } else {
                 self.image_row(x as i32, y as i32 + row as i32, w, fmt, skip, wpr.min(IMG_ROW_WORDS), out);
             }
@@ -1495,6 +1513,7 @@ impl Hq2Engine {
                     words_per_row: a[0],
                     s2d: self.s2d,
                     decode: ReadDecode::Planes2d,
+                    bottom_up: false,
                 };
                 out.read_image(&req, ReadDest::Shram(READ_IMAGE_SHRAM));
             }
@@ -1507,6 +1526,7 @@ impl Hq2Engine {
                     words_per_row: a[4],
                     s2d: self.s2d,
                     decode: ReadDecode::Planes2d,
+                    bottom_up: false,
                 };
                 out.read_image(&req, ReadDest::Gedma);
             }
@@ -1543,7 +1563,7 @@ impl Hq2Engine {
                 let (sx, sy, w, h, dx, dy) = (a[2] as i32, a[3] as i32, a[4] as i32, a[5] as i32, a[6] as i32, a[7] as i32);
                 let fg = self.s2d.fg;
                 self.setup2d(fg, out);
-                out.copy(sx, SCREEN_H - sy - h, w, h, dx, SCREEN_H - dy - h);
+                out.copy(sx, SCREEN_H - sy - h, w, h, dx, SCREEN_H - dy - h, 0);
             }
             HQ2_2D_ROP => {
                 self.s2d.fg = a[0];
@@ -1574,7 +1594,7 @@ impl Hq2Engine {
                 let (sx, sy, w, h, dx, dy) =
                     (a[2] as i32, a[3] as i32, a[4] as i32, a[5] as i32, a[6] as i32, a[7] as i32);
                 // RECTCOPY takes X-style y (top edge, top-down); VRAM is bottom-up.
-                out.copy(sx, SCREEN_H - sy - h, w, h, dx, SCREEN_H - dy - h);
+                out.copy(sx, SCREEN_H - sy - h, w, h, dx, SCREEN_H - dy - h, 0);
             }
             _ if self.gl_execute(cmd, out) => {}
             _ => {

@@ -150,6 +150,24 @@ hashes are given where a change is easiest to understand by reading the commit.
   `nvram` ones, so both chips get a real MAC regardless of machine profile.
 ### Graphics and host OpenGL
 
+- **GR2 span JIT (`gr2-jit`, part of `gpujit`).** RE3's SHADED and FLAT spans
+  compile to native code per pipeline key (pixel format and dither, raster
+  op, pattern, WID test, depth and stencil tests, blend), the way `gr4-jit`
+  compiles IMPACT primitives: background compiler thread, interpreter until
+  a shader is ready, `IRIS_GR2_JIT=off|on|sync`, `gr2 jit` in the monitor.
+  Bit-exact with the interpreter (`re3_jit_tests.rs`). IRIX fill rate on XZ
+  about 3x (78 to 245 Mpx/s), Z-buffered 2x; small triangles are bound by
+  the HQ2 side and unchanged.
+- **GR2 OpenGL accuracy against the IMPACT test suites.** pixtest (RGBA,
+  `--ci 8`, `--ci 12`), blendtest, glstate and vissweep run clean on XZ.
+  New: glCopyPixels (0x0BA) with zoom, glDrawPixels x zoom, the 0x0A7 pixel
+  packing for colour-index reads and draws, colour-index clears with depth
+  (0x30A0 / 0x70A0), colour-index software fragments, the 4-bit 1:2:1 RGB
+  visual, mailbox reads bottom row first, 3:3:2 widening by bit
+  replication, and depth reads of z20 s4 visuals with the stencil above Z.
+  The suites flag libGLcore EXPRESS's own bugs as GR2 XFAILs
+  (rules/gr2/gl-test-suites.md).
+
 - **Host GL on Linux.** `--features hostgl` now has an EGL backend
   (`iris-hostgl/src/backend/egl.rs`): headless contexts in the compatibility
   profile with no surface at all (every drawable was already a framebuffer
