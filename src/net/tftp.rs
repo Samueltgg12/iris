@@ -194,26 +194,36 @@ impl TftpServer {
         }
     }
 
-    /// Whether `name` would be served. BOOTP asks this before naming a boot file.
+    /// Whether `name` would be served.
     pub fn exists(&self, name: &str) -> bool {
-        self.resolve(name).is_some_and(|p| p.is_file())
+        file_exists(&self.root, name)
     }
 
-    /// Resolve `name` under the root, refusing anything that escapes it:
-    /// any `..`, and symlinks pointing outside. Leading slashes are dropped,
-    /// so an absolute name is taken relative to the root.
     fn resolve(&self, name: &str) -> Option<PathBuf> {
-        let rel = Path::new(name.trim_start_matches('/'));
-        if rel.as_os_str().is_empty() {
-            return None;
-        }
-        if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
-            return None;
-        }
-        let root = self.root.canonicalize().ok()?;
-        let full = root.join(rel).canonicalize().ok()?;
-        full.starts_with(&root).then_some(full)
+        resolve(&self.root, name)
     }
+}
+
+/// Whether `name` is a file TFTP would serve from `root`. BOOTP asks this
+/// before naming a boot file.
+pub fn file_exists(root: &Path, name: &str) -> bool {
+    resolve(root, name).is_some_and(|p| p.is_file())
+}
+
+/// Resolve `name` under `root`, refusing anything that escapes it: any `..`,
+/// and symlinks pointing outside. Leading slashes are dropped, so an absolute
+/// name is taken relative to the root.
+fn resolve(root: &Path, name: &str) -> Option<PathBuf> {
+    let rel = Path::new(name.trim_start_matches('/'));
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let full = root.join(rel).canonicalize().ok()?;
+    full.starts_with(&root).then_some(full)
 }
 
 /// Read `block` at `offset` and build its DATA packet, recording it for retransmit.
