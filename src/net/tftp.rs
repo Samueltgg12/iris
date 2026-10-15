@@ -6,6 +6,11 @@
 //!
 //! Read-only by construction: WRQ is refused and no path ever opens for writing.
 //! Packet fields are network byte order, which is the Edge, so swapping is correct.
+//!
+//! Names are relative to the root even when they start with `/`, as tftpd
+//! `-s` does: `bootp()/unix` and `tftp> get /unix` both ask for `<root>/unix`.
+//! Both RFC 1350 modes are served; netascii is the default of most
+//! command-line clients, IRIX's and Linux's included.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -35,8 +40,15 @@ const ERR_UNKNOWN_ID: u16 = 5;
 /// A client is identified by its address and source port (its TID).
 pub type ClientId = (Ipv4Addr, u16);
 
+/// Where a transfer's bytes come from. Octet streams the file; netascii
+/// changes the length, so it is translated once up front.
+enum Source {
+    File(File),
+    Netascii(Vec<u8>),
+}
+
 struct Transfer {
-    file: File,
+    source: Source,
     /// Block number of the DATA packet currently outstanding (1-based, wraps).
     block: u16,
     /// File offset of that block.
@@ -116,22 +128,31 @@ impl TftpServer {
         let Some((name, mode)) = parse_request(body) else {
             return error_packet(ERR_NOT_DEFINED, "malformed request");
         };
-        // The PROM only ever asks for octet (verified in the embedded PROM image);
-        // netascii would need CRLF translation we deliberately don't do.
-        if !mode.eq_ignore_ascii_case("octet") {
-            return error_packet(ERR_NOT_DEFINED, "only octet mode is supported");
+        // The PROM always asks for octet; command-line clients default to netascii.
+        let netascii = mode.eq_ignore_ascii_case("netascii");
+        if !netascii && !mode.eq_ignore_ascii_case("octet") {
+            return error_packet(ERR_NOT_DEFINED, "mode must be octet or netascii");
         }
         let Some(path) = self.resolve(&name) else {
             return error_packet(ERR_FILE_NOT_FOUND, &format!("{}: not found", name));
         };
-        let file = match File::open(&path) {
+        let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(e) => return error_packet(ERR_FILE_NOT_FOUND, &format!("{}: {}", name, e)),
+        };
+        let source = if netascii {
+            let mut raw = Vec::new();
+            if let Err(e) = file.read_to_end(&mut raw) {
+                return error_packet(ERR_NOT_DEFINED, &format!("{}: {}", name, e));
+            }
+            Source::Netascii(to_netascii(&raw))
+        } else {
+            Source::File(file)
         };
 
         // A second RRQ from the same TID replaces whatever was in flight.
         let mut t = Transfer {
-            file,
+            source,
             block: 0,
             offset: 0,
             last_packet: Vec::new(),
@@ -173,11 +194,17 @@ impl TftpServer {
         }
     }
 
+    /// Whether `name` would be served. BOOTP asks this before naming a boot file.
+    pub fn exists(&self, name: &str) -> bool {
+        self.resolve(name).is_some_and(|p| p.is_file())
+    }
+
     /// Resolve `name` under the root, refusing anything that escapes it:
-    /// absolute paths, any `..`, and symlinks pointing outside.
+    /// any `..`, and symlinks pointing outside. Leading slashes are dropped,
+    /// so an absolute name is taken relative to the root.
     fn resolve(&self, name: &str) -> Option<PathBuf> {
-        let rel = Path::new(name);
-        if rel.as_os_str().is_empty() || rel.is_absolute() {
+        let rel = Path::new(name.trim_start_matches('/'));
+        if rel.as_os_str().is_empty() {
             return None;
         }
         if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
@@ -192,12 +219,22 @@ impl TftpServer {
 /// Read `block` at `offset` and build its DATA packet, recording it for retransmit.
 fn send_block(t: &mut Transfer, block: u16, offset: u64, now: Instant) -> std::io::Result<Vec<u8>> {
     let mut buf = [0u8; BLOCK_SIZE];
-    t.file.seek(SeekFrom::Start(offset))?;
     let mut filled = 0;
-    while filled < BLOCK_SIZE {
-        match t.file.read(&mut buf[filled..])? {
-            0 => break,
-            n => filled += n,
+    match &mut t.source {
+        Source::File(file) => {
+            file.seek(SeekFrom::Start(offset))?;
+            while filled < BLOCK_SIZE {
+                match file.read(&mut buf[filled..])? {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+        }
+        Source::Netascii(data) => {
+            let start = (offset as usize).min(data.len());
+            let chunk = &data[start..(start + BLOCK_SIZE).min(data.len())];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            filled = chunk.len();
         }
     }
 
@@ -215,6 +252,19 @@ fn send_block(t: &mut Transfer, block: u16, offset: u64, now: Instant) -> std::i
     t.retries = 0;
     t.sent_at = now;
     Ok(pkt)
+}
+
+/// RFC 764 netascii: LF becomes CR LF, a bare CR becomes CR NUL.
+fn to_netascii(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() + raw.len() / 32);
+    for &b in raw {
+        match b {
+            b'\n' => out.extend_from_slice(b"\r\n"),
+            b'\r' => out.extend_from_slice(b"\r\0"),
+            _ => out.push(b),
+        }
+    }
+    out
 }
 
 fn error_packet(code: u16, msg: &str) -> Vec<u8> {
@@ -397,15 +447,62 @@ mod tests {
     }
 
     #[test]
-    fn netascii_is_refused() {
+    fn unknown_mode_is_refused() {
         let root = tmp_root("mode");
         std::fs::write(root.join("f"), b"x").unwrap();
         let mut srv = TftpServer::new(root.clone());
-        let p = srv.handle(CLIENT, &rrq("f", "netascii"), Instant::now()).unwrap();
+        let p = srv.handle(CLIENT, &rrq("f", "mail"), Instant::now()).unwrap();
         assert_eq!(opcode(&p), OP_ERROR);
         // Case-insensitive: the PROM sends lowercase "octet", others vary.
         let ok = srv.handle(CLIENT, &rrq("f", "OCTET"), Instant::now()).unwrap();
         assert_eq!(opcode(&ok), OP_DATA);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Command-line clients (IRIX, BSD, tftp-hpa) default to netascii.
+    #[test]
+    fn netascii_translates_line_ends_across_blocks() {
+        let root = tmp_root("netascii");
+        // 300 lines push the translated stream over one block.
+        let mut data = Vec::new();
+        for i in 0..300u32 {
+            data.extend_from_slice(format!("line {}\n", i).as_bytes());
+        }
+        data.extend_from_slice(b"bare\rcr");
+        std::fs::write(root.join("t"), &data).unwrap();
+        let mut srv = TftpServer::new(root.clone());
+
+        let now = Instant::now();
+        let mut pkt = srv.handle(CLIENT, &rrq("t", "NetASCII"), now).unwrap();
+        let mut got = Vec::new();
+        loop {
+            assert_eq!(opcode(&pkt), OP_DATA);
+            got.extend_from_slice(&pkt[4..]);
+            match srv.handle(CLIENT, &ack(field(&pkt)), now) {
+                Some(next) => pkt = next,
+                None => break,
+            }
+        }
+        assert_eq!(got, to_netascii(&data));
+        assert!(got.len() > BLOCK_SIZE);
+        assert!(got.ends_with(b"bare\r\0cr"));
+        assert!(got.windows(3).any(|w| w == b"0\r\n"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `bootp()/unix` and `tftp> get /unix` send absolute names; tftpd -s
+    /// semantics take them relative to the root.
+    #[test]
+    fn absolute_names_are_relative_to_the_root() {
+        let root = tmp_root("abs");
+        std::fs::create_dir_all(root.join("boot")).unwrap();
+        std::fs::write(root.join("boot/unix"), b"kernel").unwrap();
+        let mut srv = TftpServer::new(root.clone());
+        let p = srv.handle(CLIENT, &rrq("/boot/unix", "octet"), Instant::now()).unwrap();
+        assert_eq!(opcode(&p), OP_DATA);
+        assert_eq!(&p[4..], b"kernel");
+        assert!(srv.exists("/boot/unix") && srv.exists("boot/unix"));
+        assert!(!srv.exists("boot"), "a directory is not a boot file");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -421,7 +518,7 @@ mod tests {
         let mut srv = TftpServer::new(root.clone());
 
         let now = Instant::now();
-        for bad in ["../etc/passwd", "/etc/passwd", "sub/../../escape", ""] {
+        for bad in ["../etc/passwd", "/../etc/passwd", "sub/../../escape", "", "/", "/etc/passwd"] {
             let p = srv.handle(CLIENT, &rrq(bad, "octet"), now).unwrap();
             assert_eq!(opcode(&p), OP_ERROR, "{} must be refused", bad);
         }

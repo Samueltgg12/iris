@@ -982,7 +982,7 @@ impl Device for Ps2Controller {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string())]
+        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 esc | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
@@ -1018,6 +1018,13 @@ impl Device for Ps2Controller {
                 writeln!(writer, "PS/2: pressed Enter").unwrap();
                 return Ok(());
             }
+            // Esc during "Starting up the system..." stops the PROM's autoboot.
+            if !args.is_empty() && args[0] == "esc" {
+                self.push_kb(KeyCode::Escape, true);
+                self.push_kb(KeyCode::Escape, false);
+                writeln!(writer, "PS/2: pressed Esc").unwrap();
+                return Ok(());
+            }
             if !args.is_empty() && args[0] == "mouse" {
                 let n = |i: usize| args.get(i).and_then(|v| v.parse::<i32>().ok());
                 let (Some(dx), Some(dy)) = (n(1), n(2)) else {
@@ -1036,7 +1043,7 @@ impl Device for Ps2Controller {
                     s.mouse_queue_bytes, s.scancode_set, s.config, s.last_read).unwrap();
                 return Ok(());
             }
-            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string());
+            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 esc | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string());
         }
         Err("Command not found".to_string())
     }

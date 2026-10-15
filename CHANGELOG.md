@@ -12,6 +12,20 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Networking
+
+- **TFTP works for PROM network boot and for guest clients.** `boot -f
+  bootp()/unix` failed in two places. The BOOTP reply left the boot file
+  empty, which the PROM treats as "File not found on server". Its second
+  BOOTP, sent when the ELF loader seeks backwards and reopens the file, was
+  answered by broadcast, which the PROM drops once it has an address. BOOTP
+  now names the file and replies to the client's address, as bootpd does.
+  The TFTP server also refused absolute names (`/unix`) and netascii, the
+  default mode of IRIX's `/usr/bsd/tftp`. It now takes names relative to
+  the root, as `tftpd -s` does, and serves netascii. `test/tftp/` has a
+  portable client (`tftpget.c`) and a guest test script. The monitor's
+  `ps2 esc` presses Esc, which stops the PROM's autoboot.
+
 ### UI / input
 
 - **`--2x` and `scale = 2` survive boot.** The window opened at 2× but

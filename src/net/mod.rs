@@ -1201,6 +1201,65 @@ mod tftp_nat_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// BOOTP request as the PROM builds it for `bootp()<file>` (mk_bootp).
+    fn bootp_request(guest_mac: &[u8; 6], file: &str) -> Vec<u8> {
+        let mut bp = vec![0u8; 300];
+        bp[0] = BOOTP_OP_REQUEST; bp[1] = 1; bp[2] = 6;
+        bp[4..8].copy_from_slice(&0x1234u32.to_be_bytes());
+        bp[28..34].copy_from_slice(guest_mac);
+        bp[108..108 + file.len()].copy_from_slice(file.as_bytes());
+        let udp = udp_packet(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST,
+                             UDP_PORT_BOOTP_CLIENT, UDP_PORT_BOOTP_SERVER, &bp);
+        ip_frame(&[0xff; 6], guest_mac, Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, IP_PROTO_UDP, &udp)
+    }
+
+    /// The PROM aborts a network boot when the reply's file is empty, and
+    /// TFTPs the name it gets back — so a served file must be named there.
+    #[test]
+    fn bootp_names_the_boot_file_the_tftp_root_has() {
+        let root = tmp_root("bootp");
+        std::fs::write(root.join("unix"), b"kernel").unwrap();
+        let (mut e, mut rx) = engine(&root);
+        let guest_mac = [0x08, 0x00, 0x69, 0x11, 0x22, 0x33];
+
+        e.process(&bootp_request(&guest_mac, "/unix"));
+        let (_, dport, rep) = parse_reply(&rx.pop().expect("BOOTP reply"));
+        assert_eq!(dport, UDP_PORT_BOOTP_CLIENT);
+        assert_eq!(&rep[20..24], &e.config.gateway_ip.octets(), "siaddr = TFTP server");
+        assert_eq!(&rep[108..114], b"/unix\0");
+        assert_eq!(&rep[44..49], b"iris\0");
+
+        // A file the root doesn't have leaves the field empty, as before.
+        e.process(&bootp_request(&guest_mac, "missing"));
+        let (_, _, rep) = parse_reply(&rx.pop().expect("BOOTP reply"));
+        assert!(rep[108..236].iter().all(|&b| b == 0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The PROM accepts only IP packets addressed to it once it has an
+    /// address, and a backward seek in the ELF loader reopens the file with a
+    /// second BOOTP — whose reply must therefore not be broadcast.
+    #[test]
+    fn bootp_reply_is_addressed_to_the_client() {
+        let root = tmp_root("bootp-dst");
+        let (mut e, mut rx) = engine(&root);
+        let guest_mac = [0x08, 0x00, 0x69, 0x11, 0x22, 0x33];
+        let ip_dst = |f: &[u8]| Ipv4Addr::new(f[30], f[31], f[32], f[33]);
+
+        // First BOOTP: no address yet, reply goes to the one being assigned.
+        e.process(&bootp_request(&guest_mac, "unix"));
+        assert_eq!(ip_dst(&rx.pop().unwrap()), e.config.client_ip);
+
+        // Reopen: ciaddr set, reply goes there.
+        let mut f = bootp_request(&guest_mac, "unix");
+        let ciaddr = Ipv4Addr::new(192, 168, 0, 77);
+        let bp = 14 + 20 + 8;
+        f[bp + 12..bp + 16].copy_from_slice(&ciaddr.octets());
+        e.process(&f);
+        assert_eq!(ip_dst(&rx.pop().unwrap()), ciaddr);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn tftp_is_inert_when_no_directory_is_configured() {
         let (_tx_prod, tx_cons) = rtrb::RingBuffer::new(8);
@@ -2028,6 +2087,7 @@ impl NatEngine {
         rep[16..20].copy_from_slice(&self.config.client_ip.octets());
         rep[20..24].copy_from_slice(&self.config.gateway_ip.octets());
         rep[28..34].copy_from_slice(&chaddr);
+        self.bootp_boot_file(payload, &mut rep);
 
         if is_dhcp {
             rep[236..240].copy_from_slice(&[99, 130, 83, 99]);
@@ -2054,12 +2114,44 @@ impl NatEngine {
             rep[o]=255;
         }
 
-        let udp = udp_packet(self.config.gateway_ip, Ipv4Addr::BROADCAST,
+        // Address the reply as bootpd does: to ciaddr when the client already
+        // has an address, else to yiaddr for plain BOOTP. The PROM drops any
+        // IP packet not addressed to it once it has left promiscuous mode, so a
+        // broadcast reply to its second BOOTP (a backward seek reopens the file)
+        // is never seen. DHCP keeps the broadcast its clients already rely on.
+        let ciaddr = Ipv4Addr::from(r32(payload, 12));
+        let dst_ip = if !ciaddr.is_unspecified() { ciaddr }
+                     else if is_dhcp { Ipv4Addr::BROADCAST }
+                     else { self.config.client_ip };
+        let udp = udp_packet(self.config.gateway_ip, dst_ip,
                              UDP_PORT_BOOTP_SERVER, UDP_PORT_BOOTP_CLIENT, &rep);
         let frame = ip_frame(client_mac, &self.config.gateway_mac,
-                             self.config.gateway_ip, Ipv4Addr::BROADCAST,
+                             self.config.gateway_ip, dst_ip,
                              IP_PROTO_UDP, &udp);
         self.enqueue_rx(frame);
+    }
+
+    /// Fill sname and file for a PROM network boot (`boot -f bootp()unix`).
+    /// The PROM refuses a reply with an empty file ("File ... not found on
+    /// server") and TFTPs exactly the name given back, so name the requested
+    /// file whenever the TFTP root has it. With no TFTP, or no such file, the
+    /// fields stay empty as before.
+    fn bootp_boot_file(&self, request: &[u8], rep: &mut [u8]) {
+        let Some(tftp) = self.tftp.as_ref() else { return };
+        let field = |r: std::ops::Range<usize>| {
+            let f = &request[r];
+            String::from_utf8_lossy(&f[..f.iter().position(|&b| b == 0).unwrap_or(f.len())]).into_owned()
+        };
+        let file = field(108..236);
+        if file.is_empty() || !tftp.exists(&file) {
+            dlog_dev!(LogModule::Net, "NAT BOOTP file {:?} not in the TFTP root", file);
+            return;
+        }
+        // Echo a requested server name (bootp()host:file), else name ourselves.
+        let sname = field(44..108);
+        let sname = if sname.is_empty() { "iris".to_string() } else { sname };
+        rep[44..44 + sname.len().min(63)].copy_from_slice(&sname.as_bytes()[..sname.len().min(63)]);
+        rep[108..108 + file.len()].copy_from_slice(file.as_bytes()); // < 128: it came from a 128-byte field
     }
 
     // ── DNS forwarding ────────────────────────────────────────────────────────

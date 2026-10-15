@@ -172,6 +172,26 @@ DHCP reply options provided:
 | DNS server | `8.8.8.8` (guest DNS queries are forwarded to the host's DNS server whatever address they are sent to) |
 | Lease time | 86400 s (24 h) |
 
+### TFTP (PROM network boot)
+
+`tftp_dir = "DIR"` under `[network]` (or `--tftp-dir DIR`) serves DIR
+read-only over TFTP at the gateway (`192.168.0.1`, UDP 69). Names are taken
+relative to DIR even when they start with `/`, as `tftpd -s` does, and
+nothing outside DIR (`..`, symlinks out) is reachable. Both modes work:
+`octet` (what the PROM uses) and `netascii` (the default of IRIX's
+`/usr/bsd/tftp` and most other command-line clients).
+
+With TFTP on, the BOOTP reply names the requested file when DIR has it, so
+the PROM can boot from it:
+
+```
+>> boot -f bootp()/unix          # loads DIR/unix
+```
+
+To reach the Command Monitor on a machine that autoboots, press Esc while
+the PROM says "Starting up the system" (from the monitor console:
+`ps2 esc`). `test/tftp/` has a guest-side client and a test script.
+
 ### NAT
 
 All outbound TCP, UDP, and ICMP traffic from the guest is NATed through the
@@ -665,7 +685,7 @@ iris --headless
 # Headless with audio also disabled (lightest possible server mode)
 iris --headless --noaudio
 
-# Network-boot from the PROM: then `boot -f bootp()unix` at the PROM monitor
+# Network-boot from the PROM: then `boot -f bootp()/unix` at the PROM monitor
 iris --tftp-dir ./tftpboot
 ```
 
@@ -869,7 +889,7 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 | `pit debug <on\|off>` | PIT trace **[DEV]** |
 | `hal2 status` | HAL2 audio controller state |
 | `ps2 status` | PS/2 controller state |
-| `ps2 type <ascii>` / `ps2 enter` | Type text / press Enter on the guest keyboard |
+| `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (stops PROM autoboot) on the guest keyboard |
 | `ps2 mouse <dx> <dy> [buttons]` | Inject relative mouse motion and optional button mask |
 | `ps2 debug <on\|off>` | PS/2 keyboard/mouse trace |
 | `serial status` | SCC channel A/B registers and FIFO state |
