@@ -14,6 +14,22 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Networking
 
+- **The NAT stack was rebuilt, and is faster and no longer stalls.** Through
+  a port forward, host → guest TCP went from about 1 to 6 MB/s and guest →
+  host from 2.7 to 7 MB/s; FTP to a LAN server from 1 to 7 MB/s; a large
+  UDP round trip from 48 to 5 ms. A connect to an unreachable host no longer
+  freezes all guest networking for up to 5 s (nor does each DNS lookup for
+  up to 2 s), established connections are no longer dropped after 5 minutes
+  idle, and the NAT thread idles at 0.1% of a core instead of 3.7%. Causes:
+  no MSS option in our SYN-ACK (IRIX used 512-byte segments off-subnet),
+  seeq-enet pacing bursts at one frame per millisecond after a lost wake-up,
+  blocking connect and DNS on the NAT thread, and 1 ms polling. The code is
+  split into modules over typed packets (`net/packet.rs`), a real
+  guest-facing TCP endpoint (`net/tcp.rs`) and socket-like in-core services;
+  UDP replies now keep their real source port (TFTP to an outside server),
+  and portmap answers only at the gateway. Tests: `net::testnet` (directed,
+  frames in and out against real host sockets) and `test/net` (guest and
+  host, with `nettest.c`). Design and numbers: `docs/net-stack.md`.
 - **TFTP works for PROM network boot and for guest clients.** `boot -f
   bootp()/unix` failed in two places. The BOOTP reply left the boot file
   empty, which the PROM treats as "File not found on server". Its second

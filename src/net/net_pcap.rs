@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 
 use crate::config::NetMode;
 use crate::devlog::LogModule;
@@ -288,8 +288,8 @@ pub struct PcapEngine {
     config:  GatewayConfig,
     tx_cons: rtrb::Consumer<Vec<u8>>,         // outbound frames from enet thread
     rx_prod: rtrb::Producer<Vec<u8>>,         // inbound frames to enet thread
-    rx_wake: Arc<(Mutex<()>, Condvar)>,       // signal enet thread on new RX
-    tx_wake: Arc<(Mutex<()>, Condvar)>,       // wait for new TX frames
+    rx_wake: Arc<crate::net::Wake>,       // signal enet thread on new RX
+    tx_wake: Arc<crate::net::Wake>,       // wait for new TX frames
     running: Arc<AtomicBool>,
     ctl:     Arc<NatControl>,
     /// Guest MAC, learned from the first outbound frame. Used to filter our own
@@ -306,8 +306,8 @@ impl PcapEngine {
     pub fn new(config: GatewayConfig,
                tx_cons: rtrb::Consumer<Vec<u8>>,
                rx_prod: rtrb::Producer<Vec<u8>>,
-               rx_wake: Arc<(Mutex<()>, Condvar)>,
-               tx_wake: Arc<(Mutex<()>, Condvar)>,
+               rx_wake: Arc<crate::net::Wake>,
+               tx_wake: Arc<crate::net::Wake>,
                running: Arc<AtomicBool>,
                ctl:     Arc<NatControl>) -> Self {
         // Stand up the virtual NFS host when an export and a virtual IP are both
@@ -357,9 +357,7 @@ impl NetBackend for PcapEngine {
                 // Drain TX so the guest's ring doesn't back up, but produce no RX.
                 while self.running.load(Ordering::Relaxed) {
                     {
-                        let (lock, cvar) = &*self.tx_wake;
-                        let mut guard = lock.lock();
-                        let _ = cvar.wait_for(&mut guard, Duration::from_millis(50));
+                        self.tx_wake.wait(Duration::from_millis(50));
                     }
                     while self.tx_cons.pop().is_ok() {}
                 }
@@ -370,9 +368,7 @@ impl NetBackend for PcapEngine {
         while self.running.load(Ordering::Relaxed) {
             // Wait for outbound frames or a short timeout to poll the capture.
             {
-                let (lock, cvar) = &*self.tx_wake;
-                let mut guard = lock.lock();
-                let _ = cvar.wait_for(&mut guard, Duration::from_millis(1));
+                self.tx_wake.wait(Duration::from_millis(1));
             }
 
             // Machine reset: nothing stateful to flush in bridged mode, but honor
@@ -431,7 +427,7 @@ impl NetBackend for PcapEngine {
                     if let Some(replies) = host.maybe_handle(&frame) {
                         for reply in replies {
                             if self.rx_prod.slots() > 0 && self.rx_prod.push(reply).is_ok() {
-                                self.rx_wake.1.notify_one();
+                                self.rx_wake.notify();
                             }
                         }
                         continue;
@@ -467,7 +463,7 @@ impl NetBackend for PcapEngine {
                             dlog_dev!(LogModule::Net, "PCAP RX {}", eth_summary(frame));
                         }
                         if self.rx_prod.push(frame.to_vec()).is_ok() {
-                            self.rx_wake.1.notify_one();
+                            self.rx_wake.notify();
                         }
                     }
                     Err(pcap::Error::TimeoutExpired) | Err(pcap::Error::NoMorePackets) => break,

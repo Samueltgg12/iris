@@ -14,7 +14,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use crate::devlog::LogModule;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -179,9 +179,9 @@ pub struct Seeq8003 {
     rx_prod:  Mutex<Option<rtrb::Producer<Vec<u8>>>>,
     rx_cons:  Mutex<Option<rtrb::Consumer<Vec<u8>>>>,
     // tx_wake: enet signals NAT when it pushes a TX frame
-    tx_wake:  Arc<(Mutex<()>, Condvar)>,
+    tx_wake:  Arc<crate::net::Wake>,
     // rx_wake: NAT signals enet when it pushes an RX frame
-    rx_wake:  Arc<(Mutex<()>, Condvar)>,
+    rx_wake:  Arc<crate::net::Wake>,
     /// Activity heartbeat — shared with Rex3 display thread.
     heartbeat: Arc<AtomicU64>,
 }
@@ -252,8 +252,8 @@ impl Seeq8003 {
             tx_cons: Mutex::new(Some(tx_cons)),
             rx_prod: Mutex::new(Some(rx_prod)),
             rx_cons: Mutex::new(Some(rx_cons)),
-            tx_wake: Arc::new((Mutex::new(()), Condvar::new())),
-            rx_wake: Arc::new((Mutex::new(()), Condvar::new())),
+            tx_wake: crate::net::Wake::new(),
+            rx_wake: crate::net::Wake::new(),
             heartbeat,
         }
     }
@@ -332,7 +332,7 @@ impl Seeq8003 {
     /// Runs WITHOUT SeeqState lock. Returns a TxPumpResult to be applied under SeeqState lock.
     fn pump_tx(tx_dma: &Arc<dyn DmaClient>,
                tx_prod: &mut rtrb::Producer<Vec<u8>>,
-               tx_wake: &Arc<(Mutex<()>, Condvar)>,
+               tx_wake: &Arc<crate::net::Wake>,
                in_reset: &Arc<AtomicBool>) -> TxPumpResult {
         if in_reset.load(Ordering::Relaxed) { return TxPumpResult::Nothing; }
         let mut frame = Vec::with_capacity(1518);
@@ -351,7 +351,7 @@ impl Seeq8003 {
 
         crate::pf_instant!(crate::perfetto::events::ENET_TX, frame.len());
         let _ = tx_prod.push(frame);
-        tx_wake.1.notify_one();
+        tx_wake.notify();
 
         TxPumpResult::Sent { dma_irq: dma_st.irq(), writeback }
     }
@@ -428,13 +428,13 @@ impl Seeq8003 {
     /// Wake the enet thread immediately to drain pending TX data.
     /// Call this when the TX DMA channel is activated with a descriptor ready.
     pub fn kick_tx(&self) {
-        self.rx_wake.1.notify_one();
+        self.rx_wake.notify();
     }
 
     /// Wake the enet thread to deliver any pending RX frames.
     /// Call this when the RX DMA channel is activated so queued frames aren't lost.
     pub fn kick_rx(&self) {
-        self.rx_wake.1.notify_one();
+        self.rx_wake.notify();
     }
 
     /// Assert CH_RESET (rising edge): hold device in reset state.
@@ -549,8 +549,8 @@ impl Seeq8003 {
         let me = self.clone(); register_lock_fn("seeq::tx_cons",           move || me.tx_cons.is_locked());
         let me = self.clone(); register_lock_fn("seeq::rx_prod",           move || me.rx_prod.is_locked());
         let me = self.clone(); register_lock_fn("seeq::rx_cons",           move || me.rx_cons.is_locked());
-        let me = self.clone(); register_lock_fn("seeq::tx_wake",           move || me.tx_wake.0.is_locked());
-        let me = self.clone(); register_lock_fn("seeq::rx_wake",           move || me.rx_wake.0.is_locked());
+        let me = self.clone(); register_lock_fn("seeq::tx_wake",           move || me.tx_wake.is_locked());
+        let me = self.clone(); register_lock_fn("seeq::rx_wake",           move || me.rx_wake.is_locked());
         let me = self.clone(); register_lock_fn("seeq::nat_ctl::snapshot", move || me.nat_ctl.snapshot.is_locked());
     }
 }
@@ -635,12 +635,15 @@ impl Device for Seeq8003 {
         thread::Builder::new().name("seeq-enet".into()).spawn(move || {
             let mut tx_prod = tx_prod;
             let mut rx_cons = rx_cons;
+            // Whether the last pass moved a frame. While frames are moving we go
+            // straight round again: a wake-up that arrived while we were busy is
+            // lost (the condvar has no memory), so waiting here would pace a
+            // burst at one frame per timeout.
+            let mut busy = false;
             while running_enet.load(Ordering::Relaxed) {
                 // Wait for an RX frame from NAT, or 1ms timeout to poll TX DMA
-                {
-                    let (lock, cvar) = &*rx_wake_enet;
-                    let mut guard = lock.lock();
-                    let _ = cvar.wait_for(&mut guard, Duration::from_millis(1));
+                if !busy {
+                    rx_wake_enet.wait(Duration::from_millis(1));
                 }
 
                 // Snapshot rx_cmd and station_addr for address filtering outside state lock.
@@ -679,6 +682,7 @@ impl Device for Seeq8003 {
                 let mut dma_irq = false;
 
                 let tx_activity = !matches!(tx_result, TxPumpResult::Nothing);
+                let tx_moved = matches!(tx_result, TxPumpResult::Sent { .. });
                 match tx_result {
                     TxPumpResult::Sent { dma_irq: irq, writeback } => {
                         dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ TX complete dma_irq={}", st.ts, irq);
@@ -695,6 +699,7 @@ impl Device for Seeq8003 {
                 }
 
                 let rx_activity = !matches!(rx_result, RxPumpResult::Nothing);
+                let rx_moved = matches!(rx_result, RxPumpResult::Delivered { .. });
                 match rx_result {
                     RxPumpResult::Delivered { dma_irq: irq, writeback, frame_len } => {
                         dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX delivered {} bytes dma_irq={}", st.ts, frame_len, irq);
@@ -725,6 +730,7 @@ impl Device for Seeq8003 {
                 if rx_activity { heartbeat_enet.fetch_or(crate::dev::ng1::rex3::Rex3::HB_ENET_RX, Ordering::Relaxed); }
 
                 let did_something = tx_activity || rx_activity || dma_irq;
+                busy = tx_moved || rx_moved;
                 if did_something {
                     dlog_dev!(LogModule::Seeq, "[ts={}] raise_interrupt caller=enet_thread dma_irq={} rx_stat={:02x} rx_cmd={:02x} tx_stat={:02x} tx_cmd={:02x}", st.ts, dma_irq, st.rx_stat, st.rx_cmd, st.tx_stat, st.tx_cmd);
                     Self::raise_interrupt(&mut st, dma_irq, &callback);

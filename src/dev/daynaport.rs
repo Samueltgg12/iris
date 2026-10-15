@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use rtrb::RingBuffer;
 
 use crate::devlog::LogModule;
@@ -143,10 +143,10 @@ pub struct DaynaPort {
     /// The far ends, held until `start()` moves them into the NAT thread.
     nat_ends: Option<(rtrb::Consumer<Vec<u8>>, rtrb::Producer<Vec<u8>>)>,
     /// Signalled by us when a TX frame is queued (the NAT thread waits on it).
-    tx_wake: Arc<(Mutex<()>, Condvar)>,
+    tx_wake: Arc<crate::net::Wake>,
     /// Signalled by the NAT thread when an RX frame is queued. Nothing waits on
     /// it here — the driver polls READ every 10 ms — but `NatEngine` needs it.
-    rx_wake: Arc<(Mutex<()>, Condvar)>,
+    rx_wake: Arc<crate::net::Wake>,
 
     stats: DpStats,
     /// Sense data served on REQUEST SENSE, set by the last CHECK CONDITION.
@@ -170,8 +170,8 @@ impl DaynaPort {
             tx_prod,
             rx_cons,
             nat_ends: Some((tx_cons, rx_prod)),
-            tx_wake: Arc::new((Mutex::new(()), Condvar::new())),
-            rx_wake: Arc::new((Mutex::new(()), Condvar::new())),
+            tx_wake: crate::net::Wake::new(),
+            rx_wake: crate::net::Wake::new(),
             stats: DpStats::default(),
             pending_sense: [0u8; 18],
         }
@@ -244,7 +244,7 @@ impl DaynaPort {
     /// `seeq8003::stop` gives.
     pub fn stop(&mut self) {
         if !self.running.swap(false, Ordering::SeqCst) { return; }
-        self.tx_wake.1.notify_all();
+        self.tx_wake.notify();
         let (tx_prod, tx_cons) = RingBuffer::new(CHAN_CAPACITY);
         let (rx_prod, rx_cons) = RingBuffer::new(CHAN_CAPACITY);
         self.tx_prod  = tx_prod;
@@ -454,7 +454,7 @@ impl DaynaPort {
             self.stats.tx_dropped += 1;
         } else {
             self.stats.tx_frames += 1;
-            self.tx_wake.1.notify_one();
+            self.tx_wake.notify();
             self.heartbeat.fetch_or(crate::dev::ng1::rex3::Rex3::HB_ENET_TX, Ordering::Relaxed);
         }
         good()
