@@ -5,19 +5,46 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead};
 
+/// Symbols from one or more map files. A name can appear in several (the
+/// PROM and the kernel both have a `bcopy`), so each copy is kept with the
+/// file it came from and expressions must pick one (`bcopy:1`) when a name is
+/// ambiguous; `sym bcopy` lists the copies.
 #[derive(Clone, Default)]
 pub struct SymbolTable {
+    /// Address → name, for reverse lookup (a later file wins a shared address).
     pub symbols: BTreeMap<u64, String>,
+    /// Name → every copy, in load order.
+    by_name: std::collections::HashMap<String, Vec<SymCopy>>,
+    /// Map files loaded, in order; `SymCopy::file` indexes this.
+    files: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SymCopy {
+    addr: u64,
+    file: usize,
+}
+
+/// Split `name:N` into the name and the copy index.
+fn split_copy(name: &str) -> (&str, Option<usize>) {
+    if let Some((base, idx)) = name.rsplit_once(':') {
+        if let Ok(i) = idx.parse::<usize>() {
+            return (base, Some(i));
+        }
+    }
+    (name, None)
 }
 
 impl SymbolTable {
     pub fn new() -> Self {
-        Self { symbols: BTreeMap::new() }
+        Self::default()
     }
 
     pub fn load(&mut self, path: &str) -> io::Result<usize> {
         let file = File::open(path)?;
         let reader = io::BufReader::new(file);
+        let file_idx = self.files.len();
+        self.files.push(path.to_string());
         let mut count = 0;
         for line in reader.lines() {
             let line = line?;
@@ -30,12 +57,22 @@ impl SymbolTable {
                     if addr <= 0xFFFF_FFFF && (addr & 0x8000_0000) != 0 {
                         addr |= 0xFFFF_FFFF_0000_0000;
                     }
-                    self.symbols.insert(addr, parts[2].to_string());
+                    self.add(parts[2], addr, file_idx);
                     count += 1;
                 }
             }
         }
         Ok(count)
+    }
+
+    fn add(&mut self, name: &str, addr: u64, file: usize) {
+        self.symbols.insert(addr, name.to_string());
+        let copies = self.by_name.entry(name.to_string()).or_default();
+        // The same symbol at the same address (a map listing it twice, or the
+        // same file loaded again) is one copy, not an ambiguity.
+        if !copies.iter().any(|c| c.addr == addr) {
+            copies.push(SymCopy { addr, file });
+        }
     }
 
     pub fn lookup(&self, addr: u64) -> Option<(u64, &str)> {
@@ -47,13 +84,50 @@ impl SymbolTable {
         None
     }
 
+    /// The address of `name` for internal callers that know which symbol they
+    /// mean (`utsname`, `putbuf`, ...): the copy from the most recently loaded
+    /// file, so a kernel map wins over the PROM's. `name:N` picks a copy.
     pub fn get_addr(&self, name: &str) -> Option<u64> {
-        for (addr, sym_name) in &self.symbols {
-            if sym_name == name {
-                return Some(*addr);
-            }
+        let (base, idx) = split_copy(name);
+        let copies = self.by_name.get(base)?;
+        match idx {
+            Some(i) => copies.get(i).map(|c| c.addr),
+            None => copies.last().map(|c| c.addr),
         }
-        None
+    }
+
+    /// Resolve a name typed by a person: `name` when it has exactly one copy,
+    /// `name:N` for copy N. An ambiguous or unknown name is an error that says
+    /// which copies exist.
+    pub fn resolve(&self, name: &str) -> Result<u64, String> {
+        let (base, idx) = split_copy(name);
+        let copies = self.by_name.get(base).filter(|c| !c.is_empty())
+            .ok_or_else(|| format!("unknown symbol `{}`", base))?;
+        match idx {
+            Some(i) => copies.get(i).map(|c| c.addr).ok_or_else(|| {
+                format!("`{}` has {} cop{}; {} is out of range", base, copies.len(),
+                        if copies.len() == 1 { "y" } else { "ies" }, i)
+            }),
+            None if copies.len() == 1 => Ok(copies[0].addr),
+            None => Err(format!("symbol `{}` is ambiguous; pick one: {}", base, self.describe_copies(base))),
+        }
+    }
+
+    /// Every copy of `name` as `(index, address, map file)`.
+    pub fn copies(&self, name: &str) -> Vec<(usize, u64, &str)> {
+        let (base, _) = split_copy(name);
+        self.by_name.get(base).map(|copies| {
+            copies.iter().enumerate()
+                .map(|(i, c)| (i, c.addr, self.files.get(c.file).map(String::as_str).unwrap_or("?")))
+                .collect()
+        }).unwrap_or_default()
+    }
+
+    fn describe_copies(&self, name: &str) -> String {
+        self.copies(name).iter()
+            .map(|(i, a, f)| format!("{}:{} = {:#x} ({})", name, i, a, f))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -730,5 +804,46 @@ pub fn disassemble(instr: u32, pc: u64, symbols: Option<&SymbolTable>) -> String
         OP_SDC2 => format!("sdc2 ${}, {}({})", rt_val, imm_s, reg_name(rs_val)),
         OP_SD => format!("sd {}, {}({})", reg_name(rt_val), imm_s, reg_name(rs_val)),
         _ => format!("unknown 0x{:08x}", instr),
+    }
+}
+
+#[cfg(test)]
+mod symbol_table_tests {
+    use super::*;
+
+    fn table(tag: &str) -> SymbolTable {
+        let dir = std::env::temp_dir().join(format!("iris-syms-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prom = dir.join("prom.map");
+        let unix = dir.join("unix.map");
+        std::fs::write(&prom, "bfc3dd10 T bcopy\nbfc00000 T start\n").unwrap();
+        std::fs::write(&unix, "88017540 T bcopy\n88031894 T panic\n88017540 T ovbcopy\n").unwrap();
+        let mut t = SymbolTable::new();
+        t.load(prom.to_str().unwrap()).unwrap();
+        t.load(unix.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        t
+    }
+
+    #[test]
+    fn ambiguous_names_need_an_index() {
+        let t = table("ambig");
+        let err = t.resolve("bcopy").unwrap_err();
+        assert!(err.contains("ambiguous") && err.contains("bcopy:0") && err.contains("bcopy:1"), "{}", err);
+        assert!(err.contains("prom.map") && err.contains("unix.map"), "names the files: {}", err);
+        assert_eq!(t.resolve("bcopy:0").unwrap(), 0xffff_ffff_bfc3_dd10);
+        assert_eq!(t.resolve("bcopy:1").unwrap(), 0xffff_ffff_8801_7540);
+        assert!(t.resolve("bcopy:2").unwrap_err().contains("out of range"));
+        assert_eq!(t.resolve("panic").unwrap(), 0xffff_ffff_8803_1894, "unique names need no index");
+        assert!(t.resolve("nosuch").unwrap_err().contains("unknown"));
+    }
+
+    #[test]
+    fn internal_lookups_prefer_the_last_loaded_map() {
+        let t = table("last");
+        assert_eq!(t.get_addr("bcopy"), Some(0xffff_ffff_8801_7540), "the kernel map wins");
+        assert_eq!(t.copies("bcopy").len(), 2);
+        // Reverse lookup still works for either.
+        assert_eq!(t.lookup(0xffff_ffff_8803_1894).map(|(_, n)| n), Some("panic"));
     }
 }
