@@ -20,8 +20,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The reserved NFS `fileid` of the export root.
-pub const ROOT_ID: u64 = 1;
+/// The NFS `fileid` (and handle) of the export root: 2, the root inode of
+/// every Unix filesystem. Fileids 0 and 1 are never handed out. IRIX 5.3's
+/// inode monitor (`imon`, which `fam` and the desktop use to watch files)
+/// marks a pathname record in its event queue with inode 1, so an ordinary
+/// event on a real inode 1 is read as a pathname whose length is the device
+/// number: `imonread` copies about 1 MB into a MAXPATHLEN buffer on the kernel
+/// stack and the kernel panics ("Software detected SEGV" in bcopy).
+pub const ROOT_ID: u64 = 2;
 
 /// File kind, mapped to NFS `ftype3` (and the v2 equivalent) by the wire layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1465,15 +1471,20 @@ mod tests {
     }
 
     #[test]
-    fn root_is_a_dir_with_id_1() {
+    fn root_is_a_dir_with_inode_2_and_no_id_is_0_or_1() {
         let root = temp_export();
         let b = NfsBacking::new(&root);
         assert_eq!(b.abs_of(ROOT_ID).unwrap(), root);
         assert!(b.is_dir(ROOT_ID));
         let a = b.attr(ROOT_ID).unwrap();
         assert_eq!(a.kind, FileKind::Dir);
-        assert_eq!(a.fileid, ROOT_ID);
+        assert_eq!(a.fileid, 2);
         assert_eq!(a.uid, 0);
+        // Ids handed out after the root never wrap down to 0 or 1.
+        let mut b = b;
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let f = b.lookup(ROOT_ID, b"f").unwrap();
+        assert!(f > 2, "first fileid {}", f);
         std::fs::remove_dir_all(&root).ok();
     }
 
