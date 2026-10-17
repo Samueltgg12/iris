@@ -186,6 +186,9 @@ pub const HQ2_2D_POLYLINE: u32 = 302;
 pub const HQ2_2D_POLYLINE_ALT: u32 = 357;
 /// Segments: stream of (x1, y1, x2, y2), padded with (1280, 1024) pairs.
 pub const HQ2_2D_SEGMENTS: u32 = 345;
+/// Points (expPolyPoint, XDrawPoints): 0; stream of (x, y), padded with
+/// (1280, 1024) pairs, clipped to LINE_CLIP.
+pub const HQ2_2D_POLYPOINT: u32 = 353;
 /// Stipple opaque flag (1 = zero bits get bg).
 pub const HQ2_2D_STIPPLE_AUX: u32 = 313;
 /// Stippled box: 0; DATA origin x, x1, origin y, y1, x2, y2.
@@ -392,7 +395,7 @@ pub fn token_name(index: u32) -> Option<&'static str> {
         HQ2_2D_COLOR_AUX => "2D_COLOR_AUX", HQ2_2D_COLOR_OFF => "2D_COLOR_OFF", HQ2_2D_COLOR_ON => "2D_COLOR_ON",
         313 => "2D_STIPPLE_AUX", HQ2_2D_TILE_SETUP => "2D_TILE_SETUP", 315..=318 => "2D_TILE_DATA",
         HQ2_2D_STIPPLE_BOX_POW2 | HQ2_2D_STIPPLE_BOX => "2D_STIPPLE_BOX", HQ2_2D_TILE_RECT | HQ2_2D_TILE_RECT_ODD => "2D_TILE_RECT",
-        HQ2_2D_POLYLINE => "2D_POLYLINE", HQ2_2D_POLYLINE_ALT => "2D_POLYLINE", HQ2_2D_SEGMENTS => "2D_SEGMENTS",
+        HQ2_2D_POLYLINE => "2D_POLYLINE", HQ2_2D_POLYLINE_ALT => "2D_POLYLINE", HQ2_2D_SEGMENTS => "2D_SEGMENTS", HQ2_2D_POLYPOINT => "2D_POLYPOINT",
         323 => "2D_GLYPH_8", 324 => "2D_GLYPH_16", 325 => "2D_GLYPH_32", 326 => "2D_GLYPH_64",
         HQ2_2D_LINE_MODE => "2D_LINE_MODE", HQ2_2D_LINE_CLIP => "2D_LINE_CLIP", HQ2_2D_MODE => "2D_MODE", HQ2_2D_ROP => "2D_ROP",
         HQ2_2D_CID_WRITE => "2D_CID_WRITE", HQ2_2D_BUF_SELECT => "2D_BUF_SELECT",
@@ -679,7 +682,8 @@ impl Hq2Engine {
             HQ2_2D_LINE_CLIP => 4,
             HQ2_2D_STIPPLE_RECT | HQ2_2D_STIPPLE_BOX_POW2 | HQ2_2D_STIPPLE_BOX => 7,
             HQ2_2D_STIPPLED_SPAN_A | HQ2_2D_STIPPLED_SPAN_B => STREAM,
-            HQ2_2D_POLY_SPAN | HQ2_2D_POLYLINE | HQ2_2D_POLYLINE_ALT | HQ2_2D_SEGMENTS | HQ2_2D_LINE_SEG => STREAM,
+            HQ2_2D_POLY_SPAN | HQ2_2D_POLYLINE | HQ2_2D_POLYLINE_ALT | HQ2_2D_SEGMENTS | HQ2_2D_LINE_SEG
+            | HQ2_2D_POLYPOINT => STREAM,
             HQ2_2D_SOLID_RECT => STREAM,
             HQ2_2D_TILE_RECT | HQ2_2D_TILE_RECT_ODD => 7,
             HQ2_2D_DRAW_IMAGE | HQ2_2D_DRAW_IMAGE_SMALL | HQ2_DMA_WRITE_PIXELS
@@ -868,7 +872,7 @@ impl Hq2Engine {
         }
         let group = match self.cmd {
             HQ2_2D_POLY_SPAN => 3,
-            HQ2_2D_POLYLINE | HQ2_2D_POLYLINE_ALT => 2,
+            HQ2_2D_POLYLINE | HQ2_2D_POLYLINE_ALT | HQ2_2D_POLYPOINT => 2,
             HQ2_2D_SEGMENTS | HQ2_2D_LINE_SEG | HQ2_2D_STIPPLED_SPAN_A | HQ2_2D_STIPPLED_SPAN_B => 4,
             _ => 0,
         };
@@ -900,6 +904,12 @@ impl Hq2Engine {
                         if let Some(f) = done.as_mut() {
                             f(format!("2D_STIPPLED_SPAN ({}, {}) w={} pattern={:#010x} opaque={} on={:#x} off={:#x}",
                                 a[1] as i32, a[2] as i32, a[3] as i32, a[4], self.stipple_opaque, self.s2d.color_on, self.s2d.color_off));
+                        }
+                    }
+                    HQ2_2D_POLYPOINT => {
+                        if !(a[1] == PAD_X && a[2] == PAD_Y) {
+                            let p = [a[1] as i32, a[2] as i32];
+                            self.line2d(p, p, true, out);
                         }
                     }
                     HQ2_2D_SEGMENTS | HQ2_2D_LINE_SEG => {
