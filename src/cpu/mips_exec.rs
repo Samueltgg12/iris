@@ -788,6 +788,44 @@ pub enum BpType {
     RegValue   = 8,
 }
 
+/// One breakpoint as `bp list` and `bp add` show it:
+/// `5: ffffffff88031040 <cmn_err> pc enabled if a0 == 3`.
+fn format_bp_line(id: usize, addr: u64, kind: BpType, enabled: bool, cond: Option<&str>,
+                  symbols: &crate::cpu::mips_dis::SymbolTable) -> String {
+    let mut s = format!("{}: {:016x}", id, addr);
+    if matches!(kind, BpType::Pc | BpType::VirtRead | BpType::VirtWrite | BpType::VirtFetch) {
+        if let Some((base, name)) = symbols.lookup(addr) {
+            match addr - base {
+                0 => s.push_str(&format!(" <{}>", name)),
+                off => s.push_str(&format!(" <{}+{:#x}>", name, off)),
+            }
+        }
+    }
+    s.push_str(&format!(" {} {}", kind.name(), if enabled { "enabled" } else { "disabled" }));
+    if let Some(c) = cond {
+        s.push_str(" if ");
+        s.push_str(c);
+    }
+    s
+}
+
+impl BpType {
+    /// The name `bp list` shows, matching what `bp add` accepts.
+    pub fn name(self) -> &'static str {
+        match self {
+            BpType::Pc => "pc",
+            BpType::VirtRead => "read",
+            BpType::VirtWrite => "write",
+            BpType::VirtFetch => "fetch",
+            BpType::PhysRead => "pread",
+            BpType::PhysWrite => "pwrite",
+            BpType::PhysFetch => "pfetch",
+            BpType::WriteValue => "write-value",
+            BpType::RegValue => "reg-value",
+        }
+    }
+}
+
 pub struct Breakpoint {
     pub id: usize,
     pub addr: u64,
@@ -795,6 +833,8 @@ pub struct Breakpoint {
     pub enabled: bool,
     /// Optional condition expression (evaluated when breakpoint is hit)
     pub condition: Option<Expr>,
+    /// The condition as typed, for `bp list` (`condition` is constant-folded).
+    pub condition_src: Option<String>,
 }
 
 /// Execution status returned after each instruction (u32 bitfield).
@@ -2795,7 +2835,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             idle_profile_on_ptr: std::ptr::null(),
             symbols: Arc::new(Mutex::new(SymbolTable::new())),
             breakpoints: vec![Breakpoint {
-                id: 0, addr: 0, kind: BpType::Pc, enabled: false, condition: None
+                id: 0, addr: 0, kind: BpType::Pc, enabled: false, condition: None, condition_src: None
             }],
             next_bp_id: 1,
             last_bp_hit: None,
@@ -4180,7 +4220,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // Remove existing breakpoint with same ID if any
         self.remove_breakpoint(id);
 
-        self.breakpoints.push(Breakpoint { id, addr, kind, enabled: true, condition: None });
+        self.breakpoints.push(Breakpoint { id, addr, kind, enabled: true, condition: None, condition_src: None });
         if kind == BpType::Pc {
             self.pc_bp_count += 1;
         } else {
@@ -11530,14 +11570,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     if args.is_empty() { return Err("Usage: bp add <addr> [type]".to_string()); }
 
                     // Check for "if <expr>" at the end
-                    let (args_before_if, cond_expr) = {
+                    let (args_before_if, cond_expr, cond_src) = {
                         if let Some(pos) = args.iter().position(|&a| a == "if") {
                             let expr_str = args[pos+1..].join(" ");
                             let symbols = exec.symbols.lock();
                             let expr = exp::parse_and_fold(&expr_str, Some(&symbols))?;
-                            (&args[..pos], Some(expr))
+                            (&args[..pos], Some(expr), Some(expr_str))
                         } else {
-                            (args, None)
+                            (args, None, None)
                         }
                     };
 
@@ -11567,22 +11607,25 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     exec.next_bp_id += 1;
                     exec.add_breakpoint(id, addr, kind);
 
+                    let line = {
+                        let symbols = exec.symbols.lock();
+                        format_bp_line(id, addr, kind, true, cond_src.as_deref(), &symbols)
+                    };
                     if let Some(bp) = exec.breakpoints.iter_mut().find(|bp| bp.id == id) {
                         bp.condition = cond_expr;
+                        bp.condition_src = cond_src;
                     }
-
-                    if let Some(bp) = exec.breakpoints.iter().find(|bp| bp.id == id).filter(|bp| bp.condition.is_some()) {
-                        writeln!(writer, "Breakpoint {} added at {:016x} ({:?}) with condition", id, addr, kind).unwrap();
-                    } else {
-                        writeln!(writer, "Breakpoint {} added at {:016x} ({:?})", id, addr, kind).unwrap();
-                    }
+                    writeln!(writer, "Breakpoint added: {}", line).unwrap();
                     return Ok(());
                 }
                 "list" => {
                     writeln!(writer, "Breakpoints:").unwrap();
+                    let symbols = exec.symbols.lock();
                     for bp in &exec.breakpoints {
                         if bp.id == 0 { continue; } // Skip internal breakpoint
-                        writeln!(writer, "  {}: {:016x} {:?} {}", bp.id, bp.addr, bp.kind, if bp.enabled { "(enabled)" } else { "(disabled)" }).unwrap();
+                        let line = format_bp_line(bp.id, bp.addr, bp.kind, bp.enabled,
+                                                  bp.condition_src.as_deref(), &symbols);
+                        writeln!(writer, "  {}", line).unwrap();
                     }
                     return Ok(());
                 }
