@@ -1050,8 +1050,23 @@ impl Device for Ps2Controller {
                     return Err("Usage: ps2 mouse <dx> <dy> [buttons: 1 left, 2 right, 4 middle]".to_string());
                 };
                 let buttons = n(3).unwrap_or(0) as u8;
-                self.push_mouse_input(buttons, dx, dy, 0);
-                writeln!(writer, "PS/2: mouse {} {} buttons {}", dx, dy, buttons).unwrap();
+                // A PS/2 packet carries at most 9-bit deltas, and the guest
+                // accelerates fast motion: send the move as packets of at
+                // most MOUSE_STEP mickeys an axis, one a millisecond (a hand
+                // moving fast, well under 100 mickeys / ms), the last one
+                // with what is left so the path stays straight.
+                const MOUSE_STEP: i32 = 50;
+                let steps = ((dx.abs().max(dy.abs()) + MOUSE_STEP - 1) / MOUSE_STEP).max(1);
+                let (mut sent_x, mut sent_y) = (0, 0);
+                for i in 1..=steps {
+                    let (tx, ty) = (dx * i / steps, dy * i / steps);
+                    self.push_mouse_input(buttons, tx - sent_x, ty - sent_y, 0);
+                    (sent_x, sent_y) = (tx, ty);
+                    if i < steps {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                writeln!(writer, "PS/2: mouse {} {} buttons {} ({} packets)", dx, dy, buttons, steps).unwrap();
                 return Ok(());
             }
             if !args.is_empty() && args[0] == "status" {
