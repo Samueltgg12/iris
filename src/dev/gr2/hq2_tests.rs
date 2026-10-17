@@ -589,8 +589,17 @@ fn ddx_glyphs_lines_spans_stipples() {
     // Segments with sentinel padding.
     cmd(g, HQ2_2D_SEGMENTS, 0);
     for v in [0x100, 0x80, 0x110, 0x80, 1280, 1024, 1280, 1024] { data(g, v); }
+    // Points (xlock pop's 2x2 sparks), clipped to x <= 0x1ff, padded.
+    cmd(g, HQ2_2D_LINE_CLIP, 0);
+    for v in [0x1ff, 0, 0x3ff] { data(g, v); }
+    cmd(g, HQ2_2D_POLYPOINT, 0);
+    for v in [0x30, 0x40, 0x31, 0x40, 0x20c, 0x1a5, 1280, 1024] { data(g, v); }
+    cmd(g, HQ2_2D_LINE_CLIP, 0);
+    for v in [0x7ff, 0, 0x3ff] { data(g, v); }
     cmd(g, HQ2_2D_END_PRIMITIVE, 0);
     g.wait_idle();
+    assert_eq!((px(0x30, 0x40), px(0x31, 0x40), px(0x32, 0x40)), (7, 7, 0), "points");
+    assert_eq!(px(0x20c, 0x1a5), 0, "point outside the clip");
     assert_eq!((px(0x15, 0x300), px(0x1d, 0x300), px(0x1e, 0x300)), (7, 7, 0));
     assert_eq!(px(0x16, 0x301), 7);
     assert!((0x3e0..=0x3ee).all(|y| px(0x11, y) == 7), "vertical run");
