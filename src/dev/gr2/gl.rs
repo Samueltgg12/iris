@@ -230,8 +230,10 @@ pub const T_IRIS_SBOXFI: u32 = 0x4053;
 pub const T_IRIS_CHAR16: u32 = 0x069;
 pub const T_IRIS_CHAR16_TALL: u32 = 0x06a;
 pub const T_IRIS_CHAR32: u32 = 0x06d;
-/// Frame setup: 0x008 = 0, back buffer (0/1); 0x005 = colour write mask
-/// for it (0x000FFF / 0xFFF000 for 12-bit double buffering).
+/// readsource (gl_setreadsource): 0x008 = plane (0 colour, 1 overlay /
+/// popup, 2 and up other planes), then the absolute bank (0/1). 0x005 is
+/// the colour write mask, also absolute (0x000FFF / 0xFFF000 for 12-bit
+/// double buffering).
 pub const T_IRIS_BUFFER: u32 = 0x008;
 pub const T_IRIS_WRITEMASK: u32 = 0x005;
 /// clear() with the current colour; zclear(value).
@@ -1296,7 +1298,10 @@ impl Hq2Engine {
             T_STIPPLE_OFF => g.stipple_on = 0,
             T_BLEND_MODE => g.blend_fast = a[0] & 1,
             T_IRIS_DB => g.lt.on = a[1] & 1,
-            T_IRIS_BUFFER | T_IRIS_BGNPOLYGON | T_IRIS_PMV => {}
+            // readsource (gl_setreadsource): plane, then the absolute bank
+            // (libgl tracks swaps itself and sends no 0x1E7, so swap stays 0).
+            T_IRIS_BUFFER => g.read_src = [a[0], a[1]],
+            T_IRIS_BGNPOLYGON | T_IRIS_PMV => {}
             T_IRIS_WRITEMASK => g.masks = [a[0] & 0x00ff_ffff; 2],
             T_IRIS_CLEAR => {
                 let c = g.color;
@@ -1588,7 +1593,7 @@ impl Hq2Engine {
             light::T_FOG_ON => format!("GL_FOG {}", if g.lt.fog_on != 0 { "on" } else { "off" }),
             light::T_MATERIAL_COMMIT => "GL_MATERIAL_COMMIT".to_string(),
             T_BLEND_MODE => format!("GL_BLEND_MODE {}", a[0]),
-            T_IRIS_BUFFER => format!("IRISGL_BUFFER {} {}", a[0], a[1]),
+            T_IRIS_BUFFER => format!("IRISGL_READSOURCE plane {} bank {}", a[0], a[1]),
             T_AUX_WRITEMASK => format!("GL_AUX_WRITEMASK {:#x}", a[0]),
             T_IRIS_SBOX | T_IRIS_SBOXI | T_IRIS_SBOXF | T_IRIS_SBOXFI => {
                 let num = |w: u32| if cmd & 0x4000 != 0 { w as i32 as f32 } else { f(w) };

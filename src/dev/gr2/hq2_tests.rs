@@ -3067,3 +3067,25 @@ fn iris_overdraw_boxes_into_the_overlay_planes() {
     assert_eq!(aux(25, 15), 0, "between the boxes");
     assert_eq!(g.re3_reg(super::re3::REG_AUXMASK), 0, "aux mask reset for 2D");
 }
+
+/// IRIS GL readsource (0x008 = plane, absolute bank) picks the bank a
+/// rectcopy reads. Blender keeps its views in the back buffer and copies
+/// them to the front with readsource bank 1 and write mask 0x000FFF; reading
+/// bank 0 instead left those views black.
+#[test]
+fn iris_rectcopy_reads_the_readsource_bank() {
+    let g = &live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 2); // MakeCurrent: 12-bit RGB
+    cmd(g, 0x005, 0xfff000); // draw into bank 1 only
+    cmd(g, 0x6913, 0x00ff_ffff); // cpack white
+    cmd(g, 0x09e, 0); // clear
+    cmd(g, 0x005, 0x000fff); // now bank 0 ...
+    cmd(g, 0x008, 0);
+    cmd(g, 0x008, 1); // ... reading bank 1
+    cmd(g, 0x0ba, 0);
+    for v in [20, 40, 1, 10, 50, 3] { data(g, v); }
+    g.wait_idle();
+    assert_eq!(gl_px(g, 50, 40), 0xfff_fff, "bank 1 copied into bank 0");
+    assert_eq!(gl_px(g, 53, 40), 0xfff_000, "outside the copy bank 0 is untouched");
+}
