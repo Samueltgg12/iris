@@ -3031,3 +3031,39 @@ fn bench_gl_smooth_triangles() {
         println!("{size:5} px legs: {:8.0} tris/s  {:6.1} Mpx/s", n as f64 / s, n as f64 * size as f64 * size as f64 / 2.0 / s / 1e6);
     }
 }
+
+/// IRIS GL drawmode(OVERDRAW) (Blender's toolbox, IRIX 5.3): MakeCurrent
+/// 11, colour planes masked off (0x005 = 0), aux write mask 0x003 = 3 (the
+/// 2-bit overlay, aux bits 1:0), then sboxfi / sboxi (0x4053 / 0x4052,
+/// ITOF) in colour indices set by 0x7030. Only the overlay bits change;
+/// sbox draws the outline alone.
+#[test]
+fn iris_overdraw_boxes_into_the_overlay_planes() {
+    let g = &live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let ints = |g: &Gr2, tok: u32, v: [u32; 4]| {
+        cmd(g, tok, v[0]);
+        for &w in &v[1..] { cmd(g, 0x41df, w); }
+    };
+    cmd(g, 0x004, 11);
+    cmd(g, 0x005, 0);
+    cmd(g, 0x003, 3);
+    cmd(g, 0x008, 1);
+    cmd(g, 0x008, 0);
+    cmd(g, 0x7030, 2);
+    ints(g, 0x4053, [10, 10, 20, 20]);
+    cmd(g, 0x7030, 1);
+    ints(g, 0x4052, [30, 10, 40, 20]);
+    // Back to normal drawing, as Blender does.
+    cmd(g, 0x004, 2);
+    cmd(g, 0x003, 0);
+    g.wait_idle();
+    let aux = |x: i32, y: i32| (g.vram()[((660 + y) as usize) * FB_W + (64 + x) as usize] >> 24) & 0xf;
+    assert_eq!(aux(15, 15), 2, "filled box in the overlay");
+    assert_eq!(gl_px(g, 15, 15), 0, "colour planes untouched");
+    assert_eq!(aux(30, 15), 1, "outline left side");
+    assert_eq!(aux(35, 20), 1, "outline top");
+    assert_eq!(aux(35, 15), 0, "outline only, not filled");
+    assert_eq!(aux(25, 15), 0, "between the boxes");
+    assert_eq!(g.re3_reg(super::re3::REG_AUXMASK), 0, "aux mask reset for 2D");
+}

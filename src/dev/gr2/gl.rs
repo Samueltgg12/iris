@@ -215,6 +215,14 @@ pub enum PixZoom {
 /// READ_DONE. Unimplemented, snoop spun on FIN3 for its whole time slice.
 pub const T_READ_RECT: u32 = 0x0ad;
 pub const T_IRIS_SBOXF: u32 = 0x053;
+/// sbox / sboxi / sboxs (gl_i_sbox*): a screen-aligned box outline, the
+/// corners as for 0x053 (f32; integers on ITOF|0x052). Blender draws its
+/// interface lines as degenerate ones.
+pub const T_IRIS_SBOX: u32 = 0x052;
+pub const T_IRIS_SBOXI: u32 = 0x4052;
+/// Aux (overlay / popup) plane write mask (__glExpSetPixWritemask; IRIS GL
+/// drawmode): the aux bits drawing may change, 0 in normal drawing.
+pub const T_AUX_WRITEMASK: u32 = 0x003;
 /// swaptmesh (gl_i_swaptmesh): swap the two vertices a tmesh (bgntmesh =
 /// 0x046, LOADV|0x047) keeps; the next vertex makes a triangle with them.
 pub const T_IRIS_SWAPTMESH: u32 = 0x04b;
@@ -454,6 +462,12 @@ pub struct GlState {
     st_bits: u32,
     /// Pixel word packing (0x0A7): 0 = 32-bit, 1 = 2 x 16, 2 = 4 x 8.
     pix_pack: u32,
+    /// Drawing into the overlay / popup planes (IRIS GL drawmode OVERDRAW /
+    /// PUPDRAW): the MakeCurrent mode (8 = 4-bit overlay, 11 = 2-bit
+    /// overlay or popup, as the X server's 2D MODE numbers them), else 0;
+    /// and the aux plane write mask (0x003).
+    aux_draw: u32,
+    aux_wmask: u32,
     /// Spare (keeps the count of 4-byte fields even, see st_bits).
     pad: u32,
     /// Vertices drawn / primitives emitted since the last trace note.
@@ -462,6 +476,19 @@ pub struct GlState {
 
 impl GlState {
     /// Range of the R channel in GL colour units (see to_fixed).
+    /// UAUXDATA for colour index `idx` in overlay / popup drawing: 4-bit
+    /// overlay takes it as is; the 2-bit planes take it shifted up when the
+    /// mask names aux bits 3:2 (popup), as the 2D path's value2d does.
+    fn aux_value(&self, idx: u32) -> u32 {
+        if self.aux_draw == 8 {
+            idx & 0xf
+        } else if self.aux_wmask & 0xc != 0 {
+            (idx << 2) & 0xc
+        } else {
+            idx & 3
+        }
+    }
+
     fn cmax(&self) -> f32 {
         if self.pixfmt == re3::PIXFMT_CI12 { 4095.0 / 255.0 } else { 1.0 }
     }
@@ -976,7 +1003,8 @@ impl Hq2Engine {
             T_BITMAP => (BITMAP_HDR + 9) as u32,
             T_BITMAP_TALL => (BITMAP_HDR + 17) as u32,
             T_BITMAP_HUGE => (BITMAP_HDR + 33) as u32,
-            T_IRIS_SBOXF | T_IRIS_SBOXFI => 4,
+            T_IRIS_SBOXF | T_IRIS_SBOXFI | T_IRIS_SBOX | T_IRIS_SBOXI => 4,
+            T_AUX_WRITEMASK => 1,
             T_IRIS_SWAPTMESH => 1,
             T_CLIP_PLANE_ENABLE => 2,
             T_CLIP_PLANE => 5,
@@ -1311,6 +1339,8 @@ impl Hq2Engine {
                 g.pv.swap(0, 1);
                 g.tflip ^= 1;
             }
+            T_AUX_WRITEMASK => g.aux_wmask = a[0] & 0xf,
+            T_IRIS_SBOX | T_IRIS_SBOXI => self.gl_sbox(cmd == T_IRIS_SBOXI, &a, out),
             T_IRIS_SBOXF | T_IRIS_SBOXFI => {
                 let num = |w: u32| if cmd == T_IRIS_SBOXFI { w as i32 as f32 } else { f(w) };
                 let p = g.transform([num(a[0]), num(a[1]), 0.0, 1.0]);
@@ -1441,15 +1471,24 @@ impl Hq2Engine {
             // Visual code from the kernel (inferred from 0, 1, 2, 4, 9, 10 in
             // traces and the DDX's matching 2D MODE numbers): bit 3 = colour
             // index, low bits = depth (0 = 4, 1 = 8, 2 = 12, 4 = 24 bits).
-            T_MAKECURRENT => match a[0] {
-                0 => g.pixfmt = re3::PIXFMT_RGB4,
-                4 => g.pixfmt = 0,
-                2 => g.pixfmt = re3::PIXFMT_RGB12,
-                1 => g.pixfmt = re3::PIXFMT_RGB8,
-                10 => g.pixfmt = re3::PIXFMT_CI12,
-                9 => g.pixfmt = re3::PIXFMT_CI8,
-                _ => {}
-            },
+            T_MAKECURRENT => {
+                g.aux_draw = 0;
+                match a[0] {
+                    // Overlay / popup planes: the colour index goes to the aux
+                    // bits (gl_setup), the colour planes are left alone.
+                    8 | 11 => {
+                        g.aux_draw = a[0];
+                        g.pixfmt = re3::PIXFMT_CI8;
+                    }
+                    0 => g.pixfmt = re3::PIXFMT_RGB4,
+                    4 => g.pixfmt = 0,
+                    2 => g.pixfmt = re3::PIXFMT_RGB12,
+                    1 => g.pixfmt = re3::PIXFMT_RGB8,
+                    10 => g.pixfmt = re3::PIXFMT_CI12,
+                    9 => g.pixfmt = re3::PIXFMT_CI8,
+                    _ => {}
+                }
+            }
             T_CLEAR_CI => self.gl_clear([f(a[0]) / 255.0, 0.0, 0.0, 1.0], out),
             T_CLEAR_CI_DEPTH | T_CLEAR_CI_DEPTH_I => {
                 let i = if cmd == T_CLEAR_CI_DEPTH_I { a[0] as i32 as f32 } else { f(a[0]) };
@@ -1550,6 +1589,12 @@ impl Hq2Engine {
             light::T_MATERIAL_COMMIT => "GL_MATERIAL_COMMIT".to_string(),
             T_BLEND_MODE => format!("GL_BLEND_MODE {}", a[0]),
             T_IRIS_BUFFER => format!("IRISGL_BUFFER {} {}", a[0], a[1]),
+            T_AUX_WRITEMASK => format!("GL_AUX_WRITEMASK {:#x}", a[0]),
+            T_IRIS_SBOX | T_IRIS_SBOXI | T_IRIS_SBOXF | T_IRIS_SBOXFI => {
+                let num = |w: u32| if cmd & 0x4000 != 0 { w as i32 as f32 } else { f(w) };
+                format!("IRISGL_{} ({}, {})-({}, {})", if cmd & 0xff == T_IRIS_SBOX { "SBOX" } else { "SBOXF" },
+                    num(a[0]), num(a[1]), num(a[2]), num(a[3]))
+            }
             T_IRIS_WRITEMASK => format!("IRISGL_WRITEMASK {:#08x}", a[0]),
             T_IRIS_CLEAR => format!("IRISGL_CLEAR rgb ({:.3}, {:.3}, {:.3}) rect {:?}", g.color[0], g.color[1], g.color[2], g.clip_rect()),
             T_IRIS_ZCLEAR => format!("IRISGL_ZCLEAR {:#x}", a[0]),
@@ -1661,8 +1706,16 @@ impl Hq2Engine {
             self.gl.blend_sent = 1;
         }
         out.reg(re3::REG_NOPUP, 1);
-        out.reg(re3::REG_UAUXDATA, 0);
-        out.reg(re3::REG_AUXMASK, 0);
+        if self.gl.aux_draw != 0 {
+            // Overlay / popup drawing: only the aux planes 0x003 names, the
+            // index as the X server's 2D path writes it (value2d).
+            out.reg(re3::REG_AUXMASK, self.gl.aux_wmask);
+            let idx = (self.gl.color[0] * 255.0).round() as u32;
+            out.reg(re3::REG_UAUXDATA, self.gl.aux_value(idx));
+        } else {
+            out.reg(re3::REG_UAUXDATA, 0);
+            out.reg(re3::REG_AUXMASK, 0);
+        }
         if self.gl.wid_clip() {
             // More visible pieces than 0x1E5 carries: draw only where the
             // CID planes (painted by Xsgi, 2D_CID_WRITE) hold this window's
@@ -1675,7 +1728,7 @@ impl Hq2Engine {
         }
         // Stipple patterns are span-relative (see gl_stipple_pattern).
         out.reg(re3::REG_ALIGNPAT, 0);
-        let mask = self.gl.masks[self.gl.swap as usize & 1] & self.gl.colormask;
+        let mask = if self.gl.aux_draw != 0 { 0 } else { self.gl.masks[self.gl.swap as usize & 1] & self.gl.colormask };
         out.reg(re3::REG_PIXMASK, mask & 0x00ff_ffff);
         // Always: a 2D 12-bit draw (MODE 2) may have left RGB12 behind.
         out.op(re3::RE3_OP_PIXFMT, self.gl.pixfmt as u64);
@@ -1703,6 +1756,11 @@ impl Hq2Engine {
 
     /// Undo GL-only RE3 state so 2D drawing sees what it expects.
     fn gl_done(&mut self, out: &mut dyn Re3Sink) {
+        if self.gl.aux_draw != 0 {
+            // 2D drawing keeps AUXMASK only for its own aux modes.
+            out.reg(re3::REG_AUXMASK, 0);
+            out.reg(re3::REG_UAUXDATA, 0);
+        }
         if self.gl.pixfmt != 0 {
             out.op(re3::RE3_OP_PIXFMT, 0);
             out.reg(re3::REG_ENABDITH, 0);
@@ -1774,6 +1832,9 @@ impl Hq2Engine {
     }
 
     fn gl_color_regs(&mut self, c: [u32; 3], out: &mut dyn Re3Sink) {
+        if self.gl.aux_draw != 0 {
+            out.reg(re3::REG_UAUXDATA, self.gl.aux_value(c[0] >> 11));
+        }
         out.reg(re3::REG_R, c[0]);
         out.reg(re3::REG_G, c[1]);
         out.reg(re3::REG_B, c[2]);
@@ -1963,6 +2024,40 @@ impl Hq2Engine {
         for r in &rects[..n] {
             for y in r[1]..r[3] {
                 self.span(r[0], y, (r[2] - r[0]) as u32, None, out);
+            }
+        }
+        self.gl_done(out);
+    }
+
+    /// 0x052 sbox: the outline of the screen-aligned box between two
+    /// transformed corners, in the current colour, each pixel once (top
+    /// and bottom rows, then the sides between them).
+    fn gl_sbox(&mut self, ints: bool, a: &[u32], out: &mut dyn Re3Sink) {
+        let num = |w: u32| if ints { w as i32 as f32 } else { f(w) };
+        let p = self.gl.transform([num(a[0]), num(a[1]), 0.0, 1.0]);
+        let q = self.gl.transform([num(a[2]), num(a[3]), 0.0, 1.0]);
+        if p.ok == 0 || q.ok == 0 {
+            return;
+        }
+        let (x0, x1) = (p.x.min(q.x).floor() as i32, p.x.max(q.x).floor() as i32);
+        let (y0, y1) = (p.y.min(q.y).floor() as i32, p.y.max(q.y).floor() as i32);
+        self.gl_setup(out);
+        let c = self.gl.color;
+        self.gl_color_regs(to_fixed(c, self.gl.cmax()), out);
+        let mut run = |e: &mut Self, xa: i32, xb: i32, y: i32| {
+            let (pieces, np) = e.gl.span_pieces(y, xa, xb + 1);
+            for &(s, t) in &pieces[..np] {
+                e.span(s, y, (t - s) as u32, None, out);
+            }
+        };
+        run(self, x0, x1, y0);
+        if y1 > y0 {
+            run(self, x0, x1, y1);
+        }
+        for y in y0 + 1..y1 {
+            run(self, x0, x0, y);
+            if x1 > x0 {
+                run(self, x1, x1, y);
             }
         }
         self.gl_done(out);
