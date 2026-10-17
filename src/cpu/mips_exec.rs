@@ -835,6 +835,10 @@ pub struct Breakpoint {
     pub condition: Option<Expr>,
     /// The condition as typed, for `bp list` (`condition` is constant-folded).
     pub condition_src: Option<String>,
+    /// Times this breakpoint matched (condition true), stopped or not.
+    pub hits: u64,
+    /// Matches still to let pass before stopping (`bp ignore`).
+    pub ignore: u64,
 }
 
 /// Execution status returned after each instruction (u32 bitfield).
@@ -1343,6 +1347,9 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub breakpoints: Vec<Breakpoint>,
     pub next_bp_id: usize,
     pub last_bp_hit: Option<usize>,
+    /// More about the last hit for the stop note: the access address of a
+    /// memory breakpoint, or why its condition could not be evaluated.
+    pub bp_hit_detail: Option<String>,
     pub pc_bp_count: usize,
     pub mem_bp_count: usize,
     /// When true, the next call to step() skips all breakpoint checks.
@@ -2835,10 +2842,12 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             idle_profile_on_ptr: std::ptr::null(),
             symbols: Arc::new(Mutex::new(SymbolTable::new())),
             breakpoints: vec![Breakpoint {
-                id: 0, addr: 0, kind: BpType::Pc, enabled: false, condition: None, condition_src: None
+                id: 0, addr: 0, kind: BpType::Pc, enabled: false, condition: None, condition_src: None,
+                hits: 0, ignore: 0,
             }],
             next_bp_id: 1,
             last_bp_hit: None,
+            bp_hit_detail: None,
             pc_bp_count: 0,
             mem_bp_count: 0,
             skip_breakpoints: false,
@@ -4142,25 +4151,34 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
 
         let mut hit = false;
-        for bp in &self.breakpoints {
+        for bp in &mut self.breakpoints {
             if bp.enabled && bp.kind as u8 == KIND {
                 // Normalize kseg0/kseg1 to physical so a bp on physical
                 // 0x1fbb0010 hits through kseg0 (0x9fbb0010) or kseg1
                 // (0xbfbb0010), then word-align. Never mask below bit 2.
                 if bp_match_key(bp.addr) == bp_match_key(addr) {
+                    let mut detail = None;
                     // Check optional register condition
                     if let Some(expr) = &bp.condition {
                         let symbols = self.symbols.lock();
                         match expr.eval(&self.core, Some(&symbols)) {
                             Ok(val) => if val == 0 { continue; },
-                            // If evaluation fails, we assume the condition is not met (or maybe we should break to show error?)
-                            Err(_) => continue, 
+                            // `bp add` refuses conditions that cannot resolve,
+                            // so this is a runtime failure (division by zero):
+                            // stop, rather than hide the breakpoint forever.
+                            Err(e) => detail = Some(format!("condition failed to evaluate: {}", e)),
                         }
                     }
-                    if KIND != BpType::Pc as u8 {
-                        eprintln!("[bp] mem bp {} hit: kind={:?} bp_addr={:#010x} access_addr={:#010x} pc={:#018x}",
-                            bp.id, bp.kind, bp.addr, addr, self.core.pc);
+                    bp.hits += 1;
+                    if bp.ignore > 0 {
+                        bp.ignore -= 1;
+                        continue;
                     }
+                    if KIND != BpType::Pc as u8 {
+                        let access = format!("access to {:#x}", addr);
+                        detail = Some(match detail { Some(d) => format!("{}; {}", access, d), None => access });
+                    }
+                    self.bp_hit_detail = detail;
                     self.last_bp_hit = Some(bp.id);
                     hit = true;
                     if bp.id == 0 {
@@ -4171,6 +4189,28 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
         }
         hit
+    }
+
+    /// What `last_bp_hit` was, as a sentence for the stop note.
+    fn breakpoint_hit_reason(&self) -> String {
+        match self.last_bp_hit {
+            Some(0) => "reached the run-until address".to_string(),
+            Some(id) => match self.breakpoints.iter().find(|b| b.id == id) {
+                Some(bp) => {
+                    let symbols = self.symbols.lock();
+                    let mut s = format!("breakpoint {} (hit {} time{})",
+                            format_bp_line(bp.id, bp.addr, bp.kind, bp.enabled, bp.condition_src.as_deref(), &symbols),
+                            bp.hits, if bp.hits == 1 { "" } else { "s" });
+                    if let Some(e) = &self.bp_hit_detail {
+                        s.push_str("; ");
+                        s.push_str(e);
+                    }
+                    s
+                }
+                None => format!("breakpoint {} (since deleted)", id),
+            },
+            None => "breakpoint".to_string(),
+        }
     }
 
     pub fn set_temp_breakpoint(&mut self, addr: u64) {
@@ -4220,7 +4260,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // Remove existing breakpoint with same ID if any
         self.remove_breakpoint(id);
 
-        self.breakpoints.push(Breakpoint { id, addr, kind, enabled: true, condition: None, condition_src: None });
+        self.breakpoints.push(Breakpoint { id, addr, kind, enabled: true, condition: None, condition_src: None,
+                                           hits: 0, ignore: 0 });
         if kind == BpType::Pc {
             self.pc_bp_count += 1;
         } else {
@@ -10449,9 +10490,28 @@ fn decode_cause(val: u32) -> String {
 }
 
 /// MipsCpu wrapper for threaded execution and monitor control
+/// Why the CPU last stopped on its own (a breakpoint, an exception catch, a
+/// run/step finishing), readable without the executor lock so `status` and
+/// `wait` work while the CPU runs. `seq` counts stops.
+#[derive(Clone, Default)]
+pub struct StopNote {
+    pub seq: u64,
+    pub pc: u64,
+    pub reason: String,
+}
+
+impl StopNote {
+    fn record(&mut self, pc: u64, reason: String) {
+        self.seq += 1;
+        self.pc = pc;
+        self.reason = reason;
+    }
+}
+
 pub struct MipsCpu<T: Tlb, C: CpuModel> {
     executor: Arc<Mutex<MipsExecutor<T, C>>>,
     running: Arc<AtomicBool>,
+    stop_note: Arc<Mutex<StopNote>>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
     /// Pointer into the executor's `MipsCore.hot.cycles` — see
     /// `CyclesPtr`/`Hot::cycles`'s doc comments. Same process-lifetime
@@ -10474,6 +10534,20 @@ pub struct MipsCpu<T: Tlb, C: CpuModel> {
     idle_profile_on: Arc<AtomicBool>,
     #[cfg(feature = "idle-pause")]
     idle_profile_reset: Arc<AtomicBool>,
+}
+
+/// See [`MipsCpu::pause`].
+struct Paused<'a, T: Tlb + Send + 'static, C: CpuModel + Send + 'static> {
+    cpu: &'a MipsCpu<T, C>,
+    resume: bool,
+}
+
+impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Drop for Paused<'_, T, C> {
+    fn drop(&mut self) {
+        if self.resume {
+            Device::start(self.cpu);
+        }
+    }
 }
 
 // Safety: interrupts_ptr points into the MipsCore owned by `executor`
@@ -10505,6 +10579,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         Self {
             executor: executor_arc,
             running: Arc::new(AtomicBool::new(false)),
+            stop_note: Arc::new(Mutex::new(StopNote::default())),
             thread: Mutex::new(None),
             cycles_ptr,
             interrupts_ptr,
@@ -10613,7 +10688,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     }
 
     pub fn run_debug_loop(&self, mut count: Option<usize>, wait: bool, mut writer: Box<dyn Write + Send>) {
-        self.stop(); // Ensure stopped before running
+        self.halt(); // Ensure stopped before running
 
         self.running.store(true, Ordering::SeqCst);
 
@@ -10622,9 +10697,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         let debug = self.debug.clone();
         let exception_mask = self.exception_mask.clone();
         let trace_file = self.trace_file.clone();
+        let stop_note = self.stop_note.clone();
 
         let task = move || {
             let mut exec = executor.lock();
+            // Why this run ends, for the stop note (`status`, `wait`).
+            let mut reason: Option<String> = None;
 
             // Clear any breakpoint id left from a previous run/step, or a stop
             // caused by something else (retry, exception_mask) is reported by
@@ -10660,12 +10738,13 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             loop {
                 if !running.load(Ordering::Relaxed) {
                     writeln!(writer, "Interrupted").unwrap();
+                    reason = Some("interrupted by `stop`".to_string());
                     break;
                 }
 
                 // Check step count
                 if let Some(c) = count {
-                    if c == 0 { break; }
+                    if c == 0 { reason = Some("step finished".to_string()); break; }
                     count = Some(c - 1);
                 }
 
@@ -10745,6 +10824,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         retry_count += 1;
                         if retry_count > MAX_RUN_RETRIES {
                             writeln!(writer, "PC={:016x}: Retry (Bus Busy) — still busy after {} attempts, giving up", pc, MAX_RUN_RETRIES).unwrap();
+                            reason = Some("bus busy, gave up retrying".to_string());
                             break;
                         }
                         // Refund the step budget: a retry retires no
@@ -10758,6 +10838,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         let mask = exception_mask.load(Ordering::Relaxed);
                         if (mask & (1 << code)) != 0 {
                             writeln!(writer, "PC={:016x}: Exception code={}", pc, code).unwrap();
+                            reason = Some(format!("caught exception code {} (`exception` catch)", code));
                             break;
                         }
                     }
@@ -10766,17 +10847,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         let mask = exception_mask.load(Ordering::Relaxed);
                         if (mask & (1 << code)) != 0 {
                             writeln!(writer, "PC={:016x}: TLB Miss code={}", pc, code).unwrap();
+                            reason = Some(format!("caught TLB refill, code {} (`exception` catch)", code));
                             break;
                         }
                     }
                     EXEC_BREAKPOINT => {
-                        if let Some(bp_id) = exec.last_bp_hit {
-                            if bp_id != 0 {
-                                writeln!(writer, "PC={:016x}: Breakpoint {} hit", pc, bp_id).unwrap();
-                            }
-                        } else {
-                            writeln!(writer, "PC={:016x}: Breakpoint hit", pc).unwrap();
+                        let why = exec.breakpoint_hit_reason();
+                        if exec.last_bp_hit != Some(0) {
+                            writeln!(writer, "PC={:016x}: {}", pc, why).unwrap();
                         }
+                        reason = Some(why);
                         break;
                     }
                     _ => {}
@@ -10816,6 +10896,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                      writeln!(writer, "Next: {:016x} (Fetch failed)", next_pc).unwrap();
                  }
             }
+
+            let stop_pc = exec.core.pc;
+            stop_note.lock().record(stop_pc, reason.unwrap_or_else(|| "stopped".to_string()));
 
             // Clear temporary breakpoint (used by run/finish)
             exec.clear_temp_breakpoint();
@@ -10880,6 +10963,38 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         let mut exec = self.try_lock_executor()?;
         load_range(&mut exec, vaddr, &bytes, bytes.len() as u64)?;
         Ok(format!("  {:#018x}  {} bytes\n", vaddr, bytes.len()))
+    }
+
+    /// Stop the CPU thread and leave the core in the stopped state (Count
+    /// latched, jitv2 `pcp` cleared), without the stats `Device::stop` prints.
+    fn halt(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.thread.lock().take() {
+            let _ = handle.join();
+        }
+        let mut exec = self.executor.lock();
+        // Latch the virtual CP0 Count and silence the compare timer while
+        // stopped — debugger stepping must not see Count advance or IP7
+        // fire underneath it (mips_core.rs on_cpu_stop's doc comment).
+        exec.core.on_cpu_stop();
+        // `pcp == null` is an invariant of "CPU is stopped"; see the note in
+        // `Device::stop`.
+        #[cfg(feature = "jitv2")]
+        exec.nanotlb_invalidate();
+        #[cfg(not(feature = "jitv2"))]
+        let _ = &mut exec;
+    }
+
+    /// Hold the core still for a monitor command: a running CPU is stopped
+    /// now and restarted when the guard drops; a stopped one is left alone.
+    /// Every command that reads or changes core state goes through this, so
+    /// none of them can block on, or fail because of, a running CPU.
+    fn pause(&self) -> Paused<'_, T, C> {
+        let resume = self.is_running();
+        if resume {
+            self.halt();
+        }
+        Paused { cpu: self, resume }
     }
 
     /// Loading over live code races the running dispatch loop, and the v1 JIT's
@@ -11188,14 +11303,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
     }
 
     fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.thread.lock().take() {
-            let _ = handle.join();
-        }
-        // Latch the virtual CP0 Count and silence the compare timer while
-        // stopped — debugger stepping must not see Count advance or IP7
-        // fire underneath it (mips_core.rs on_cpu_stop's doc comment).
-        self.executor.lock().core.on_cpu_stop();
+        self.halt();
         #[cfg(feature = "tlbstats")]
         self.executor.lock().tlb.stats_print();
         #[cfg(feature = "jitstats")]
@@ -11245,7 +11353,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
         }
         #[cfg(feature = "jitv2")]
         {
-            let mut exec = self.executor.lock();
+            let exec = self.executor.lock();
             // `pcp == null` is an invariant of "CPU is stopped" — established
             // here, unconditionally, rather than left to every caller that
             // stops the CPU around a `jitv2.pages` mutation to remember.
@@ -11263,7 +11371,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             // `cpu.stop()` at all — it IS the CPU thread, already
             // synchronously "as good as stopped" for its own purposes — so
             // it calls `nanotlb_invalidate()` directly itself instead.)
-            exec.nanotlb_invalidate();
+            // (Done in `halt()`, which every stop path goes through.)
+            //
             // Locks the same Mutex<Jitv2> that CompileQueue::worker_loop
             // locks around its own flush_from_jit_thread call — safe only
             // because worker_loop calls cpu.stop() (this function) BEFORE
@@ -11310,6 +11419,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
         // fighting over which stops which — a plain CPU pause never touches
         // the compile queue at all anymore.
 
+        let stop_note = self.stop_note.clone();
         *self.thread.lock() = Some(thread::Builder::new().name("MIPS-CPU".to_string()).stack_size(16 * 1024 * 1024).spawn(move || {
             crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::MipsCpu);
             let mut guard = executor.lock();
@@ -11391,11 +11501,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 match status {
                                     EXEC_BREAKPOINT => {
                                         running.store(false, Ordering::SeqCst);
-                                        if let Some(bp_id) = guard.last_bp_hit {
-                                            dlog_dev!(LogModule::Mips, "\nBreakpoint {} hit at PC: {:016x}", bp_id, guard.core.pc);
-                                        } else {
-                                            dlog_dev!(LogModule::Mips, "\nBreakpoint hit at PC: {:016x}", guard.core.pc);
-                                        }
+                                        // Reported through the stop note (`status`, `wait`),
+                                        // not printed: the terminal is a monitor console.
+                                        let why = guard.breakpoint_hit_reason();
+                                        stop_note.lock().record(guard.core.pc, why);
                                         break;
                                     }
                                     _ => {}
@@ -11472,7 +11581,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
             ("cpu".to_string(), "CPU commands: start, stop, run, step, regs, cop0, cop1, mem, dis, jump, translate, trace, undo, sym, loadsym".to_string()),
-            ("bp".to_string(), "Breakpoint commands: bp add <addr> [type] [if <expr>], bp list, bp del <id>, bp enable/disable <id>".to_string()),
+            ("bp".to_string(), "Breakpoint commands: bp add <addr> [type] [if <expr>], bp list, bp del <id>, bp enable/disable <id>, bp ignore <id> <n>, bp clear, bp save/load <file>".to_string()),
             ("b".to_string(), "Alias for bp add".to_string()),
             ("bl".to_string(), "Alias for bp list".to_string()),
             ("bd".to_string(), "Alias for bp disable".to_string()),
@@ -11481,7 +11590,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("tlb".to_string(), "TLB commands: tlb dump | tlb trans <vaddr> [asid] | tlb debug <on|off> [DEV]".to_string()),
             ("start".to_string(), "Start CPU execution thread".to_string()),
             ("stop".to_string(), "Stop CPU execution thread".to_string()),
-            ("status".to_string(), "Show CPU running status and current PC".to_string()),
+            ("status".to_string(), "CPU running/stopped, PC, and why it last stopped (never blocks)".to_string()),
+            ("wait".to_string(), "wait [ms]: block until the CPU stops (breakpoint, exception) or ms pass; says why".to_string()),
             ("ip7".to_string(), "Set pending IP7 (CP0 Compare timer) interrupt — simulate a timer fire while stopped".to_string()),
             ("exception".to_string(), "Control exception breaks: exception <class|code|all> <on|off>".to_string()),
             ("run".to_string(), "Run instructions until exception or breakpoint: run [addr]".to_string()),
@@ -11499,7 +11609,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("cont".to_string(), "Alias for run".to_string()),
             ("cop0".to_string(), "Dump COP0 registers".to_string()),
             ("cop1".to_string(), "Dump COP1 registers".to_string()),
-            ("mem".to_string(), "Dump virtual memory: mem <addr> [count]".to_string()),
+            ("eframe".to_string(), "IRIX exception frame: eframe <addr> [o32|64] — registers, decoded cause/sr, then a backtrace of the interrupted context".to_string()),
+            ("putbuf".to_string(), "IRIX kernel console log (putbuf ring): putbuf [size]  (alias dmesg; needs the kernel's symbols)".to_string()),
+            ("mem".to_string(), "Dump virtual memory: mem <addr> [count] [b|h|w|d]".to_string()),
             ("m".to_string(), "Alias for mem".to_string()),
             ("mw".to_string(), "Write virtual memory: mw <addr> <val> [size: b|h|w|d]".to_string()),
             ("stack".to_string(), "Dump stack memory: stack [addr] [count]".to_string()),
@@ -11519,7 +11631,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             #[cfg(feature = "instr_stats")]
             ("instrstats".to_string(), "Per-instruction decode/execution counters: instrstats [report|clear|dump] [DEV]".to_string()),
             ("u".to_string(), "Alias for undo [DEV]".to_string()),
-            ("sym".to_string(), "Lookup symbol: sym <addr>".to_string()),
+            ("sym".to_string(), "Lookup symbol: sym <addr> | sym <name> (lists every copy; pick one with name:N)".to_string()),
             ("loadsym".to_string(), "Load symbols from file: loadsym <file>".to_string()),
             ("loadelf".to_string(), "Load a static ELF32 MSB binary and set PC to its entry: loadelf <file>".to_string()),
             ("loadbin".to_string(), "Load raw bytes at a virtual address: loadbin <file> <addr>".to_string()),
@@ -11546,10 +11658,27 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             (cmd, args)
         };
 
+        // One rule for the running CPU, the same for every command:
+        //  - run control (run/step/next/finish) starts from a stopped CPU,
+        //    and says so if it isn't;
+        //  - start/stop/status/wait/help never touch the core lock;
+        //  - everything else holds the core still while it works (`pause`):
+        //    a running CPU is stopped for the command and restarted after.
+        const RUN_CONTROL: &[&str] = &["run", "c", "cont", "finish", "fin", "step", "s", "si", "next", "n"];
+        const LOCK_FREE: &[&str] = &["start", "stop", "status", "wait", "help"];
+        if RUN_CONTROL.contains(&actual_cmd) && self.is_running() {
+            return Err(format!("CPU is running: `stop` it before `{}` (or `wait` for a breakpoint)", actual_cmd));
+        }
+        let _paused = if RUN_CONTROL.contains(&actual_cmd) || LOCK_FREE.contains(&actual_cmd) {
+            None
+        } else {
+            Some(self.pause())
+        };
+
         if actual_cmd == "bp" || actual_cmd == "b" || actual_cmd == "bd" || actual_cmd == "be" || actual_cmd == "bb" || actual_cmd == "bl" {
             let (subcmd, args) = if actual_cmd == "bp" {
                 if actual_args.is_empty() {
-                    return Err("Usage: bp <add|list|del|enable|disable> ...".to_string());
+                    return Err("Usage: bp <add|list|del|enable|disable|ignore|clear|save|load> ...".to_string());
                 }
                 (actual_args[0], &actual_args[1..])
             } else {
@@ -11574,7 +11703,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         if let Some(pos) = args.iter().position(|&a| a == "if") {
                             let expr_str = args[pos+1..].join(" ");
                             let symbols = exec.symbols.lock();
-                            let expr = exp::parse_and_fold(&expr_str, Some(&symbols))?;
+                            let expr = exp::parse_and_fold_checked(&expr_str, Some(&symbols))
+                                .map_err(|e| format!("bad condition: {}", e))?;
                             (&args[..pos], Some(expr), Some(expr_str))
                         } else {
                             (args, None, None)
@@ -11625,7 +11755,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         if bp.id == 0 { continue; } // Skip internal breakpoint
                         let line = format_bp_line(bp.id, bp.addr, bp.kind, bp.enabled,
                                                   bp.condition_src.as_deref(), &symbols);
-                        writeln!(writer, "  {}", line).unwrap();
+                        let mut extra = format!("  [hits {}", bp.hits);
+                        if bp.ignore > 0 {
+                            extra.push_str(&format!(", ignoring next {}", bp.ignore));
+                        }
+                        extra.push(']');
+                        writeln!(writer, "  {}{}", line, extra).unwrap();
                     }
                     return Ok(());
                 }
@@ -11648,6 +11783,98 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     } else {
                         return Err(format!("Breakpoint {} not found", id));
                     }
+                }
+                "ignore" => {
+                    if args.len() < 2 { return Err("Usage: bp ignore <id> <count>".to_string()); }
+                    let id = args[0].parse::<usize>().map_err(|_| "Invalid ID")?;
+                    let n = args[1].parse::<u64>().map_err(|_| "Invalid count")?;
+                    let bp = exec.breakpoints.iter_mut().find(|b| b.id == id && id != 0)
+                        .ok_or_else(|| format!("Breakpoint {} not found", id))?;
+                    bp.ignore = n;
+                    writeln!(writer, "Breakpoint {} will let the next {} hit{} pass", id, n, if n == 1 { "" } else { "s" }).unwrap();
+                    return Ok(());
+                }
+                "clear" => {
+                    let ids: Vec<usize> = exec.breakpoints.iter().map(|b| b.id).filter(|&i| i != 0).collect();
+                    for id in &ids {
+                        exec.remove_breakpoint(*id);
+                    }
+                    writeln!(writer, "Deleted {} breakpoint{}", ids.len(), if ids.len() == 1 { "" } else { "s" }).unwrap();
+                    return Ok(());
+                }
+                "save" => {
+                    // One `bp add` line per breakpoint: the file is what you
+                    // would type, so it can be edited and `bp load`ed after a
+                    // restart. Addresses are saved numerically (symbols may not
+                    // be loaded yet when it is read back).
+                    let path = args.first().ok_or("Usage: bp save <file>")?;
+                    let mut out = String::new();
+                    let mut n = 0;
+                    for bp in exec.breakpoints.iter().filter(|b| b.id != 0) {
+                        if matches!(bp.kind, BpType::WriteValue | BpType::RegValue) { continue; }
+                        if !bp.enabled { out.push_str("# disabled\n"); }
+                        out.push_str(&format!("bp add {:#x} {}", bp.addr, bp.kind.name()));
+                        if let Some(c) = &bp.condition_src {
+                            out.push_str(" if ");
+                            out.push_str(c);
+                        }
+                        out.push('\n');
+                        n += 1;
+                    }
+                    std::fs::write(path, out).map_err(|e| format!("{}: {}", path, e))?;
+                    writeln!(writer, "Saved {} breakpoint{} to {}", n, if n == 1 { "" } else { "s" }, path).unwrap();
+                    return Ok(());
+                }
+                "load" => {
+                    let path = args.first().ok_or("Usage: bp load <file>")?;
+                    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
+                    let mut disable_next = false;
+                    let mut added = 0;
+                    for (lineno, line) in text.lines().enumerate() {
+                        let line = line.trim();
+                        if line == "# disabled" { disable_next = true; continue; }
+                        if line.is_empty() || line.starts_with('#') { continue; }
+                        let words: Vec<&str> = line.split_whitespace().collect();
+                        let rest = match words.as_slice() {
+                            ["bp", "add", rest @ ..] | ["b", rest @ ..] => rest,
+                            _ => return Err(format!("{}:{}: not a `bp add` line", path, lineno + 1)),
+                        };
+                        let (before_if, cond) = match rest.iter().position(|&w| w == "if") {
+                            Some(p) => (&rest[..p], Some(rest[p + 1..].join(" "))),
+                            None => (rest, None),
+                        };
+                        let symbols_arc = exec.symbols.clone();
+                        let symbols = symbols_arc.lock();
+                        let expr = match &cond {
+                            Some(c) => Some(exp::parse_and_fold_checked(c, Some(&symbols))
+                                .map_err(|e| format!("{}:{}: bad condition: {}", path, lineno + 1, e))?),
+                            None => None,
+                        };
+                        let addr = before_if.first()
+                            .ok_or_else(|| format!("{}:{}: missing address", path, lineno + 1))
+                            .and_then(|a| parse_cpu_arg(a, &exec.core, Some(&symbols)))?;
+                        drop(symbols);
+                        let kind = match before_if.get(1).copied().unwrap_or("pc") {
+                            "pc" => BpType::Pc, "r" | "read" => BpType::VirtRead, "w" | "write" => BpType::VirtWrite,
+                            "f" | "fetch" => BpType::VirtFetch, "pr" | "pread" => BpType::PhysRead,
+                            "pw" | "pwrite" => BpType::PhysWrite, "pf" | "pfetch" => BpType::PhysFetch,
+                            k => return Err(format!("{}:{}: unknown breakpoint type {}", path, lineno + 1, k)),
+                        };
+                        let id = exec.next_bp_id;
+                        exec.next_bp_id += 1;
+                        exec.add_breakpoint(id, addr, kind);
+                        if let Some(bp) = exec.breakpoints.iter_mut().find(|bp| bp.id == id) {
+                            bp.condition = expr;
+                            bp.condition_src = cond;
+                        }
+                        if disable_next {
+                            exec.set_breakpoint_enabled(id, false);
+                            disable_next = false;
+                        }
+                        added += 1;
+                    }
+                    writeln!(writer, "Loaded {} breakpoint{} from {}", added, if added == 1 { "" } else { "s" }, path).unwrap();
+                    return Ok(());
                 }
                 "disable" => {
                     if args.is_empty() { return Err("Usage: bp disable <id>".to_string()); }
@@ -11680,10 +11907,22 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
 
         if actual_cmd == "sym" {
             if actual_args.is_empty() {
-                return Err("Usage: sym <addr>".to_string());
+                return Err("Usage: sym <addr|name>".to_string());
             }
-            let exec = self.try_lock_executor()?;
+            let exec = self.executor.lock();
             let symbols = exec.symbols.lock();
+            // A name: every copy, with the map file it came from.
+            let copies = symbols.copies(actual_args[0]);
+            if !copies.is_empty() {
+                let base = actual_args[0].rsplit_once(':').map(|(b, _)| b).unwrap_or(actual_args[0]);
+                for (i, addr, file) in &copies {
+                    writeln!(writer, "{}:{} = {:016x}  ({})", base, i, addr, file).unwrap();
+                }
+                if copies.len() > 1 {
+                    writeln!(writer, "ambiguous: use {}:N to pick one", base).unwrap();
+                }
+                return Ok(());
+            }
             let addr = parse_cpu_arg(actual_args[0], &exec.core, Some(&symbols))?;
             
             if let Some((sym_addr, name)) = symbols.lookup(addr) {
@@ -11881,20 +12120,58 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 Ok(())
             }
             "stop" => {
+                let was_running = self.is_running();
                 self.stop();
+                if was_running {
+                    let pc = self.executor.lock().core.pc;
+                    self.stop_note.lock().record(pc, "stopped by `stop`".to_string());
+                }
                 writeln!(writer, "CPU stopped").unwrap();
                 Ok(())
             }
             "status" => {
-                let running = self.is_running();
-                let exec = self.try_lock_executor()?;
+                // Never blocks: while running, the core is not touched.
+                let note = self.stop_note.lock().clone();
+                if self.is_running() {
+                    writeln!(writer, "running").unwrap();
+                    if note.seq > 0 {
+                        writeln!(writer, "  last stop #{}: {} at {:016x}", note.seq, note.reason, note.pc).unwrap();
+                    }
+                    return Ok(());
+                }
+                let exec = self.executor.lock();
                 let pc = exec.core.pc;
                 let symbols = exec.symbols.lock();
                 let sym_str = format_pc_symbol(pc, &symbols);
-                writeln!(writer, "{} pc={:016x}{}", if running { "running" } else { "stopped" }, pc, sym_str).unwrap();
+                writeln!(writer, "stopped pc={:016x}{}", pc, sym_str).unwrap();
+                if note.seq > 0 {
+                    writeln!(writer, "  stop #{}: {}", note.seq, note.reason).unwrap();
+                }
                 let hz = exec.core.count_hz;
                 writeln!(writer, "  count_hz={} ({:.3} MHz)  count={:#010x} compare={:#010x}",
                     hz, hz as f64 / 1e6, exec.core.count_peek(), exec.core.cp0_compare as u32).unwrap();
+                Ok(())
+            }
+            "wait" => {
+                // wait [ms]: block until the CPU stops (a breakpoint, an
+                // exception catch) or ms pass (default 10000), then say why.
+                let ms: u64 = actual_args.first().and_then(|a| a.parse().ok()).unwrap_or(10_000);
+                let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+                while self.is_running() && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                if self.is_running() {
+                    writeln!(writer, "still running after {} ms", ms).unwrap();
+                    return Ok(());
+                }
+                let note = self.stop_note.lock().clone();
+                let exec = self.executor.lock();
+                let symbols = exec.symbols.lock();
+                let pc = exec.core.pc;
+                writeln!(writer, "stopped pc={:016x}{}", pc, format_pc_symbol(pc, &symbols)).unwrap();
+                if note.seq > 0 {
+                    writeln!(writer, "  stop #{}: {}", note.seq, note.reason).unwrap();
+                }
                 Ok(())
             }
             "ip7" => {
@@ -12121,20 +12398,122 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 Ok(())
             }
             "mem" | "m" | "memory" => {
-                if actual_args.is_empty() { return Err("Usage: mem <addr> [count]".to_string()); }
+                if actual_args.is_empty() { return Err("Usage: mem <addr> [count] [b|h|w|d]".to_string()); }
                 let mut exec = self.try_lock_executor()?;
                 let symbols_arc = exec.symbols.clone();
                 let symbols = symbols_arc.lock();
                 let addr = parse_cpu_arg(actual_args[0], &exec.core, Some(&symbols))?;
-                let count = if actual_args.len() > 1 { actual_args[1].parse().unwrap_or(1) } else { 1 };
-                
+                let count: u64 = if actual_args.len() > 1 { actual_args[1].parse().unwrap_or(1) } else { 1 };
+                let size: usize = match actual_args.get(2).copied() {
+                    None | Some("w") | Some("word") => 4,
+                    Some("b") | Some("byte") => 1,
+                    Some("h") | Some("half") => 2,
+                    Some("d") | Some("double") => 8,
+                    Some(o) => return Err(format!("Invalid size {}. Use b, h, w, or d", o)),
+                };
                 for i in 0..count {
-                    let curr_addr = addr.wrapping_add(i * 4);
-                    match exec.debug_read(curr_addr, 4) {
-                        Ok(val) => writeln!(writer, "{:#018x}: {:#010x}", curr_addr, val).unwrap(),
+                    let curr_addr = addr.wrapping_add(i * size as u64);
+                    match exec.debug_read(curr_addr, size) {
+                        Ok(val) => writeln!(writer, "{:#018x}: {:#0w$x}", curr_addr, val, w = 2 + 2 * size).unwrap(),
                         Err(e) => writeln!(writer, "{:#018x}: Error {:?}", curr_addr, e).unwrap(),
                     }
                 }
+                Ok(())
+            }
+            "eframe" | "ef" => {
+                // eframe <addr> [o32|64]: an IRIX exception frame (struct
+                // eframe_s, sys/reg.h): 8-byte register slots; o32 kernels
+                // (5.3, 6.5 on IP22) put 4 argument-save slots first. Then a
+                // backtrace of the interrupted context from its EPC/sp/ra.
+                let mut exec = self.try_lock_executor()?;
+                let symbols_arc = exec.symbols.clone();
+                let base = {
+                    let symbols = symbols_arc.lock();
+                    parse_cpu_arg(actual_args.first().ok_or("Usage: eframe <addr> [o32|64]")?, &exec.core, Some(&symbols))?
+                };
+                let wide = match actual_args.get(1).copied() {
+                    Some("64") | Some("n64") => true,
+                    Some("o32") | Some("32") => false,
+                    None => exec.core.cp0_status & STATUS_KX != 0,
+                    Some(o) => return Err(format!("unknown layout {} (o32 or 64)", o)),
+                };
+                let at = if wide { 0 } else { 4 };
+                let names: [&str; 31] = if wide {
+                    ["at", "v0", "v1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "t0", "t1", "t2", "t3",
+                     "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"]
+                } else {
+                    ["at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+                     "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"]
+                };
+                let slot = |exec: &mut MipsExecutor<T, C>, i: u64| -> Result<u64, String> {
+                    let a = base.wrapping_add((at + i) * 8);
+                    exec.debug_read(a, 8).map_err(|e| format!("cannot read frame slot at {:#x}: {:?}", a, e))
+                };
+                let mut regs = [0u64; 31];
+                for (i, r) in regs.iter_mut().enumerate() {
+                    *r = slot(&mut exec, i as u64)?;
+                }
+                let sr = slot(&mut exec, 31)?;
+                let lo = slot(&mut exec, 32)?;
+                let hi = slot(&mut exec, 33)?;
+                let badvaddr = slot(&mut exec, 34)?;
+                let cause = slot(&mut exec, 35)?;
+                let epc = slot(&mut exec, 36)?;
+                writeln!(writer, "eframe at {:#x} ({} layout)", base, if wide { "64-bit" } else { "o32" }).unwrap();
+                for (i, name) in names.iter().enumerate() {
+                    write!(writer, "{:>3}: {:#018x}  ", name, regs[i]).unwrap();
+                    if i % 4 == 3 { writeln!(writer).unwrap(); }
+                }
+                writeln!(writer).unwrap();
+                let symbols = symbols_arc.lock();
+                writeln!(writer, "  sr:       {:#010x} ({})", sr as u32, decode_status(sr as u32)).unwrap();
+                writeln!(writer, "  cause:    {:#010x} ({})", cause as u32, decode_cause(cause as u32)).unwrap();
+                writeln!(writer, "  badvaddr: {:#018x}", badvaddr).unwrap();
+                writeln!(writer, "  epc:      {:#018x}{}", epc, format_pc_symbol(epc, &symbols)).unwrap();
+                writeln!(writer, "  ra:       {:#018x}{}", regs[30], format_pc_symbol(regs[30], &symbols)).unwrap();
+                writeln!(writer, "  lo/hi:    {:#x} / {:#x}", lo, hi).unwrap();
+                drop(symbols);
+                writeln!(writer, "Interrupted context:").unwrap();
+                write!(writer, "{}", exec.backtrace_from(epc, regs[28], regs[30], 20)).unwrap();
+                Ok(())
+            }
+            "putbuf" | "dmesg" => {
+                // putbuf [size]: the IRIX kernel's console message ring (what
+                // savecore puts in the crash log): panic text you otherwise
+                // only see on the screen. 6.5 has `char *putbuf` sized by
+                // `putbufsz`; an older kernel with a plain array needs [size].
+                let mut exec = self.try_lock_executor()?;
+                let symbols_arc = exec.symbols.clone();
+                let (buf_sym, ndx_sym, sz_sym) = {
+                    let symbols = symbols_arc.lock();
+                    (symbols.get_addr("putbuf"), symbols.get_addr("putbufndx"), symbols.get_addr("putbufsz"))
+                };
+                let buf_sym = buf_sym.ok_or("no `putbuf` symbol: loadsym the kernel's map first")?;
+                let ndx_sym = ndx_sym.ok_or("no `putbufndx` symbol")?;
+                let read32 = |exec: &mut MipsExecutor<T, C>, a: u64| -> Result<u64, String> {
+                    exec.debug_read(a, 4).map_err(|e| format!("cannot read {:#x}: {:?}", a, e))
+                };
+                let ndx = read32(&mut exec, ndx_sym)?;
+                let (buf, size) = match (actual_args.first().and_then(|a| a.parse::<u64>().ok()), sz_sym) {
+                    (Some(n), _) => (buf_sym, n),
+                    (None, Some(sz)) => {
+                        let p = read32(&mut exec, buf_sym)?;
+                        let p = if p & 0x8000_0000 != 0 { p | 0xFFFF_FFFF_0000_0000 } else { p };
+                        (p, read32(&mut exec, sz)?)
+                    }
+                    (None, None) => return Err("no `putbufsz`: give the buffer size, `putbuf <size>`".to_string()),
+                };
+                if size == 0 || size > (1 << 20) {
+                    return Err(format!("implausible putbuf size {}", size));
+                }
+                let start = ndx.saturating_sub(size);
+                let mut text = Vec::with_capacity(size as usize);
+                for i in start..ndx {
+                    let a = buf.wrapping_add(i % size);
+                    let b = exec.debug_read(a, 1).map_err(|e| format!("cannot read {:#x}: {:?}", a, e))? as u8;
+                    if b != 0 { text.push(b); }
+                }
+                writeln!(writer, "{}", String::from_utf8_lossy(&text).replace('\r', "")).unwrap();
                 Ok(())
             }
             "stack" => {
@@ -13964,10 +14343,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     let n = actual_args.first().and_then(|s| s.parse().ok()).unwrap_or(10);
                     (None, n)
                 };
+                let requested = count;
                 let count = count.min(TRACEBACK_SIZE);
                 let exec = self.executor.lock();
                 let symbols = exec.symbols.lock();
                 let entries = exec.traceback.get_last(count);
+                if requested > TRACEBACK_SIZE {
+                    writeln!(writer, "note: asked for {} instructions; the history holds {}", requested, TRACEBACK_SIZE).unwrap();
+                }
                 let n = entries.len();
                 let do_write = |w: &mut dyn Write| {
                     writeln!(w, "Execution Traceback (last {} instructions):", n).unwrap();
@@ -14216,10 +14599,15 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     }
 
     pub fn backtrace(&mut self, max_frames: usize) -> String {
+        let (pc, sp, ra) = (self.core.pc, self.core.read_gpr(29), self.core.read_gpr(31));
+        self.backtrace_from(pc, sp, ra, max_frames)
+    }
+
+    /// Walk the stack from an arbitrary context (an exception frame's EPC,
+    /// sp and ra, say) by prologue analysis.
+    pub fn backtrace_from(&mut self, pc: u64, sp: u64, ra: u64, max_frames: usize) -> String {
         let mut output = String::new();
-        let mut pc = self.core.pc;
-        let mut sp = self.core.read_gpr(29);
-        let ra = self.core.read_gpr(31);
+        let (mut pc, mut sp) = (pc, sp);
 
         writeln!(output, "Backtrace:").unwrap();
 

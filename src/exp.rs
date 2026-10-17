@@ -116,19 +116,14 @@ impl Expr {
             Expr::Literal(val) => Ok(*val),
             Expr::Register(reg) => Ok(read_reg_target(reg, core)),
             Expr::Symbol(name) => {
-                if let Some(syms) = symbols {
-                    if let Some(addr) = syms.get_addr(name) {
-                        // Sign-extend 32-bit kernel addresses
-                        if addr <= 0xFFFF_FFFF && (addr & 0x8000_0000) != 0 {
-                            Ok(addr | 0xFFFF_FFFF_0000_0000)
-                        } else {
-                            Ok(addr)
-                        }
-                    } else {
-                        Err(format!("Symbol not found: {}", name))
-                    }
+                let syms = symbols.ok_or_else(|| format!("No symbol table available to resolve: {}", name))?;
+                let addr = syms.resolve(name)
+                    .map_err(|e| format!("{} (and not a register name)", e))?;
+                // Sign-extend 32-bit kernel addresses
+                if addr <= 0xFFFF_FFFF && (addr & 0x8000_0000) != 0 {
+                    Ok(addr | 0xFFFF_FFFF_0000_0000)
                 } else {
-                    Err(format!("No symbol table available to resolve: {}", name))
+                    Ok(addr)
                 }
             }
             Expr::Unary(op, expr) => {
@@ -170,7 +165,7 @@ impl Expr {
         match self {
             Expr::Symbol(name) => {
                 if let Some(syms) = symbols {
-                    if let Some(addr) = syms.get_addr(&name) {
+                    if let Ok(addr) = syms.resolve(&name) {
                         let val = if addr <= 0xFFFF_FFFF && (addr & 0x8000_0000) != 0 {
                             addr | 0xFFFF_FFFF_0000_0000
                         } else {
@@ -294,6 +289,20 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     chars.next();
                 } else {
                     break;
+                }
+            }
+            // `name:N` picks copy N of a symbol several map files define.
+            if chars.peek() == Some(&':') {
+                let mut look = chars.clone();
+                look.next();
+                if look.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    chars.next();
+                    ident.push(':');
+                    while let Some(&c) = chars.peek() {
+                        if !c.is_ascii_digit() { break; }
+                        ident.push(c);
+                        chars.next();
+                    }
                 }
             }
             tokens.push(Token::Identifier(ident));
@@ -433,6 +442,33 @@ pub fn parse_and_fold(input: &str, symbols: Option<&SymbolTable>) -> Result<Expr
     Ok(expr.fold(symbols))
 }
 
+/// `parse_and_fold`, refusing any name that is neither a register nor a
+/// symbol that resolves. For breakpoint conditions: one that can never
+/// evaluate would otherwise just never fire.
+pub fn parse_and_fold_checked(input: &str, symbols: Option<&SymbolTable>) -> Result<Expr, String> {
+    let expr = parse_and_fold(input, symbols)?;
+    if let Some(name) = expr.first_symbol() {
+        return match symbols {
+            Some(s) => Err(s.resolve(name).err().map(|e| format!("{} (and not a register name)", e))
+                .unwrap_or_else(|| format!("cannot resolve `{}`", name))),
+            None => Err(format!("`{}` is not a register name and no symbols are loaded", name)),
+        };
+    }
+    Ok(expr)
+}
+
+impl Expr {
+    /// The first symbol name left unresolved after folding.
+    fn first_symbol(&self) -> Option<&str> {
+        match self {
+            Expr::Symbol(n) => Some(n),
+            Expr::Unary(_, e) => e.first_symbol(),
+            Expr::Binary(_, l, r) => l.first_symbol().or_else(|| r.first_symbol()),
+            _ => None,
+        }
+    }
+}
+
 /// Parse and evaluate a constant expression (no CPU registers, no symbol table).
 /// Useful for command arguments that are numeric expressions like "0xC00" or "1<<10".
 pub fn eval_const_expr(input: &str) -> Result<u64, String> {
@@ -441,5 +477,30 @@ pub fn eval_const_expr(input: &str) -> Result<u64, String> {
     match folded {
         Expr::Literal(val) => Ok(val),
         _ => Err(format!("Expression '{}' could not be reduced to a constant", input)),
+    }
+}
+#[cfg(test)]
+mod checked_condition_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_names_are_rejected_and_copies_parse() {
+        let mut t = SymbolTable::new();
+        let dir = std::env::temp_dir().join(format!("iris-exp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.map"), dir.join("b.map"));
+        std::fs::write(&a, "bfc00010 T bcopy\n").unwrap();
+        std::fs::write(&b, "88017540 T bcopy\n").unwrap();
+        t.load(a.to_str().unwrap()).unwrap();
+        t.load(b.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(parse_and_fold_checked("a0 == 3 && (c0_cause & 0x7c) == 8", Some(&t)).is_ok());
+        let e = parse_and_fold_checked("c0_badaddr == 0", Some(&t)).unwrap_err();
+        assert!(e.contains("c0_badaddr"), "{}", e);
+        let e = parse_and_fold_checked("pc == bcopy", Some(&t)).unwrap_err();
+        assert!(e.contains("ambiguous"), "{}", e);
+        assert_eq!(parse_and_fold_checked("bcopy:1 + 4", Some(&t)).unwrap(),
+                   Expr::Literal(0xffff_ffff_8801_7544));
     }
 }

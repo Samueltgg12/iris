@@ -39,9 +39,9 @@ trace is short and every option flips one piece of state or one address bit.
   one command works, as does `run_in_background`). The CPU starts by
   itself; this build exits on guest power-off, so after `shutdown` just
   wait for the pid to go.
-- Monitor from the shell: `tools/mon.py "mgras status" "rss regs" ...`
-  (the MCP `run_command` has been seen returning the previous command's
-  output). Useful: `mgras status|xmap|pix X Y|stats|jit|fbdump DIR|shot
+- Monitor from the shell: `tools/mon.py "mgras status" "rss regs" ...`,
+  or through the MCP (its replies used to arrive one command late after a
+  cancelled call; fixed 2026-10). Useful: `mgras status|xmap|pix X Y|stats|jit|fbdump DIR|shot
   F.png|trace F [hq,rss,cpu,tex|all]|rec F|rec off`, `rss regs` (decodes
   the IR, shows each raster engine's backlog), `locks` (who holds what).
 - `/tmp` is emptied at boot: re-copy and rebuild gltest each boot

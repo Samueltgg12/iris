@@ -726,11 +726,18 @@ usage string. The following tables list the same set, grouped.
 
 ### CPU / execution
 
+Every command works the same way against a running CPU: `start`, `stop`,
+`status`, `wait` and `help` never touch the core; run control (`run`, `step`,
+`next`, `finish`) needs a stopped CPU and says so; everything else pauses a
+running CPU for the duration of the command and resumes it afterwards. So
+`bp add`, `regs`, `mem` and friends work at any time and never hang.
+
 | Command | Description |
 |---------|-------------|
 | `start` | Start CPU execution |
 | `stop` | Stop (pause) CPU execution |
-| `status` | Running state, PC, and the CP0 Count rate/Count/Compare |
+| `status` | Running or stopped, the PC, why it last stopped (which breakpoint, its condition and hit count), and the CP0 Count rate. Never blocks |
+| `wait [ms]` | Block until the CPU stops (breakpoint, exception catch) or `ms` pass (default 10000), then say where and why |
 | `run [addr]` / `c` / `cont` | Run until breakpoint or exception (or until `addr`) |
 | `step [n\|addr]` / `s` | Step n instructions (default 1), or until `addr` |
 | `si` | Step without taking interrupts **[DEV]** |
@@ -753,7 +760,7 @@ usage string. The following tables list the same set, grouped.
 
 | Command | Description |
 |---------|-------------|
-| `mem <addr> [n]` / `m` | Dump virtual memory (hex+ascii) |
+| `mem <addr> [n] [b\|h\|w\|d]` / `m` | Dump virtual memory in bytes, halves, words (default) or doublewords |
 | `mw <addr> <val> [b\|h\|w\|d]` | Write virtual memory |
 | `stack [addr] [n]` | Dump stack |
 | `ms <addr> [max]` | Read string from virtual memory |
@@ -767,18 +774,32 @@ usage string. The following tables list the same set, grouped.
 | Command | Description |
 |---------|-------------|
 | `sym <addr>` | Look up nearest symbol |
+| `sym <name>` | Every copy of a name, with the map file it came from |
 | `loadsym <file>` | Load symbol map from file |
 | `proc info` | IRIX kernel utsname and friends (needs `loadsym` first) |
+| `eframe <addr> [o32\|64]` / `ef` | Decode an IRIX exception frame (the `ep` of a panic): registers, cause, sr, EPC, then a backtrace of the interrupted context |
+| `putbuf [size]` / `dmesg` | The IRIX kernel console log, i.e. what a panic printed (needs the kernel's map) |
+
+A name defined in more than one loaded map (the PROM and the kernel both have
+`bcopy`) is ambiguous in expressions: the error lists the copies, and
+`bcopy:1` picks one. Internal lookups (`proc`, `putbuf`) use the copy from the
+map loaded last.
 
 ### Breakpoints
 
 | Command | Description |
 |---------|-------------|
-| `bp add <addr> [type] [if <expr>]` / `b` | Add breakpoint. Types: `pc` (default), `r`, `w`, `f` (virtual read/write/fetch), `pr`, `pw`, `pf` (physical) |
-| `bp list` / `bl` | List breakpoints |
+| `bp add <addr> [type] [if <expr>]` / `b` | Add breakpoint. Types: `pc` (default), `r`, `w`, `f` (virtual read/write/fetch), `pr`, `pw`, `pf` (physical). The condition may use registers (`a0`, `c0_badvaddr`, ...) and symbols; a name that is neither is refused |
+| `bp list` / `bl` | List breakpoints with type, symbol, condition and hit count |
 | `bp del <id>` / `bb` | Delete breakpoint |
 | `bp enable <id>` / `be` | Enable breakpoint |
 | `bp disable <id>` / `bd` | Disable breakpoint |
+| `bp ignore <id> <n>` | Let the next n hits pass without stopping |
+| `bp clear` | Delete all breakpoints |
+| `bp save <file>` / `bp load <file>` | Write the breakpoints as `bp add` lines / read them back (survives a restart) |
+
+A breakpoint hit while the CPU runs freely is reported by `status` and
+`wait`, not printed (the terminal is a monitor console too).
 
 ### Undo / traceback
 
@@ -787,13 +808,13 @@ usage string. The following tables list the same set, grouped.
 | `undo [n]` / `u` | Undo n instructions **[DEV]** |
 | `undo <on\|off\|clear\|resize <n>>` | Control undo buffer **[DEV]** |
 | `bt [n]` | Print call backtrace |
-| `dt [n]` / `dt file <path> [n]` | Disassemble traceback buffer |
+| `dt [n]` / `dt file <path> [n]` | Disassemble traceback buffer (the history holds 1,048,576 instructions; asking for more says so) |
 
 ### TLB / cache
 
 | Command | Description |
 |---------|-------------|
-| `tlb dump` | Dump all TLB entries |
+| `tlb dump` | Dump the TLB entries this CPU has (48 on R4400/R5000, 64 on R10000) |
 | `tlb trans <vaddr> [asid]` | Translate via TLB |
 | `tlb debug <on\|off>` | TLB trace logging **[DEV]** |
 | `l1i <check\|dump> <addr\|index>` | L1 instruction cache |

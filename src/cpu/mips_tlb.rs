@@ -1131,8 +1131,10 @@ impl Tlb for MipsTlb {
         0x80000000 // Not found (P bit set)
     }
 
+    /// The live size for this CPU model (48 on R4400/R5000, 64 on R10000),
+    /// not the backing array's: TLBR/TLBWI bounds and `tlb dump` both use it.
     fn num_entries(&self) -> usize {
-        self.entries.len()
+        self.num_entries
     }
 
     fn format_entry(&self, index: usize) -> String {
