@@ -632,6 +632,21 @@ pub const OCTANT_XMAJOR: u32 = 1 << 2;
 // per-pixel walk) — both interpreter code paths, but setup() also gates what the
 // JIT sees (see setup()'s doc comment on why the fractional correction lives there).
 #[rustfmt::skip]
+/// Bit of BRESRNDINC2's BRESROUND byte (bits 31:24) for each hardware
+/// octant. The spec numbers octants 1-8 with octant 1 in the msb; hardware
+/// octant {XMAJOR, XDEC, YDEC} 5,1,3,7,6,2,0,4 is spec octant 1..8.
+/// A set bit steps straight only when d < 0, a clear one when d <= 0
+/// (rex3.pdf §3.6, "BRESROUND"); it only matters when d is exactly 0.
+pub(crate) const BRESROUND_BIT: [u32; 8] = [1, 6, 2, 5, 0, 7, 3, 4];
+
+/// Whether a Bresenham step with d == 0 goes straight (BRESROUND clear for
+/// the line's octant). IRIS GL's lines run with BRESROUND = 0; the X server
+/// loads 0xff.
+#[inline(always)]
+pub(crate) fn bres_straight_on_zero(ctx: &Rex3Context, octant: u32) -> bool {
+    (ctx.bresrndinc2.rnd() >> BRESROUND_BIT[(octant & 7) as usize]) & 1 == 0
+}
+
 pub(crate) const REX3_BRES_OCTANTS: [(i32, i32, i32, i32, bool); 8] = [
     ( 0,  1, -1, -1, true ),  // octant 0
     ( 0,  1,  1,  1, true ),  // octant 1
@@ -1736,6 +1751,15 @@ impl Rex3 {
     }
 
     fn setup(&self, ctx: &mut Rex3Context) {
+        // F_LINE/A_LINE set up from the fixed-point endpoints. Done here, not
+        // at draw time: the JIT never calls back into interpreter draw code,
+        // it walks whatever octant/incr/d/start setup() leaves in ctx.
+        let adrmode = ctx.drawmode0.adrmode();
+        if adrmode == DRAWMODE0_ADRMODE_F_LINE || adrmode == DRAWMODE0_ADRMODE_A_LINE {
+            crate::dev::ng1::rex3_generic::fline_setup(ctx);
+            return;
+        }
+
         let dx = ctx.xend - ctx.xstart;
         let dy = ctx.yend - ctx.ystart;
 
@@ -1755,33 +1779,12 @@ impl Rex3 {
         //   d     = incr1 - major       (initial decision variable, I_LINE formula)
         let incr1: i32 = 2 * minor;
         let incr2: i32 = 2 * (minor - major);
-        let mut d: i32 = incr1 - major;
+        let d: i32 = incr1 - major;
 
         // Store as plain two's-complement integers masked to register field widths.
         ctx.bresoctinc1.set_octant(octant);
         ctx.bresoctinc1.set_incr1((incr1 as u32) & 0xFFFFF);     // 20-bit, always positive
         ctx.bresrndinc2.set_incr2((incr2 as u32) & 0x1FFFFF);    // 21-bit signed
-
-        // F_LINE/A_LINE: apply the fractional-endpoint correction HERE, not at draw
-        // time. This must happen in setup() (not draw_line_bresenham/fline_apply_fract)
-        // because setup() is the only Bresenham-state derivation shared by both the
-        // interpreter and the JIT — the JIT-compiled entry point never calls back into
-        // interpreter draw functions, it just replays whatever bresd/bresoctinc1/
-        // bresrndinc2/xstart/ystart setup() already wrote into ctx. Applying the
-        // correction only in draw_line_bresenham (the old approach) left the JIT
-        // silently drawing plain-I_LINE trajectories for F_LINE/A_LINE, since the
-        // JIT never reaches that interpreter-only code path.
-        let adrmode = ctx.drawmode0.adrmode();
-        let is_fractional = adrmode == DRAWMODE0_ADRMODE_F_LINE || adrmode == DRAWMODE0_ADRMODE_A_LINE;
-        if is_fractional {
-            let (_incrx1, incrx2, _incry1, incry2, y_major) = REX3_BRES_OCTANTS[(octant & 7) as usize];
-            let mut x = ctx.xstart >> 11;
-            let mut y = ctx.ystart >> 11;
-            crate::dev::ng1::rex3_generic::fline_apply_fract(ctx, &mut d, &mut x, &mut y, incrx2, incry2, y_major);
-            ctx.xstart = x << 11;
-            ctx.ystart = y << 11;
-        }
-
         ctx.bresd = (d as u32) & 0x7FF_FFFF;                     // 27-bit signed
     }
 
@@ -2698,11 +2701,10 @@ impl Rex3 {
         } else {
             // Continuation GO: re-derive Bresenham when the segment axis disagrees with
             // the persisted octant (e.g. degenerate setup point, then horizontal cont).
-            let adrmode = ctx.drawmode0.adrmode();
-            let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
-                || adrmode == DRAWMODE0_ADRMODE_F_LINE
-                || adrmode == DRAWMODE0_ADRMODE_A_LINE;
-            if is_line {
+            // I_LINE only: F_LINE/A_LINE take their octant from the
+            // fixed-point deltas, which integer deltas can disagree with, and
+            // their setup moves the start point, so it must not run twice.
+            if ctx.drawmode0.adrmode() == DRAWMODE0_ADRMODE_I_LINE {
                 let xs = ctx.xstart >> 11;
                 let ys = ctx.ystart >> 11;
                 let xe = ctx.xend >> 11;
@@ -3302,7 +3304,15 @@ impl Rex3 {
             REX3_LSMODE => ctx.lsmode = LsMode(val),
             REX3_LSPATTERN => ctx.lspattern = val,
             REX3_LSPATSAVE => ctx.lspatsave = val,
-            REX3_ZPATTERN => ctx.zpattern = val,
+            // ZPATTERN is a recirculating register, "msb = first pixel"
+            // (rex3.pdf register table): writing it reloads the pattern, so
+            // the next pixel tests bit 31 whatever the last primitive left.
+            // IRIS GL's software-Z lines rely on it: each stroke is an F_LINE
+            // without DOSETUP drawn by a ZPATTERN GO with an MSB-aligned mask.
+            REX3_ZPATTERN => {
+                ctx.zpattern = val;
+                ctx.zpat_bit = 31;
+            }
             REX3_LSSAVE => {
                 ctx.lssave = val;
                 ctx.lspatsave = ctx.lspattern;

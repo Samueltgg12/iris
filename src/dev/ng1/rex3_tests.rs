@@ -1839,147 +1839,39 @@ fn draw_iline_step(rex: &Rex3, x0: i32, y0: i32, x1: i32, y1: i32, color: u8) ->
     pts
 }
 
-/// Reference F_LINE Bresenham in software — a mechanical transcription of
-/// `setup()` + `fline_apply_fract()` + the `bres_step!` macro from
-/// `draw_line_bresenham` (rex3.rs), NOT the simplified octant-agnostic form
-/// `bres_pixels()` uses. This is deliberately duplicated rather than calling
-/// the real implementation: a hand-transcribed oracle must fail if
-/// `fline_apply_fract`/`setup()` regress, which a shared-code oracle cannot
-/// detect (see `rules/` note on this — a call-through oracle would mask
-/// exactly the kind of regression this test exists to catch).
-///
-/// `x0_frac4`/`y0_frac4` are the *start* endpoint's fractional nibble
-/// (0-15, 1/16-pixel units) — the only fractional input `fline_apply_fract`
-/// consumes; the end endpoint is integer-only here, matching what the
-/// F_LINE hardware path actually uses (draw_aline's AWEIGHT lookup is the
-/// only consumer of the *end* endpoint's fraction, handled separately by
-/// `aline_endpoint_skip` below).
-fn fline_pixels(x0: i32, x0_frac4: i32, y0: i32, y0_frac4: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
-    // BRES table copied verbatim from draw_line_bresenham (rex3.rs):
-    // (incrx1, incrx2, incry1, incry2, y_major), indexed by octant.
-    #[rustfmt::skip]
-    const BRES: [(i32, i32, i32, i32, bool); 8] = [
-        ( 0,  1, -1, -1, true ),  // octant 0
-        ( 0,  1,  1,  1, true ),  // octant 1
-        ( 0, -1, -1, -1, true ),  // octant 2
-        ( 0, -1,  1,  1, true ),  // octant 3
-        ( 1,  1,  0, -1, false),  // octant 4
-        ( 1,  1,  0,  1, false),  // octant 5
-        (-1, -1,  0, -1, false),  // octant 6
-        (-1, -1,  0,  1, false),  // octant 7
-    ];
-
-    // 21.11 fixed-point endpoint values, matching how the register writes
-    // populate ctx.xstart/ystart/xend/yend.
-    let xstart = (x0 << 11) | (x0_frac4 << 7);
-    let ystart = (y0 << 11) | (y0_frac4 << 7);
-    let xend = x1 << 11;
-    let yend = y1 << 11;
-
-    // --- setup(): derive octant + initial incr1/incr2/d (rex3.rs:1390-1419) ---
-    let dx = xend - xstart;
-    let dy = yend - ystart;
-    let adx = dx.abs() >> 11;
-    let ady = dy.abs() >> 11;
-
-    let mut octant = 0u32;
-    if dy < 0 { octant |= 1 << 0; } // OCTANT_YDEC
-    if dx < 0 { octant |= 1 << 1; } // OCTANT_XDEC
-    if adx > ady { octant |= 1 << 2; } // OCTANT_XMAJOR
-
-    let (major, minor) = if adx > ady { (adx, ady) } else { (ady, adx) };
-    let incr1 = 2 * minor;
-    let incr2 = 2 * (minor - major);
-    let mut d = incr1 - major;
-
-    let (incrx1, incrx2, incry1, incry2, y_major) = BRES[(octant & 7) as usize];
-
-    let mut x = xstart >> 11;
-    let mut y = ystart >> 11;
-    let x2 = xend >> 11;
-    let y2 = yend >> 11;
-
-    // --- fline_apply_fract() (rex3.rs:1754-1816), transcribed verbatim ---
-    {
-        let x1p = xstart >> 11;
-        let y1p = ystart >> 11;
-        let x2p = xend >> 11;
-        let y2p = yend >> 11;
-        let mut fdx = (x1p - x2p).abs();
-        let mut fdy = (y1p - y2p).abs();
-        let mut xf = (xstart >> 7) & 0xF;
-        let mut yf = (ystart >> 7) & 0xF;
-
-        match octant & 7 {
-            1 => {
-                std::mem::swap(&mut xf, &mut yf);
-                std::mem::swap(&mut fdx, &mut fdy);
-            }
-            3 => {
-                xf = 0x10 - xf;
-                std::mem::swap(&mut xf, &mut yf);
-                std::mem::swap(&mut fdx, &mut fdy);
-            }
-            7 => { xf = 0x10 - xf; }
-            6 => {
-                xf = 0x10 - xf;
-                yf = 0x10 - yf;
-            }
-            2 => {
-                let t = 0x10 - xf;
-                xf = 0x10 - yf;
-                yf = t;
-                std::mem::swap(&mut fdx, &mut fdy);
-            }
-            0 => {
-                let t = 0x10 - yf;
-                yf = xf;
-                xf = t;
-                std::mem::swap(&mut fdx, &mut fdy);
-            }
-            4 => { yf = 0x10 - yf; }
-            _ => {}
-        }
-
-        // Spec-correct base d for F_LINE/A_LINE is 3*minor - 2*major, not
-        // I_LINE's 2*minor - major (see rex3.rs fline_apply_fract for the
-        // full derivation from rex3_pdf.md 3.6.1.2 and MAME's do_fline).
-        // `d` here still holds the I_LINE-formula value; apply the same
-        // (minor - major) correction the real fix applies before adding
-        // the fractional term.
-        d += fdy - fdx;
-        d += 2 * (((fdx * yf) >> 4) - ((fdy * xf) >> 4));
-        let major_delta = if y_major { fdy } else { fdx };
-        let e = d - 2 * major_delta;
-        if e > 0 {
-            d = e;
-            let x_major = !y_major;
-            if x_major {
-                y -= incry2;
-            } else {
-                x += incrx2;
-            }
-        }
+/// Reference F_LINE, from geometry rather than from the implementation: the
+/// start point's own pixel, then in each column of the major axis, up to the
+/// end point's, the row holding the true line at the column's centre (pixel n
+/// covers [n, n+1)), moving at most one row per column. That is the pixel set
+/// IRIS GL computes for its software Z buffer (fsn.rec: see
+/// rules/rex3/soft-z-lines-zpattern-and-bresround.md). Endpoints in 1/16
+/// pixels. None when the line passes exactly through a row boundary at some
+/// column centre: which side wins there is BRESROUND's choice.
+fn fline_geom(x1: i32, y1: i32, x2: i32, y2: i32) -> Option<Vec<(i32, i32)>> {
+    let x_major = (x2 - x1).abs() > (y2 - y1).abs();
+    // (major, minor) start and end
+    let (a1, b1, a2, b2) = if x_major { (x1, y1, x2, y2) } else { (y1, x1, y2, x2) };
+    let (p1, p2) = (a1 >> 4, a2 >> 4);
+    let step = if p2 >= p1 { 1 } else { -1 };
+    let mut out = vec![(p1, b1 >> 4)];
+    let mut p = p1;
+    while p != p2 {
+        p += step;
+        // minor at the column centre, as num / den in 1/16 units
+        let c = p * 16 + 8;
+        let (mut num, mut den) = (b1 as i64 * (a2 - a1) as i64 + (c - a1) as i64 * (b2 - b1) as i64, (a2 - a1) as i64);
+        if den < 0 { num = -num; den = -den; }
+        if num.rem_euclid(den * 16) == 0 { return None; }
+        let want = num.div_euclid(den * 16) as i32;
+        let prev = out.last().unwrap().1;
+        out.push((p, prev + (want - prev).clamp(-1, 1)));
     }
+    Some(out.into_iter().map(|(a, b)| if x_major { (a, b) } else { (b, a) }).collect())
+}
 
-    // --- step exactly like bres_step! / draw_line_bresenham's main loop ---
-    let adx2 = (x2 - x).abs();
-    let ady2 = (y2 - y).abs();
-    let pixel_count = adx2.max(ady2) + 1;
-
-    let mut pts = Vec::new();
-    for i in 0..pixel_count {
-        pts.push((x, y));
-        let is_last = i == pixel_count - 1;
-        if !is_last {
-            if d < 0 {
-                x += incrx1; y -= incry1; d += incr1;
-            } else {
-                x += incrx2; y -= incry2; d += incr2;
-            }
-        }
-    }
-    pts
+/// `fline_geom` for a start point with a fractional nibble and an integer end.
+fn fline_pixels(x0: i32, x0_frac4: i32, y0: i32, y0_frac4: i32, x1: i32, y1: i32) -> Option<Vec<(i32, i32)>> {
+    fline_geom(x0 * 16 + x0_frac4, y0 * 16 + y0_frac4, x1 * 16, y1 * 16)
 }
 
 /// Reference A_LINE endpoint-suppression decision — mirrors `draw_aline`'s
@@ -2354,8 +2246,10 @@ fn test_fline_all_octants_half_pixel() {
                 }
             }
         }
-        let expected: HashSet<(i32,i32)> =
-            fline_pixels(cx, cx_frac, cy, cy_frac, x1, y1).into_iter().collect();
+        // A line through a pixel-row boundary is BRESROUND's call, not
+        // geometry's.
+        let Some(expected) = fline_pixels(cx, cx_frac, cy, cy_frac, x1, y1) else { continue };
+        let expected: HashSet<(i32,i32)> = expected.into_iter().collect();
 
         assert_eq!(pts, expected,
             "fline half-pixel octant test deg={deg}: ({cx}.5,{cy}.5)->({x1},{y1}): got {:?} expected {:?}",
@@ -2408,8 +2302,11 @@ fn test_fline_quarter_pixel_offsets() {
                     }
                 }
             }
-            let expected: HashSet<(i32,i32)> =
-                fline_pixels(cx, frac4, cy, frac4, x1, y1).into_iter().collect();
+            let Some(expected) = fline_pixels(cx, frac4, cy, frac4, x1, y1) else {
+                color = color.wrapping_add(1).max(1);
+                continue;
+            };
+            let expected: HashSet<(i32,i32)> = expected.into_iter().collect();
 
             assert_eq!(pts, expected,
                 "fline frac4={frac4} deg={deg}: ({cx}+{frac4}/16,{cy}+{frac4}/16)->({x1},{y1}): \
@@ -7618,4 +7515,243 @@ fn test_hostw_full_block_replicates_single_word() {
     }
     assert_eq!(read_pixel(&rex, x1 + 1, y0) & 0xFFFFFF, 0, "spilled past XEND");
     assert_eq!(read_pixel(&rex, x0, y1 + 1) & 0xFFFFFF, 0, "spilled past YEND");
+}
+
+/// IRIS GL's software-Z lines (fsn's label text, blast's HUD): each short
+/// stroke is an F_LINE without DOSETUP, set up by a SETUP write, drawn by a
+/// ZPATTERN GO whose mask is MSB-aligned (0xe0000000 = three pixels). The
+/// pattern is a recirculating register, "msb = first pixel": a ZPATTERN
+/// write reloads it, so every stroke starts at bit 31. When the bit position
+/// carried over from the previous stroke instead, the second stroke tested
+/// bits 28.. of its mask and came out partly or wholly missing.
+#[test]
+fn test_zpattern_write_restarts_pattern_for_soft_z_lines() {
+    const DM0_FLINE_SOFTZ: u32 = 0x0000_930e; // DRAW FLINE STOPONX STOPONY ENZPAT LEN32
+
+    let rex = &make_rex3();
+    rex3init(rex);
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(rex, REX3_WRMASK, 0xFF);
+
+    // (x0, y0, x1, y1, mask), as fsn sends them.
+    let strokes = [
+        (10, 10, 12, 10, 0xe000_0000u32),
+        (10, 20, 13, 20, 0xf000_0000),
+        (10, 30, 11, 30, 0xc000_0000),
+        (10, 40, 10, 43, 0xf000_0000),
+    ];
+    for (i, &(x0, y0, x1, y1, mask)) in strokes.iter().enumerate() {
+        reg(rex, REX3_COLORI, 1 + i as u32);
+        write_xstartf(rex, x0, 0);
+        write_ystartf(rex, y0, 0);
+        write_xendf(rex, x1, 0);
+        write_yendf(rex, y1, 0);
+        reg(rex, REX3_DRAWMODE0, DM0_FLINE_SOFTZ);
+        reg(rex, REX3_SETUP, 0);
+        reg_go(rex, REX3_ZPATTERN, mask);
+    }
+    for (i, &(x0, y0, x1, y1, _)) in strokes.iter().enumerate() {
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                assert_eq!(read_pixel(rex, x, y) & 0xFF, 1 + i as u32,
+                    "stroke {i} pixel ({x}, {y}) missing: its ZPATTERN mask was tested from the wrong bit");
+            }
+        }
+    }
+}
+
+/// BRESROUND (BRESRNDINC2[31:24], one bit per octant) picks which way a
+/// Bresenham step with d == 0 goes: set = diagonal, clear = straight. A 2x1
+/// I_LINE starts at d = 2*1 - 2 = 0, so its middle pixel shows the choice.
+/// IRIS GL draws with BRESROUND = 0, the X server with 0xff. Both engines.
+#[test]
+fn test_bresround_decides_the_d_zero_step() {
+    const DM0_DRAW_ILINE_XY: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
+    let mut cases = vec![(false, 0x00u32, 10), (false, 0xff, 11)];
+    if cfg!(feature = "rex-jit") {
+        cases.push((true, 0x00, 10));
+        cases.push((true, 0xff, 11));
+    }
+    for (jit, rnd, middle_row) in cases {
+        let rex = &make_rex3();
+        #[cfg(feature = "rex-jit")]
+        rex.jit_enabled.store(jit, std::sync::atomic::Ordering::Relaxed);
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_COLORI, 5);
+        reg(rex, REX3_BRESRNDINC2, rnd << 24);
+        #[cfg(feature = "rex-jit")]
+        let before = rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "rex-jit")]
+        if jit {
+            let j = rex.rex_jit.as_ref().unwrap();
+            let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_CI8_SRC, DRAWMODE0_OPCODE_DRAW);
+            let cm = unsafe { (*rex.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+            j.request_compile(DM0_DRAW_ILINE_XY, dm1, cm);
+            assert!(j.wait_compiled(DM0_DRAW_ILINE_XY, dm1, cm));
+        }
+        reg(rex, REX3_XYENDI, xy(12, 11));
+        reg(rex, REX3_XYSTARTI, xy(10, 10));
+        reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_ILINE_XY);
+        #[cfg(feature = "rex-jit")]
+        assert_eq!(rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed) > before, jit,
+            "jit={jit}: the line ran on the wrong engine");
+        for (x, y) in [(10, 10), (11, middle_row), (12, 11)] {
+            assert_eq!(read_pixel(rex, x, y) & 0xFF, 5,
+                "jit={jit} BRESROUND={rnd:#x}: pixel ({x}, {y}) not drawn");
+        }
+    }
+}
+
+/// F_LINE with both endpoints fractional, every direction, lengths like
+/// stroke text (0-12 pixels): the pixels must be `fline_geom`'s. Deterministic
+/// pseudo-random endpoints; lines through a row boundary are skipped.
+#[test]
+fn test_fline_fractional_both_ends_matches_geometry() {
+    fline_geometry_sweep(false);
+    #[cfg(feature = "rex-jit")]
+    fline_geometry_sweep(true);
+}
+
+fn fline_geometry_sweep(jit: bool) {
+    let rex = &make_rex3();
+    #[cfg(feature = "rex-jit")]
+    rex.jit_enabled.store(jit, std::sync::atomic::Ordering::Relaxed);
+    rex3init(rex);
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(rex, REX3_WRMASK, 0xFF);
+    #[cfg(feature = "rex-jit")]
+    if jit {
+        let j = rex.rex_jit.as_ref().unwrap();
+        let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_CI8_SRC, DRAWMODE0_OPCODE_DRAW);
+        let cm = unsafe { (*rex.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+        j.request_compile(DM0_DRAW_FLINE, dm1, cm);
+        assert!(j.wait_compiled(DM0_DRAW_FLINE, dm1, cm));
+    }
+    #[cfg(feature = "rex-jit")]
+    let before = rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+    let mut seed = 0x1234_5678u32;
+    let mut rnd = |n: u32| { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; seed % n };
+    let (c, pad) = (100i32, 16i32);
+    let (mut checked, mut ties) = (0, 0);
+    for _ in 0..2000 {
+        let x1 = c * 16 + rnd(16) as i32;
+        let y1 = c * 16 + rnd(16) as i32;
+        let x2 = x1 + rnd(25 * 16) as i32 - 12 * 16;
+        let y2 = y1 + rnd(25 * 16) as i32 - 12 * 16;
+        let Some(want) = fline_geom(x1, y1, x2, y2) else { ties += 1; continue };
+        reg(rex, REX3_COLORI, 0);
+        reg(rex, REX3_XYENDI, xy(c + pad, c + pad));
+        reg(rex, REX3_XYSTARTI, xy(c - pad, c - pad));
+        // DOSETUP: without it the block steps in the last line's octant.
+        reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK | DM0_DOSETUP);
+        reg(rex, REX3_COLORI, 7);
+        write_xstartf(rex, x1 >> 4, x1 & 15);
+        write_ystartf(rex, y1 >> 4, y1 & 15);
+        write_xendf(rex, x2 >> 4, x2 & 15);
+        write_yendf(rex, y2 >> 4, y2 & 15);
+        reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_FLINE);
+        let mut got = HashSet::new();
+        for y in c - pad..=c + pad {
+            for x in c - pad..=c + pad {
+                if read_pixel(rex, x, y) & 0xFF == 7 { got.insert((x, y)); }
+            }
+        }
+        let want: HashSet<(i32, i32)> = want.into_iter().collect();
+        assert_eq!(got, want, "jit={jit}: F_LINE ({x1}/16, {y1}/16) -> ({x2}/16, {y2}/16)");
+        checked += 1;
+    }
+    assert!(checked > 1500, "only {checked} lines checked ({ties} ties)");
+    #[cfg(feature = "rex-jit")]
+    assert_eq!(rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed) > before, jit,
+        "jit={jit}: the lines ran on the wrong engine");
+    let _ = jit;
+}
+
+/// One of fsn's label strokes (the left of an 'a', from fns.log): y-major,
+/// x and y increasing, (26052, 29923) -> (26094, 29976) in 1/16 pixels.
+/// IRIS GL's software Z buffer expects x = 1628, 1629, 1630, 1630; with the
+/// y fraction mirrored the wrong way round it came out 1628, 1628, 1629, 1630
+/// and the spotlight drawn afterwards left the expected pixels unpainted.
+/// Two more from fsn.rec, where a first-pixel adjustment (the spec's E test,
+/// or E/G) moved the start off the start point's own pixel.
+#[test]
+fn test_fline_fsn_label_stroke() {
+    let rex = &make_rex3();
+    rex3init(rex);
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_COLORI, 9);
+    // Same place, shifted into the visible framebuffer.
+    let (x1, y1, x2, y2) = (26052 - 1500 * 16, 29923 - 1800 * 16, 26094 - 1500 * 16, 29976 - 1800 * 16);
+    write_xstartf(rex, x1 >> 4, x1 & 15);
+    write_ystartf(rex, y1 >> 4, y1 & 15);
+    write_xendf(rex, x2 >> 4, x2 & 15);
+    write_yendf(rex, y2 >> 4, y2 & 15);
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_FLINE);
+    for (x, y) in [(128, 70), (129, 71), (130, 72), (130, 73)] {
+        assert_eq!(read_pixel(rex, x, y) & 0xFF, 9, "pixel ({x}, {y}) not drawn");
+    }
+    assert_eq!(read_pixel(rex, 128, 71) & 0xFF, 0, "(128, 71) drawn: y fraction mirrored the wrong way");
+
+    // fsn.rec: (27278, 22016) -> (30550, 31190), shifted by (-1600, -1300)
+    // pixels. Starts at x = 1704.875: its first pixel is column 104, where
+    // the start point is; an E/G adjustment moved it to 105.
+    reg(rex, REX3_COLORI, 11);
+    let (x1, y1, x2, y2) = (27278 - 1600 * 16, 22016 - 1300 * 16, 30550 - 1600 * 16, 31190 - 1300 * 16);
+    write_xstartf(rex, x1 >> 4, x1 & 15);
+    write_ystartf(rex, y1 >> 4, y1 & 15);
+    write_xendf(rex, x2 >> 4, x2 & 15);
+    write_yendf(rex, y2 >> 4, y2 & 15);
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_FLINE);
+    assert_eq!(read_pixel(rex, 104, 76) & 0xFF, 11, "first pixel is not the start point's own");
+    assert_eq!(read_pixel(rex, 105, 76) & 0xFF, 0, "first pixel moved off the start point's pixel");
+}
+
+/// A SPAN never steps y: once it reaches XEND, XSTART is left one past it and
+/// YSTART is unchanged (rex3.pdf §3.5.3), and both pattern bit positions
+/// restart at 31. The JIT used to end a span like a block row (x back to
+/// XSAVE, y + 1), and left a disabled pattern's bit position stale; IRIS GL
+/// reads XSTART/YSTART back (fsn.rec). fsn's soft-Z span: two LEN32 GOs.
+#[test]
+fn test_span_end_leaves_y_and_x_past_end() {
+    const DM0_SPAN_SOFTZ: u32 = 0x0008_9102; // DRAW SPAN STOPONX ENZPAT LEN32 LRONLY
+    let engines: &[bool] = if cfg!(feature = "rex-jit") { &[false, true] } else { &[false] };
+    for &jit in engines {
+        let rex = &make_rex3();
+        #[cfg(feature = "rex-jit")]
+        rex.jit_enabled.store(jit, std::sync::atomic::Ordering::Relaxed);
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_COLORI, 3);
+        #[cfg(feature = "rex-jit")]
+        if jit {
+            let j = rex.rex_jit.as_ref().unwrap();
+            let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_CI8_SRC, DRAWMODE0_OPCODE_DRAW);
+            let cm = unsafe { (*rex.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+            j.request_compile(DM0_SPAN_SOFTZ, dm1, cm);
+            assert!(j.wait_compiled(DM0_SPAN_SOFTZ, dm1, cm));
+        }
+        #[cfg(feature = "rex-jit")]
+        let before = rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+        // 46 pixels from x = 10 on row 20: a 32-pixel GO, then 14.
+        reg(rex, REX3_XYENDI, xy(55, 20));
+        reg(rex, REX3_XYSTARTI, xy(10, 20));
+        reg(rex, REX3_DRAWMODE0, DM0_SPAN_SOFTZ);
+        reg_go(rex, REX3_ZPATTERN, 0xffff_ffff);
+        reg_go(rex, REX3_ZPATTERN, 0);
+        #[cfg(feature = "rex-jit")]
+        assert_eq!(rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed) > before, jit,
+            "jit={jit}: the span ran on the wrong engine");
+        let ctx = unsafe { &*rex.context.get() };
+        let (x, y) = ((ctx.xstart >> 11) - REX3_COORD_BIAS, (ctx.ystart >> 11) - REX3_COORD_BIAS);
+        assert_eq!((x, y), (56, 20), "jit={jit}: span end left XSTART/YSTART at ({x}, {y})");
+        assert_eq!((ctx.zpat_bit, ctx.pat_bit), (31, 31), "jit={jit}: pattern bits not restarted");
+        for px in 10..42 {
+            assert_eq!(read_pixel(rex, px, 20) & 0xFF, 3, "jit={jit}: ({px}, 20) not drawn");
+        }
+        assert_eq!(read_pixel(rex, 42, 20) & 0xFF, 0, "jit={jit}: masked chunk drew");
+    }
 }
