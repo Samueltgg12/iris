@@ -1,5 +1,13 @@
 # REX3 F_LINE fractional Bresenham — fixes and open A_LINE follow-up
 
+> **Superseded in part (2026-10-17):** the setup described below still had
+> the spec's y orientation backwards, rounded the fractional term, lacked the
+> errata's E/G first-pixel tests and sized the walk from integer deltas. The
+> current setup is `fline_setup` (rex3_generic.rs) and the test oracle is the
+> geometric `fline_geom`; see rules/rex3/soft-z-lines-zpattern-and-bresround.md.
+> The "where the fix lives" (setup(), shared by both engines) and the
+> test-coordinate notes below still hold.
+
 ## Fixed: base `d` formula was I_LINE's, not F_LINE's — and the fix lives in `setup()`, not `draw_line_bresenham`
 
 `fline_apply_fract` (rex3.rs) received `*d` already computed by `setup()`
