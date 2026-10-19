@@ -623,14 +623,19 @@ fn cmd_boot(opts: &Opts, timeout_s: u64) -> Result<()> {
 fn cmd_login(opts: &Opts, user: &str, password: Option<&str>) -> Result<()> {
     send(opts, "serial-send", json!({"data": format!("{}\r", user)}))?;
     // IRIX presents `TERM = (vt100)` after the username; pressing enter accepts.
-    std::thread::sleep(Duration::from_millis(2000));
+    // Wait for it instead of sleeping a fixed 2 s: the prompt normally arrives
+    // in milliseconds, and a missing prompt still falls through to the enter.
     if let Some(p) = password {
         send_until(opts, "wait-serial",
         json!({"pattern": "Password:", "timeout_ms": 5000}),
         read_timeout_for(5000))?;
         send(opts, "serial-send", json!({"data": format!("{}\r", p)}))?;
+        send(opts, "serial-send", json!({"data": "\r"}))?;
+    } else {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let _ = wait_with_deadline(opts, "TERM =", deadline);
+        send(opts, "serial-send", json!({"data": "\r"}))?;
     }
-    send(opts, "serial-send", json!({"data": "\r"}))?;
     let deadline = Instant::now() + Duration::from_secs(15);
     wait_with_deadline(opts, "#", deadline)?;
     if !opts.quiet { eprintln!("login: shell ready"); }
