@@ -6,6 +6,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -66,7 +67,17 @@ pub struct CiServer {
     /// commands return an error in that case.
     display: Option<Arc<dyn GfxDisplay>>,
     display_head1: Option<Arc<dyn GfxDisplay>>,
+    /// In-flight command connections; bounded so long waits cannot exhaust
+    /// threads/file descriptors.
+    connections: AtomicUsize,
 }
+
+/// Concurrent CI connections allowed. Short-lived `iris-ci` commands use one
+/// at a time; agents holding a session open stay well under this.
+const MAX_CI_CONNECTIONS: usize = 32;
+/// A connection that sends nothing for this long is reaped. Long waits are
+/// bounded by their own `wait-serial` timeout, not this read timeout.
+const CI_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 impl Drop for CiServer {
     fn drop(&mut self) {
@@ -122,6 +133,7 @@ pub fn start_server(
         ci_serial,
         display,
         display_head1,
+        connections: AtomicUsize::new(0),
     });
 
     *SOCKET_PATH.lock() = Some(path.clone());
@@ -154,10 +166,18 @@ fn start_unix_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
             for conn in listener.incoming() {
                 match conn {
                     Ok(stream) => {
+                        if server_clone.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CI_CONNECTIONS {
+                            server_clone.connections.fetch_sub(1, Ordering::AcqRel);
+                            eprintln!("iris-ci-accept: too many connections (max {MAX_CI_CONNECTIONS}); refusing");
+                            continue;
+                        }
                         let s = server_clone.clone();
                         thread::Builder::new()
                             .name("iris-ci-handler".into())
-                            .spawn(move || handle_client(s, stream))
+                            .spawn(move || {
+                                handle_client(s.clone(), stream);
+                                s.connections.fetch_sub(1, Ordering::AcqRel);
+                            })
                             .ok();
                     }
                     Err(e) => eprintln!("iris-ci-accept: {}", e),
@@ -191,10 +211,18 @@ fn start_tcp_server_impl(server: Arc<CiServer>, path: &str) -> Result<(), String
                 match conn {
                     Ok(stream) => {
                         let _ = stream.set_nodelay(true);
+                        if server_clone.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CI_CONNECTIONS {
+                            server_clone.connections.fetch_sub(1, Ordering::AcqRel);
+                            eprintln!("iris-ci-accept: too many connections (max {MAX_CI_CONNECTIONS}); refusing");
+                            continue;
+                        }
                         let s = server_clone.clone();
                         thread::Builder::new()
                             .name("iris-ci-handler".into())
-                            .spawn(move || handle_client_tcp(s, stream))
+                            .spawn(move || {
+                                handle_client_tcp(s.clone(), stream);
+                                s.connections.fetch_sub(1, Ordering::AcqRel);
+                            })
                             .ok();
                     }
                     Err(e) => eprintln!("iris-ci-accept: {}", e),
@@ -227,6 +255,7 @@ fn handle_client_lines(server: Arc<CiServer>, reader: impl BufRead, mut writer: 
 
 #[cfg(unix)]
 fn handle_client(server: Arc<CiServer>, stream: UnixStream) {
+    let _ = stream.set_read_timeout(Some(CI_IDLE_TIMEOUT));
     match stream.try_clone() {
         Ok(writer) => {
             let reader = BufReader::new(stream);
@@ -237,6 +266,7 @@ fn handle_client(server: Arc<CiServer>, stream: UnixStream) {
 }
 
 fn handle_client_tcp(server: Arc<CiServer>, stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(CI_IDLE_TIMEOUT));
     match stream.try_clone() {
         Ok(writer) => {
             let reader = BufReader::new(stream);
