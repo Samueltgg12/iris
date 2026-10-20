@@ -1322,16 +1322,16 @@ impl App {
                 } else {
                     subtitle(ui, t!("menu-memory-stopped-subtitle"));
                 }
-                let ip28_banks = self.cfg.machine.profile.ip28();
+                let bank_sizes = self.cfg.machine.profile.valid_bank_sizes();
                 ui.separator();
                 ui.label(t!("menu-memory-presets"));
-                for &p in ram_presets(ip28_banks) {
+                for &p in ram_presets(self.cfg.machine.profile) {
                     if ui
                         .add_enabled(!running, egui::Button::new(t!("menu-memory-size", mb = p)))
                         .on_disabled_hover_text(t!("menu-memory-stop-first-tip"))
                         .clicked()
                     {
-                        self.cfg.banks = distribute_ram(p, ip28_banks);
+                        self.cfg.banks = distribute_ram(p, bank_sizes);
                         self.mark_dirty();
                         self.toast(t!("toast-ram-set", ram = ram_summary(&self.cfg.banks), banks = format!("{:?}", self.cfg.banks)));
                         ui.close();
@@ -1343,7 +1343,7 @@ impl App {
                     ui.menu_button(t!("menu-memory-bank", bank = i, mb = self.cfg.banks[i]), |ui| {
                         for &sz in iris::config::VALID_BANK_SIZES {
                             if ui
-                                .add_enabled(!running && (sz <= 128 || ip28_banks), egui::Button::new(t!("menu-memory-size", mb = sz)))
+                                .add_enabled(!running && bank_sizes.contains(&sz), egui::Button::new(t!("menu-memory-size", mb = sz)))
                                 .on_disabled_hover_text(if running {
                                     t!("menu-memory-stop-first-tip")
                                 } else {
@@ -2332,6 +2332,10 @@ impl App {
                 running: self.emu.is_running(),
                 started_banks: self.started_banks,
                 started_cpu: self.started_cpu,
+                // The O2's GBE lands in step 4 of docs/o2-ip32.md §7. Until
+                // then the graphics console stays offered-but-disabled, so a
+                // user who wants it can see that it is coming.
+                gbe_ready: iris::dev::crm::gbe::GBE_READY,
             },
             &mut self.bench,
         );

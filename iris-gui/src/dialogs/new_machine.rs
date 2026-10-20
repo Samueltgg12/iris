@@ -60,17 +60,23 @@ impl Default for NewMachineDialog {
 }
 
 /// Greedy-fill banks 0..3 with the largest valid bank size that fits.
-/// `ip28` gates the 256/512 MB sizes, which only the IP28 MC can express
-/// (`validate()` rejects them on other machine profiles) — pass
-/// `cfg.machine.profile.ip28()`.
-pub fn distribute_ram(total: u32, ip28: bool) -> [u32; 4] {
+///
+/// `sizes` is the profile's own bank-size list (`MachineProfile::
+/// valid_bank_sizes`), so a total that needs a bank the profile's memory
+/// controller cannot express — the IP28's 256/512 MB, or anything but the
+/// O2's 32/128 MB DIMMs — comes back as an approximation rather than as a
+/// config `validate()` rejects at Start.
+pub fn distribute_ram(total: u32, sizes: &[u32]) -> [u32; 4] {
     let mut remaining = total;
     let mut banks = [0u32; 4];
     for slot in &mut banks {
-        // Pick the largest size in VALID_BANK_SIZES that is <= remaining.
-        let pick = VALID_BANK_SIZES.iter()
-            .filter(|&&s| s > 0 && s <= remaining && (s <= 128 || ip28))
-            .max().copied().unwrap_or(0);
+        // Pick the largest offered size that is <= remaining.
+        let pick = sizes
+            .iter()
+            .filter(|&&s| s > 0 && s <= remaining)
+            .max()
+            .copied()
+            .unwrap_or(0);
         *slot = pick;
         remaining -= pick;
         if remaining == 0 { break; }
@@ -214,20 +220,20 @@ impl NewMachineDialog {
                         ComboBox::from_id_salt("ram_total")
                             .selected_text(t!("dialog-new-machine-mb", size = self.ram_total_mb))
                             .show_ui(ui, |ui| {
-                                for &s in ram_presets(self.profile.ip28()) {
+                                for &s in ram_presets(self.profile) {
                                     ui.selectable_value(&mut self.ram_total_mb, s, t!("dialog-new-machine-mb", size = s));
                                 }
                             });
                         ui.end_row();
                     } else {
-                        let ip28_banks = self.profile.ip28();
+                        let bank_sizes = self.profile.valid_bank_sizes();
                         for i in 0..4 {
                             ui.label(t!("dialog-new-machine-bank", bank = i));
                             ComboBox::from_id_salt(("nm_bank", i))
                                 .selected_text(t!("dialog-new-machine-mb", size = self.ram_banks[i]))
                                 .show_ui(ui, |ui| {
                                     for &sz in VALID_BANK_SIZES {
-                                        ui.add_enabled_ui(sz <= 128 || ip28_banks, |ui| {
+                                        ui.add_enabled_ui(bank_sizes.contains(&sz), |ui| {
                                             ui.selectable_value(&mut self.ram_banks[i], sz, t!("dialog-new-machine-mb", size = sz))
                                                 .on_disabled_hover_text(t!("dialog-new-machine-bank-ip28-only"));
                                         });
@@ -324,14 +330,21 @@ impl NewMachineDialog {
                         cfg.banks = if self.ram_advanced {
                             self.ram_banks
                         } else {
-                            distribute_ram(self.ram_total_mb, self.profile.ip28())
+                            distribute_ram(self.ram_total_mb, self.profile.valid_bank_sizes())
                         };
-                        // The IP28 IRIX kernel carries no Newport driver at all —
-                        // default straight to IMPACT so a fresh machine has a working
-                        // display instead of a blank Newport head.
+                        // A fresh machine gets the display its profile actually
+                        // has: IMPACT on the IP28 (whose IRIX kernel carries no
+                        // Newport driver at all, so a blank Newport head is not
+                        // a working display), the integrated GBE on the O2
+                        // (which has no GIO slot to put a board in), Newport
+                        // elsewhere.
+                        cfg.graphics.board = self.profile.default_graphics_board();
                         if self.profile == MachineProfile::Indigo2Ip28 {
                             cfg.graphics.board = iris::config::GraphicsBoard::SolidImpact;
                         }
+                        // And the console that profile's firmware can actually
+                        // start on — the O2's GBE does not exist yet.
+                        cfg.coerce_to_profile();
                         // SCSI defaults: drop the built-in entries unless the
                         // user explicitly opted in.
                         cfg.scsi.clear();
@@ -361,11 +374,23 @@ impl NewMachineDialog {
 #[cfg(test)]
 mod ram_tests {
     use super::distribute_ram;
+    use iris::config::MachineProfile;
 
     #[test]
     fn ip28_gigabyte_uses_two_banks() {
-        assert_eq!(distribute_ram(1024, true), [512, 512, 0, 0]);
-        assert_eq!(distribute_ram(768, true), [512, 256, 0, 0]);
-        assert_eq!(distribute_ram(512, false), [128, 128, 128, 128]);
+        let ip28 = MachineProfile::Indigo2Ip28.valid_bank_sizes();
+        assert_eq!(distribute_ram(1024, ip28), [512, 512, 0, 0]);
+        assert_eq!(distribute_ram(768, ip28), [512, 256, 0, 0]);
+        let fullhouse = MachineProfile::IndyIp24.valid_bank_sizes();
+        assert_eq!(distribute_ram(512, fullhouse), [128, 128, 128, 128]);
+    }
+
+    #[test]
+    fn o2_uses_only_its_dimms() {
+        let o2 = MachineProfile::O2Ip32.valid_bank_sizes();
+        assert_eq!(distribute_ram(512, o2), [128, 128, 128, 128]);
+        assert_eq!(distribute_ram(64, o2), [32, 32, 0, 0]);
+        // 192 is 128 + 32 + 32, not a single bank.
+        assert_eq!(distribute_ram(192, o2), [128, 32, 32, 0]);
     }
 }

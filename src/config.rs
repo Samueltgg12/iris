@@ -396,18 +396,43 @@ pub enum MachineProfile {
     /// Use an IMPACT board (`src/dev/mgras/`): an IP28 kernel carries no
     /// Newport driver, so REX3 is not an alternative for that guest.
     Indigo2Ip28,
+    /// SGI O2 IP32 (Moosehead) — CRIME + MACE, no GIO bus at all.
+    ///
+    /// A different system ASIC set rather than another fullhouse variant.
+    /// **CRIME** is the memory *and* interrupt controller (8 bank-control
+    /// registers, one CPU interrupt line on Cause.IP2) and also holds the
+    /// graphics pipeline: the CPU interface (geometry), the **MRE** rasterizer
+    /// and texture mapper, and the **GBE** display engine. **MACE** carries
+    /// the PCI bridge, the 16550 UARTs, PS/2, the DS17287 RTC, audio, video
+    /// and the MAC110 Ethernet. **VICE** is the image-compression
+    /// accelerator, used only by IRIX and not needed to boot.
+    ///
+    /// Nothing in the IP22/IP24/IP28 device model transfers, so this profile
+    /// builds its own devices (`src/dev/crime.rs`, `src/dev/mace.rs`,
+    /// `src/dev/crm/`) out of the same reusable components — see
+    /// docs/o2-ip32.md.
+    ///
+    /// RAM is 4 × 32/128 MB DIMMs at physical 0, visible again at +1 GB
+    /// through CRIME's bank windows.
+    O2Ip32,
 }
 
 impl MachineProfile {
     /// All selectable profiles, in display order. Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
-    pub const ALL: [Self; 3] = [Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28];
+    pub const ALL: [Self; 4] = [
+        Self::IndyIp24,
+        Self::Indigo2Ip22,
+        Self::Indigo2Ip28,
+        Self::O2Ip32,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::IndyIp24 => "SGI Indy (IP24)",
             Self::Indigo2Ip22 => "SGI Indigo2 (IP22)",
             Self::Indigo2Ip28 => "SGI Indigo2 IMPACT (IP28)",
+            Self::O2Ip32 => "SGI O2 (IP32)",
         }
     }
 
@@ -420,6 +445,53 @@ impl MachineProfile {
     /// fullhouse devices — see the variant's own documentation for the list.
     pub fn ip28(self) -> bool {
         matches!(self, Self::Indigo2Ip28)
+    }
+
+    /// The O2. Selects the CRIME/MACE/GBE device tree and the IP32 physical
+    /// map instead of anything HPC3-shaped — see the variant's documentation.
+    pub fn ip32(self) -> bool {
+        matches!(self, Self::O2Ip32)
+    }
+
+    /// RAM bank sizes this profile's memory controller can express. The
+    /// fullhouse MC takes 8/16/32/64/128 MB banks (256/512 only on IP28,
+    /// whose MEMCFG base field is 4 bits wider); CRIME takes 32/128 MB DIMMs.
+    ///
+    /// This is the single source of truth for what a config may contain, so
+    /// `validate()` and the GUI's RAM pickers both read it rather than each
+    /// re-deriving the rules.
+    pub fn valid_bank_sizes(self) -> &'static [u32] {
+        match self {
+            // CRIME's DIMMs are 32 or 128 MB; the PROM's probe sizes anything
+            // else as an empty slot.
+            Self::O2Ip32 => &[0, 32, 128],
+            // The IP28's base field reaches 512 MB; the IP22/IP24's stops at
+            // 128.
+            Self::Indigo2Ip28 => VALID_BANK_SIZES,
+            Self::IndyIp24 | Self::Indigo2Ip22 => &[0, 8, 16, 32, 64, 128],
+        }
+    }
+
+    /// The display this profile has. Every Indy/Indigo2 has a GIO slot, so
+    /// the board is a choice the user makes and Newport is the default; the
+    /// O2's GBE is the only thing it can have, so it is not really a choice.
+    pub fn default_graphics_board(self) -> GraphicsBoard {
+        if self.ip32() {
+            GraphicsBoard::Gbe
+        } else {
+            GraphicsBoard::Newport
+        }
+    }
+
+    /// The CPU this profile's firmware accepts and that a real machine of
+    /// this kind shipped with: the R4400 for the Indy, the R4400/R10000 pair
+    /// for the Indigo2s, the R5000 for the O2.
+    pub fn default_cpu(self) -> CpuModel {
+        match self {
+            Self::IndyIp24 => CpuModel::R4400,
+            Self::Indigo2Ip22 | Self::Indigo2Ip28 => CpuModel::R4400,
+            Self::O2Ip32 => CpuModel::R5000,
+        }
     }
 }
 
@@ -445,16 +517,22 @@ pub enum GraphicsBoard {
     /// Maximum IMPACT (2 GE11, 2 RE4).
     #[clap(name = "maximpact", alias = "impact:max", alias = "max_impact")]
     MaxImpact,
+    /// O2 (IP32) GBE — the display engine half of CRIME (`src/dev/crm/gbe.rs`),
+    /// fed by the CRIME MRE rasterizer. O2 only; there is no GIO slot to put
+    /// a board in.
+    #[clap(name = "gbe", alias = "o2gfx", alias = "crm")]
+    Gbe,
 }
 
 impl GraphicsBoard {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Newport,
         Self::Xz,
         Self::Extreme,
         Self::SolidImpact,
         Self::HighImpact,
         Self::MaxImpact,
+        Self::Gbe,
     ];
 
     pub fn label(self) -> &'static str {
@@ -465,6 +543,7 @@ impl GraphicsBoard {
             Self::SolidImpact => "IMPACT Solid",
             Self::HighImpact => "IMPACT High",
             Self::MaxImpact => "IMPACT Maximum",
+            Self::Gbe => "GBE (integrated)",
         }
     }
 
@@ -476,6 +555,7 @@ impl GraphicsBoard {
             Self::SolidImpact => "solidimpact",
             Self::HighImpact => "highimpact",
             Self::MaxImpact => "maximpact",
+            Self::Gbe => "gbe",
         }
     }
 
@@ -485,7 +565,16 @@ impl GraphicsBoard {
 
     /// Whether `validate()` accepts this board on `profile`.
     pub fn supports(self, profile: MachineProfile) -> bool {
-        self != Self::Extreme || profile == MachineProfile::Indigo2Ip22
+        match self {
+            // The O2 has no GIO bus: GBE is the only display it can have, and
+            // it is the only machine that has GBE.
+            Self::Gbe => profile == MachineProfile::O2Ip32,
+            // Extreme's own Indigo2-only rule is checked separately, with a
+            // message that names the profile it *does* want; here it only has
+            // to say "not on an O2".
+            Self::Extreme => profile != MachineProfile::O2Ip32,
+            _ => profile != MachineProfile::O2Ip32,
+        }
     }
 }
 
@@ -501,8 +590,9 @@ impl std::str::FromStr for GraphicsBoard {
             "solidimpact" | "impact:solid" | "solid_impact" | "solid-impact" | "solid" => Ok(Self::SolidImpact),
             "highimpact" | "impact:high" | "high_impact" | "high-impact" | "high" => Ok(Self::HighImpact),
             "maximpact" | "impact:max" | "max_impact" | "max-impact" | "maximumimpact" | "maximum_impact" | "maximum-impact" | "max" => Ok(Self::MaxImpact),
+            "gbe" | "o2gfx" | "crm" => Ok(Self::Gbe),
             _ => Err(format!(
-                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max)"
+                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, gbe, impact:solid, impact:high, impact:max)"
             )),
         }
     }
@@ -537,9 +627,10 @@ impl std::fmt::Display for GraphicsBoard {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphicsSection {
-    /// Graphics board: Newport, GR2 XZ/Extreme, or IMPACT Solid/High/Maximum.
-    /// Extreme is restricted to IP22; non-Newport boards require one head
-    /// and Guest resolution. See [`MachineConfig::validate`].
+    /// Graphics board: Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum, or
+    /// the O2's integrated GBE. Extreme is restricted to IP22; non-Newport
+    /// boards require one head and Guest resolution; GBE requires the O2. See
+    /// [`MachineConfig::validate`].
     #[serde(default)]
     pub board: GraphicsBoard,
     /// Newport heads to emulate (1 or 2). Dual-head maps a second REX3 at GIO slot 1.
@@ -632,6 +723,13 @@ impl CpuModel {
             Self::R10000 => "MIPS R10000",
         }
     }
+
+    /// CPUs this profile's firmware accepts. The O2's PROM probes CP0 PRId
+    /// and takes R5000, RM7000 and R10000 (impl 0x23/0x27/0x28) alike; IRIS
+    /// models the R5000 and the R10000, and the O2 has no R4400.
+    pub fn supports(self, profile: MachineProfile) -> bool {
+        !profile.ip32() || self != Self::R4400
+    }
 }
 
 /// How the CPU's caches are modelled. A runtime choice: each is its own
@@ -668,6 +766,36 @@ impl CacheModel {
     }
 }
 
+/// Which console the firmware starts on. O2 only — the Indy/Indigo2 choose
+/// with the same `console` environment variable, but their firmware is
+/// configured through their own NVRAM chips and needs no host-side seed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleDevice {
+    /// Graphics console — the O2's GBE.
+    #[default]
+    Graphics,
+    /// Serial console — MACE UART 1 (the O2's `console=d`).
+    Serial,
+}
+
+impl ConsoleDevice {
+    /// The value the firmware's `console` environment variable holds.
+    pub fn env_value(self) -> &'static str {
+        match self {
+            Self::Graphics => "g",
+            Self::Serial => "d",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Graphics => "Graphics (GBE)",
+            Self::Serial => "Serial (UART 1)",
+        }
+    }
+}
+
 /// `[machine]` section — platform identity (not performance knobs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -678,11 +806,42 @@ pub struct MachineSection {
     pub cpu: CpuModel,
     #[serde(default)]
     pub cache: CacheModel,
+    /// Which console the firmware starts on, O2 only. `g` is the graphics
+    /// console (GBE), `d` the serial one (MACE UART 1).
+    ///
+    /// On real hardware this is the `console` environment variable, stored in
+    /// the PROM's own flash and changed with `setenv`. Flash persistence is
+    /// not emulated yet (docs/o2-ip32.md §6), so instead this seeds the env
+    /// segment of the loaded PROM image before the CPU starts — the same
+    /// backdoor-injection pattern the Indigo2 uses for its Ethernet MAC. The
+    /// default is `d` until the graphics console exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<ConsoleDevice>,
 }
 
 impl Default for MachineSection {
     fn default() -> Self {
-        Self { profile: MachineProfile::default(), cpu: CpuModel::default(), cache: CacheModel::default() }
+        Self {
+            profile: MachineProfile::default(),
+            cpu: CpuModel::default(),
+            cache: CacheModel::default(),
+            console: None,
+        }
+    }
+}
+
+impl MachineSection {
+    /// Which console the firmware starts on. The O2 defaults to the serial
+    /// console while GBE is still a stub (docs/o2-ip32.md §2.2); every other
+    /// profile's firmware has its own console and ignores this.
+    pub fn console(&self) -> ConsoleDevice {
+        self.console.unwrap_or_else(|| {
+            if self.profile.ip32() {
+                ConsoleDevice::Serial
+            } else {
+                ConsoleDevice::Graphics
+            }
+        })
     }
 }
 
@@ -1386,6 +1545,39 @@ impl Default for MachineConfig {
 fn is_default_keyboard(k: &KeyboardLayout) -> bool { *k == KeyboardLayout::default() }
 
 impl MachineConfig {
+    /// Replace anything the current `[machine] profile` cannot express with
+    /// that profile's own equivalent.
+    ///
+    /// Called when the profile is chosen for the user rather than by them —
+    /// `iris --o2` on a bare command line, or the GUI's profile combo box.
+    /// A config that *names* a profile and then contradicts it is a mistake
+    /// the user has to see (`validate()` rejects it); a config that names one
+    /// and leaves the rest at the previous profile's defaults is not a
+    /// mistake, it is just incomplete, and completing it is this function's
+    /// job.
+    pub fn coerce_to_profile(&mut self) {
+        let profile = self.machine.profile;
+        if !self.graphics.board.supports(profile) {
+            self.graphics.board = profile.default_graphics_board();
+        }
+        if !self.machine.cpu.supports(profile) {
+            self.machine.cpu = profile.default_cpu();
+        }
+        let bank_sizes = profile.valid_bank_sizes();
+        let max_bank = bank_sizes.iter().max().copied().unwrap_or(128);
+        for bank in &mut self.banks {
+            if !bank_sizes.contains(bank) {
+                *bank = max_bank;
+            }
+        }
+        // The graphics console needs GBE, which is not there yet.
+        if profile.ip32() && !crate::dev::crm::gbe::GBE_READY {
+            if self.machine.console == Some(ConsoleDevice::Graphics) {
+                self.machine.console = Some(ConsoleDevice::Serial);
+            }
+        }
+    }
+
     /// The serial channels' TCP ports (A, B), defaults filled in.
     pub fn serial_ports(&self) -> [u16; 2] {
         let [a, b] = crate::dev::z85c30::DEFAULT_PORTS;
@@ -1432,6 +1624,21 @@ impl MachineConfig {
                 self.graphics.heads
             ));
         }
+        // Which boards this profile can host at all, before any per-board
+        // rule: the O2 has no GIO slot, and the Indy has no IMPACT-grade
+        // host bridge.
+        if !self.graphics.board.supports(self.machine.profile) {
+            let name = self.graphics.board.as_str();
+            if self.machine.profile.ip32() {
+                return Err(format!(
+                    "graphics.board \"{name}\" needs the GIO bus the O2 does not have \
+                     (machine.profile = o2_ip32: use gbe)"
+                ));
+            }
+            return Err(format!(
+                "graphics.board \"{name}\" is not valid on this machine profile"
+            ));
+        }
         if self.graphics.board != GraphicsBoard::Newport {
             let name = self.graphics.board.as_str();
             if self.graphics.board == GraphicsBoard::Extreme && self.machine.profile != MachineProfile::Indigo2Ip22 {
@@ -1467,6 +1674,17 @@ impl MachineConfig {
                     i, sz, VALID_BANK_SIZES
                 ));
             }
+            // CRIME's DIMMs are 32 or 128 MB; nothing else fits its bank
+            // windows, and the PROM's probe would size the slot empty. Checked
+            // first, since 256/512 would otherwise be reported as the IP28's
+            // 16 MB-granule rule and never reach the DIMM rule at all.
+            if self.machine.profile.ip32() && sz != 0 && sz != 32 && sz != 128 {
+                return Err(format!(
+                    "bank{} size {} MB is not an O2 DIMM (machine.profile = o2_ip32: \
+                     valid: 0, 32, 128)",
+                    i, sz
+                ));
+            }
             // The IP22/IP24 MC cannot express banks larger than 128 MB at its base
             // shift; only the IP28's can.
             if sz > 128 && !self.machine.profile.ip28() {
@@ -1475,6 +1693,23 @@ impl MachineConfig {
                     i, sz
                 ));
             }
+        }
+        if self.machine.profile.ip32() && self.machine.cpu == CpuModel::R4400 {
+            return Err(
+                "machine.cpu \"r4400\" has no O2 — the IP32 firmware takes R5000, \
+                 RM7000 or R10000 (machine.profile = o2_ip32: use r5000 or r10000)"
+                    .into(),
+            );
+        }
+        if self.machine.profile.ip32() && self.machine.console == Some(ConsoleDevice::Graphics) {
+            // Not a permanent restriction: the graphics console is the O2's
+            // normal mode and becomes valid when GBE lands. Until then the
+            // firmware would sit in initGraphics with nothing to show, so say
+            // that rather than booting into a black window.
+            return Err(
+                "machine.console = \"graphics\" is not emulated yet — the O2's GBE is \
+                 still a stub (use machine.console = \"serial\")".into(),
+            );
         }
         if let Some(ref s) = self.nat_subnet {
             if let Err(e) = parse_nat_subnet(s) {
@@ -1588,6 +1823,12 @@ pub struct Cli {
     /// Overrides `[machine].profile` in the config file.
     #[arg(long, default_value_t = false)]
     pub ip22: bool,
+
+    /// Emulate an SGI O2 (IP32). Overrides `[machine].profile` in the config
+    /// file. CRIME + MACE, not an Indy/Indigo2 variant — see
+    /// docs/o2-ip32.md.
+    #[arg(long, default_value_t = false)]
+    pub o2: bool,
 
     /// Path to NVRAM file (default: nvram.bin in cwd)
     #[arg(long)]
@@ -1813,6 +2054,16 @@ impl Cli {
     pub fn apply(&self, mut cfg: MachineConfig) -> MachineConfig {
         if let Some(p) = &self.prom    { cfg.prom = p.clone(); }
         if self.ip22 { cfg.machine.profile = MachineProfile::Indigo2Ip22; }
+        if self.o2   { cfg.machine.profile = MachineProfile::O2Ip32; }
+        // A profile flag is a request for a whole different machine, not just
+        // a different label on this one: `iris --o2` has to work with nothing
+        // else on the command line, so anything the old profile had that the
+        // new one cannot express is replaced rather than left for
+        // `validate()` to reject. A config *file* that contradicts itself is
+        // still an error — the fix belongs in the file, not in the loader.
+        if self.ip22 || self.o2 {
+            cfg.coerce_to_profile();
+        }
         if let Some(p) = &self.nvram   { cfg.nvram = p.clone(); }
         if let Some(p) = &self.nveeprom { cfg.nveeprom = p.clone(); }
         if let Some(v) = self.bank0    { cfg.banks[0] = v; }

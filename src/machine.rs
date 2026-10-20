@@ -272,6 +272,20 @@ impl Machine {
 
         let guinness = cfg.machine.profile.guinness();
 
+        // The O2 (IP32) has no HPC3, no IOC2, no MC and no GIO bus: it is
+        // CRIME + MACE, a different ASIC set (docs/o2-ip32.md §1). Building
+        // one out of the fullhouse devices below would produce a machine that
+        // answers the IP32 firmware's probes with the wrong chips' registers,
+        // which looks like a broken emulator rather than an unimplemented
+        // profile — so refuse until the real device tree lands.
+        if cfg.machine.profile.ip32() {
+            panic!(
+                "SGI O2 (IP32) support is not implemented yet — the profile, \
+                 config plumbing and embedded 4.18 PROM are in place, but the \
+                 CRIME/MACE device tree is not (docs/o2-ip32.md §7)"
+            );
+        }
+
         // 0. EEPROMs. Real IP22 hardware has two distinct 93-series serial
         // EEPROM chips, not one shared part: a CPU-daughtercard chip wired to
         // the MC (REG_EEROM @ 0x1fa00030 — CPU boot config, incl. CACHSZ_REG),

@@ -42,6 +42,16 @@ config-indigo2-subtitle =
 config-ip28-subtitle =
 config-ip28-graphics-warning = IRIX has no Newport driver for this machine. Choose an IMPACT graphics board.
 
+# The O2's `console` environment variable, which lives in the PROM's own
+# flash. Flash persistence is not emulated yet (docs/o2-ip32.md §6), so this
+# seeds the loaded image instead — the emulator's equivalent of a machine
+# someone already ran `setenv console=d` on.
+config-o2-console = Console
+config-o2-console-graphics = Graphics (GBE)
+config-o2-console-serial = Serial (UART 1)
+config-o2-console-subtitle =
+config-o2-console-graphics-pending = The O2's GBE display engine is not emulated yet. Use the serial console for now.
+
 config-processor = Processor
 config-cpu = CPU
 config-cpu-locked = Stop the machine to change the CPU.

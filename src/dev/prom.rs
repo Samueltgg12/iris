@@ -73,6 +73,20 @@ impl Prom {
         )
     }
 
+    /// O2 (IP32) variant: try the configured path, then
+    /// `ip32prom.rev4.18.bin` in the current directory, then the embedded
+    /// image. The IP32 firmware is one 512 KB flash for every O2 — there is no
+    /// per-CPU variant to pick, so unlike IP22/IP28 there is no profile
+    /// suffix on the filename.
+    pub fn from_file_or_embedded_ip32(cfg_path: &str) -> Self {
+        Self::from_file_or_embedded_indigo2(
+            cfg_path,
+            "ip32prom.rev4.18.bin",
+            &crate::prombinip32::PROM_IP32_REV418,
+            "IP32",
+        )
+    }
+
     fn from_file_or_embedded_indigo2(
         cfg_path: &str, default_path: &str, embedded: &[u8], profile: &str,
     ) -> Self {
@@ -292,6 +306,35 @@ mod tests {
     #[test]
     fn ip28_prom_fallback_order() {
         check_indigo2_fallback_order("IP28", &crate::prombinip28::PROM0701477002);
+    }
+
+    #[test]
+    fn ip32_prom_fallback_order() {
+        check_indigo2_fallback_order("IP32", &crate::prombinip32::PROM_IP32_REV418);
+    }
+
+    /// The embedded IP32 image is the unmodified SGI firmware: revision 4.18,
+    /// 512 KB. A patched image would be indistinguishable from a user's own
+    /// flash dump and is never embedded — the emulator patches the *loaded*
+    /// image at runtime instead (docs/o2-ip32.md §2.2).
+    #[test]
+    fn ip32_prom_is_the_stock_4_18_image() {
+        assert_eq!(crate::prombinip32::PROM_IP32_REV418.len(), 524_288);
+        // A fingerprint (not a real md5 — iris has no md5 crate, and adding one
+        // for a test would be silly) that fails if the array is edited. The
+        // real image's md5, c9725e036052cf1f3e6258eb9bc687fa, is recorded in
+        // `src/prombinip32.rs`'s header comment for a human to check with
+        // `md5sum` against a known-good dump.
+        let fingerprint = format!(
+            "{:08x}",
+            crate::prombinip32::PROM_IP32_REV418.iter().fold(0u32, |h, &b| {
+                h.wrapping_mul(31).wrapping_add(b as u32)
+            })
+        );
+        assert_eq!(fingerprint, "0f7622ea");
+        // The image starts with the PROM's own segment header, and the boot
+        // code sits at offset 0 where the reset vector expects it.
+        assert_eq!(&crate::prombinip32::PROM_IP32_REV418[8..12], b"SHDR");
     }
 
     #[test]

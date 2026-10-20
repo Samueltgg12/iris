@@ -1,10 +1,12 @@
 //! Emulated hardware. Graphics boards get a directory each (GR2, Newport,
-//! IMPACT); the rest of the system's devices sit here as single files.
+//! IMPACT, and the O2's CRIME/GBE); the rest of the system's devices sit here
+//! as single files.
 
 pub mod gl;
 pub mod gr2;
 pub mod mgras;
 pub mod ng1;
+pub mod crm;
 
 pub mod camera;
 pub mod cdmc;

@@ -2,9 +2,9 @@ use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, U
 use iris::build_features;
 use std::path::Path;
 use iris::config::{AudioHost, CacheModel,
-    format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard, KeyboardLayout,
-    MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset,
-    ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
+    format_unix_utc, ConsoleDevice, CpuModel, ForwardBind, ForwardProto, GraphicsBoard,
+    KeyboardLayout, MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig,
+    RtcOffset, ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
 use iris::net::nfsudp::NfsVersion;
 use iris::dev::ng1::vc2_timings::NewportResolution;
@@ -20,6 +20,10 @@ pub struct MemoryUiContext {
     /// The CPU the running guest actually booted on, so a pending change is
     /// shown as pending rather than as fact. `None` when nothing is running.
     pub started_cpu: Option<CpuModel>,
+    /// Whether the O2's GBE display engine exists yet. Until it does, the
+    /// graphics console cannot be offered — the firmware would sit in
+    /// `initGraphics` with nothing to show (docs/o2-ip32.md §2.1).
+    pub gbe_ready: bool,
 }
 
 /// A host network interface candidate for the PCAP backend selector. This is a
@@ -206,6 +210,15 @@ pub fn show_tab(
     }).inner
 }
 
+/// The O2's console choice, as the GUI spells it. `ConsoleDevice::label()`
+/// is the plain-language form used in logs and errors; this is the picker's.
+fn console_label(c: ConsoleDevice) -> String {
+    match c {
+        ConsoleDevice::Graphics => t!("config-o2-console-graphics").to_string(),
+        ConsoleDevice::Serial => t!("config-o2-console-serial").to_string(),
+    }
+}
+
 fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) -> ConfigAction {
     let mut action = ConfigAction::None;
     ui.heading(t!("config-tab-general"));
@@ -217,17 +230,26 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
                 ui.selectable_value(&mut cfg.machine.profile, p, p.label());
             }
         });
-    // GR2 Extreme is Indigo2-only; moving to Indy keeps the closest board
-    // rather than leaving a config `validate()` would reject at Start.
+    // GR2 Extreme is Indigo2-only, and the O2 has no GIO bus at all: moving
+    // to a profile that cannot host the current board falls back to that
+    // profile's own display rather than leaving a config `validate()` would
+    // reject at Start.
     if !cfg.graphics.board.supports(cfg.machine.profile) {
-        cfg.graphics.board = GraphicsBoard::Xz;
+        cfg.graphics.board = cfg.machine.profile.default_graphics_board();
     }
-    // Only IP28 can express 256/512 MB banks. Clamp them when switching to
-    // IP22/IP24 so the new profile passes `validate()` at Start.
-    if cfg.machine.profile != MachineProfile::Indigo2Ip28 {
-        for bank in &mut cfg.banks {
-            if *bank > 128 { *bank = 128; }
+    // Only IP28 can express 256/512 MB banks, and CRIME can only express
+    // 32/128 MB DIMMs. Clamp to the profile's own sizes so the new profile
+    // passes `validate()` at Start.
+    let bank_sizes = cfg.machine.profile.valid_bank_sizes();
+    let max_bank = bank_sizes.iter().max().copied().unwrap_or(128);
+    for bank in &mut cfg.banks {
+        if !bank_sizes.contains(bank) {
+            *bank = max_bank;
         }
+    }
+    // The O2's firmware has no R4400.
+    if !cfg.machine.cpu.supports(cfg.machine.profile) {
+        cfg.machine.cpu = cfg.machine.profile.default_cpu();
     }
     subtitle(ui, t!("config-platform-subtitle"));
     subtitle(ui, t!("config-viewport-subtitle"));
@@ -241,6 +263,26 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             .color(Color32::from_rgb(220, 170, 90))
             .small(),
         );
+    }
+    if cfg.machine.profile.ip32() {
+        // The O2's `console` is the one knob the emulator has to fake, since
+        // flash persistence is not emulated yet (docs/o2-ip32.md §2.2) — the
+        // PROM reads its env out of the image we hand it.
+        ui.horizontal(|ui| {
+            ui.label(t!("config-o2-console"));
+            ComboBox::from_id_salt("o2_console")
+                .selected_text(console_label(cfg.machine.console()))
+                .show_ui(ui, |ui| {
+                    for c in [ConsoleDevice::Serial, ConsoleDevice::Graphics] {
+                        let enabled = c != ConsoleDevice::Graphics || mem_ctx.gbe_ready;
+                        ui.add_enabled_ui(enabled, |ui| {
+                            ui.selectable_value(&mut cfg.machine.console, Some(c), console_label(c))
+                                .on_disabled_hover_text(t!("config-o2-console-graphics-pending"));
+                        });
+                    }
+                });
+        });
+        subtitle(ui, t!("config-o2-console-subtitle"));
     }
         ui.heading(t!("config-processor"));
     Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
@@ -614,16 +656,17 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
         subtitle(ui, t!("config-ram-subtitle"));
     }
     let ip28_banks = cfg.machine.profile.ip28();
+    let bank_sizes = cfg.machine.profile.valid_bank_sizes();
     ui.add_space(4.0);
     ui.label(t!("config-ram-presets"));
     ui.horizontal_wrapped(|ui| {
-        for &p in ram_presets(ip28_banks) {
+        for &p in ram_presets(cfg.machine.profile) {
             if ui
                 .add_enabled(!mem_ctx.running, egui::Button::new(t!("config-megabytes", size = p)))
                 .on_disabled_hover_text(t!("config-ram-locked"))
                 .clicked()
             {
-                cfg.banks = crate::dialogs::new_machine::distribute_ram(p, ip28_banks);
+                cfg.banks = crate::dialogs::new_machine::distribute_ram(p, bank_sizes);
             }
         }
     });
@@ -641,7 +684,7 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
                 ComboBox::from_id_salt(("bank", i)).selected_text(t!("config-megabytes", size = cur))
                     .show_ui(ui, |ui| {
                         for &sz in VALID_BANK_SIZES {
-                            ui.add_enabled_ui(sz <= 128 || ip28_banks, |ui| {
+                            ui.add_enabled_ui(bank_sizes.contains(&sz), |ui| {
                                 ui.selectable_value(&mut cfg.banks[i], sz, t!("config-megabytes", size = sz))
                                     .on_disabled_hover_text(t!("config-ram-bank-ip28-only"));
                             });

@@ -1,0 +1,61 @@
+# iris-o2.toml — SGI O2 (IP32) configuration.
+#
+# A starting point, not a required file: `iris --o2` picks the same profile
+# and the same defaults from the command line. See docs/o2-ip32.md for what
+# the machine is and how far the emulation has got.
+#
+# The O2 is not an Indy/Indigo2 variant: CRIME + MACE, no HPC3, no IOC2, no
+# MC and no GIO bus. Its display is the integrated GBE, and its firmware has
+# no R4400 — an O2 shipped with an R5000, an RM7000 or an R10000.
+
+# RAM. The O2 has four DIMM slots and CRIME expresses only 32 MB and 128 MB
+# parts; an 8 × 128 MB (1 GB) machine is not modelled yet. 512 MB, four 128s.
+banks = [128, 128, 128, 128]
+
+# PROM ROM image. Leave empty to use the embedded IP32 revision 4.18 image —
+# the same unmodified 512 KB flash every O2 shipped with.
+prom = ""
+
+# Serial console. Channel A is MACE UART 1 (the O2's `console=d` port), and
+# `--serial-log` mirrors what the guest prints into a file, which is the
+# easiest way to watch the PROM come up.
+serial_port_a = 8880
+# serial_log = "o2-console.log"
+
+# The O2's Ethernet is a MAC110 inside MACE, reached through MACE's PCI
+# bridge; the disk behind it is an AIC-7880 on the same bridge. Both land
+# later in the bring-up (docs/o2-ip32.md §7 steps 6 and 7), so today the
+# machine has no disk and no network.
+scsi = {}
+
+# Scale and window. GBE has no framebuffer yet, so there is nothing to scale.
+scale = 1
+headless = true
+
+# The O2 (IP32) profile. `iris --o2` sets the same thing.
+[machine]
+profile = "o2_ip32"
+cpu = "r5000"
+cache = "auto"
+
+# Which console the firmware starts on.
+#
+# On real hardware this is the `console` environment variable, which lives in
+# the PROM's own flash and is changed with `setenv`. Flash persistence is not
+# emulated yet, so instead this seeds the env segment of the loaded PROM image
+# before the CPU starts — the emulator's equivalent of a machine someone
+# already ran `setenv console=d` on.
+#
+#   serial   — MACE UART 1, at the `serial_port_a` TCP port above. The O2's
+#              `console=d`. This is what works today.
+#   graphics — the GBE console. The O2's default (`console=g`) and what a real
+#              O2 boots into, but GBE is not emulated yet, so choosing it is
+#              refused with an explanation rather than booting into a black
+#              window.
+console = "serial"
+
+# The O2's display is the GBE inside CRIME — there is no GIO slot to put a
+# board in, so this is the only board the O2 can have. The Indy/Indigo2
+# boards (Newport, XZ, IMPACT) are rejected here with an explanation.
+[graphics]
+board = "gbe"
