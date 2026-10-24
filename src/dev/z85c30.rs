@@ -503,6 +503,11 @@ impl TcpSocketBackend {
             if socket.set_nonblocking(true).is_err() {
                 continue;
             }
+            // The console is latency-sensitive: without TCP_NODELAY, Nagle
+            // holds a keystroke or a log line back until the previous
+            // segment is acked, which shows up as a stutter on every
+            // interaction. Set it on accept, before any byte is written.
+            let _ = socket.set_nodelay(true);
             let mut c = TcpConn { stream: socket, telnet: crate::net::telnet::TelnetFilter::new() };
             if c.stream.write_all(&crate::net::telnet::TelnetFilter::initial_handshake()).is_ok() {
                 conns.push(c);
