@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use crate::traits::{BusRead32, BusRead64};
+use crate::traits::{BusRead32, BusRead64, Resettable};
 use super::*;
 use crate::test_board::TestBoard;
 
@@ -26,6 +26,22 @@ use crate::test_board::TestBoard;
 /// default Rust test thread stack (2MB), and Rex3Context now embeds the 1 MiB HOSTRW
 /// data-port array, which construction moves through several temporaries.
 fn make_rex3() -> TestBoard<Rex3> {
+    let rex = make_rex3_unstarted();
+    rex.start();
+    rex
+}
+
+/// `make_rex3` without `start()`: no processor and no refresh thread, so every
+/// bus write stays in the GFIFO until the test looks at it.
+///
+/// Tests that inspect queue depth or STATUS need the consumer to be absent —
+/// with it running, a queue of one entry drains before the status read lands
+/// and the observation is a race. `TestBoard::drop` still calls `stop()`, which
+/// pushes a shutdown sentinel with the *blocking* `GFifo::push`; a test that
+/// fills the queue must therefore reset it before returning (see
+/// `FifoResetGuard`) or the drop would spin forever on a full queue with no
+/// consumer left to drain it.
+fn make_rex3_unstarted() -> TestBoard<Rex3> {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
@@ -43,13 +59,53 @@ fn make_rex3() -> TestBoard<Rex3> {
             }
             #[cfg(feature = "rex-jit")]
             rex.jit_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
-            let rex = TestBoard::new(Arc::<Rex3>::from(rex));
-            rex.start();
-            rex
+            TestBoard::new(Arc::<Rex3>::from(rex))
         })
         .expect("spawn")
         .join()
-        .expect("make_rex3 thread panicked")
+        .expect("make_rex3_unstarted thread panicked")
+}
+
+/// Run `f` on a thread with the same 64 MB stack the construction helpers use.
+///
+/// `Rex3Context` is over a megabyte (the HOSTRW data port alone is 1 MiB) and
+/// `Resettable::power_on` assigns a freshly built one — twice, counting the
+/// temporary — which overflows the 2 MB default Rust test thread stack.
+fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn")
+        .join()
+        .expect("big-stack test thread panicked")
+}
+
+/// A freshly reset, running Rex3. The order mirrors `Machine::reset`:
+/// power-on with the threads stopped, then start.
+///
+/// The order is not just about stack depth. `power_on` replaces the whole
+/// context, including the `host` back-pointer that `start()` installs; calling
+/// it on a running board instead leaves the draw path with a null device and
+/// every primitive silently does nothing.
+fn make_rex3_reset() -> TestBoard<Rex3> {
+    let rex = with_big_stack(|| {
+        let rex = make_rex3_unstarted();
+        rex.power_on();
+        rex
+    });
+    rex.start();
+    rex
+}
+
+/// Empties the GFIFO when it goes out of scope, including on an assertion
+/// failure. `GFifo::reset` may only be called with the consumer stopped, which
+/// is exactly the state `make_rex3_unstarted` leaves the board in.
+struct FifoResetGuard<'a>(&'a Rex3);
+
+impl Drop for FifoResetGuard<'_> {
+    fn drop(&mut self) {
+        self.0.gfifo.reset();
+    }
 }
 
 // Compute the SET address (no GO bit) for a register offset.
@@ -110,6 +166,29 @@ fn read_reg(rex: &Rex3, offset: u32) -> u32 {
         }
         std::hint::spin_loop();
     }
+}
+
+/// Read STATUS *without* the idle gate `read_reg` imposes.
+///
+/// The point of reading STATUS is usually to see a queue that is not idle, so
+/// waiting for it first would hide the very state under test. STATUS itself is
+/// never gated behind `busy_or_val!`; the retry loop is here only because the
+/// rest of this harness treats a transient busy as a retry, and a panic on one
+/// would turn a queue race into a bogus failure.
+fn read_status_now(rex: &Rex3) -> u32 {
+    loop {
+        let r: BusRead32 = rex.read32(set_addr(REX3_STATUS));
+        if r.is_ok() { return r.data; }
+        if r.status != crate::traits::BUS_BUSY {
+            panic!("read_status_now: bad status {:#x}", r.status);
+        }
+        std::hint::spin_loop();
+    }
+}
+
+/// The `GFIFOLEVEL` field of a STATUS value.
+fn gfifo_level(status: u32) -> u32 {
+    (status & STATUS_GFIFOLEVEL_MASK) >> STATUS_GFIFOLEVEL_SHIFT
 }
 
 /// Read from HOSTRW0 GO space: returns current word, then triggers next batch.
@@ -5051,6 +5130,29 @@ mod jit_tests {
         rex_jit.stop();
         rex_interp.stop();
     }
+
+    /// RGBMODE must mean the same thing to the Cranelift engine as to the
+    /// interpreter: bit 15 clear is a CI index in the red byte, bit 15 set
+    /// composes all three colour DDAs. The interpreter-only test in the parent
+    /// module pins the pixel values; this one pins the JIT to them.
+    #[test]
+    fn jit_rgbmode_fill_matches_interp() {
+        for rgbmode in [0u32, 1] {
+            let dm1 = DM1_RGB24_PLANES | (rgbmode << 15);
+            compare_jit_interp(0, 0, 15, 0,
+                |rex| {
+                    reg(rex, REX3_DRAWMODE1, dm1);
+                    reg(rex, REX3_WRMASK,    0xFFFFFF);
+                    reg(rex, REX3_COLORRED,  0x80 << 11);
+                    reg(rex, REX3_COLORGRN,  0x40 << 11);
+                    reg(rex, REX3_COLORBLUE, 0x20 << 11);
+                    reg(rex, REX3_XYENDI,    xy(15, 0));
+                    reg(rex, REX3_XYSTARTI,  xy(0, 0));
+                },
+                DM0_DRAW_BLOCK, dm1,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7753,5 +7855,260 @@ fn test_span_end_leaves_y_and_x_past_end() {
             assert_eq!(read_pixel(rex, px, 20) & 0xFF, 3, "jit={jit}: ({px}, 20) not drawn");
         }
         assert_eq!(read_pixel(rex, 42, 20) & 0xFF, 0, "jit={jit}: masked chunk drew");
+    }
+}
+
+// ============================================================================
+// Hardware conformance: RGBMODE and GFIFO depth
+//
+// Two behaviours the OS REX3 driver depends on. Both are pinned here against
+// the emulator's public register interface, and the places where IRIS is more
+// forgiving than a real Indy are recorded in docs/Indy/rex3.md
+// ("Where IRIS diverges from real hardware"). A change to either side should
+// fail a test here rather than show up as an OS-only bug.
+// ============================================================================
+
+/// `DRAWMODE1.PLANES=RGB`, 24bpp, with the caller's LOGICOP/COMPARE.
+const DM1_RGB24_PLANES: u32 = DRAWMODE1_PLANES_RGB
+    | (DRAWMODE1_DRAWDEPTH_24 << 3)
+    | DRAWMODE1_COMPARE_DISABLE_SH
+    | DRAWMODE1_LOGICOP_SRC_SH;
+
+/// Fill a 16x1 block at the top-left in 24bpp and return the pixel written.
+///
+/// Colour registers are written *after* DRAWMODE1 because the write format of
+/// COLORRED depends on RGBMODE and DRAWDEPTH (spec Table 7): in 12-bit CI mode
+/// the bus value is o12.9 and gets shifted, in RGB mode it is a component.
+fn fill_24bpp_and_sample(rex: &Rex3, dm1: u32) -> u32 {
+    reg(rex, REX3_DRAWMODE1, dm1);
+    reg(rex, REX3_WRMASK,    0xFFFFFF);
+    // CLIPMODE resets to CIDMATCH=0 (permit nothing), so permit every CID; this
+    // is device setup, not part of the RGBMODE question.
+    reg(rex, REX3_CLIPMODE,  0xF << CLIPMODE_CIDMATCH_SHIFT);
+    reg(rex, REX3_COLORRED,  0x80 << 11);
+    reg(rex, REX3_COLORGRN,  0x40 << 11);
+    reg(rex, REX3_COLORBLUE, 0x20 << 11);
+    reg(rex, REX3_XYENDI,    xy(15, 0));
+    reg(rex, REX3_XYSTARTI,  xy(0, 0));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    read_pixel(rex, 0, 0)
+}
+
+/// After reset, DRAWMODE1 is at IRIS's reset value, not the hardware's.
+///
+/// The spec's Table 11 init column has PLANES=001, RGBMODE=1, FASTCLEAR=1 and
+/// LOGICOP=SRC. IRIS resets to PLANES=NONE, RGBMODE=0, FASTCLEAR=0,
+/// LOGICOP=ZERO, keeping only COMPARE=0x7 (afunction disabled). That is a
+/// deliberate, documented divergence: software must program DRAWMODE1 after a
+/// reset, and this test pins both the register value and its consequence — a
+/// draw attempted before that programming writes nothing at all.
+#[test]
+fn reset_leaves_drawmode1_planes_disabled() {
+    let rex = &make_rex3_reset();
+
+    assert_eq!(read_reg(rex, REX3_DRAWMODE1), 0x7000,
+        "reset DRAWMODE1 should be COMPARE=0x7 and nothing else");
+    assert_eq!(read_reg(rex, REX3_WRMASK), 0,
+        "reset WRMASK should be 0");
+
+    // Program everything except DRAWMODE1: colour, write mask, CID permit
+    // and geometry are all valid, so only PLANES=NONE can stop the write.
+    // (CLIPMODE must be programmed too — it also resets to "permit no CIDs",
+    // which on its own would refuse every pixel.)
+    reg(rex, REX3_WRMASK,    0xFFFFFF);
+    reg(rex, REX3_CLIPMODE,  0xF << CLIPMODE_CIDMATCH_SHIFT);
+    reg(rex, REX3_COLORRED,  0xFF << 11);
+    reg(rex, REX3_COLORGRN,  0xFF << 11);
+    reg(rex, REX3_COLORBLUE, 0xFF << 11);
+    reg(rex, REX3_XYENDI,    xy(7, 0));
+    reg(rex, REX3_XYSTARTI,  xy(0, 0));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    for x in 0..8 {
+        assert_eq!(read_pixel(rex, x, 0), 0,
+            "PLANES=NONE must not write the framebuffer (x={x})");
+    }
+}
+
+/// A 24bpp RGB fill needs `DRAWMODE1` bit 15 (RGBMODE) *as well as*
+/// PLANES=RGB. Bit 15 clear is CI mode, where the shader is a single index
+/// taken from COLORRED: COLORGRN and COLORBLUE never contribute, and the index
+/// is written as the 24-bit value itself — which, in the BGR pixel layout,
+/// puts it in the red byte and clears green and blue.
+///
+/// This is the behaviour the OS driver depends on: forgetting the bit turns a
+/// white fill into a red one. IRIS matches the hardware here rather than being
+/// permissive; the test proves the bit is load-bearing in both directions.
+#[test]
+fn rgb24_fill_needs_rgbmode_as_well_as_rgb_planes() {
+    let rex = &make_rex3_reset();
+
+    // CI mode: planes says RGB, but RGBMODE is clear.
+    let ci_pixel = fill_24bpp_and_sample(rex, DM1_RGB24_PLANES);
+    assert_eq!(ci_pixel & 0xFFFFFF, 0x000080,
+        "RGBMODE=0 must write the CI index into the red byte only, not compose RGB");
+    // The same index is what COLORI reads back in this mode: one colour
+    // register, no green or blue.
+    assert_eq!(read_reg(rex, REX3_COLORI), 0x000080,
+        "CI-mode COLORI should be the COLORRED index alone");
+
+    // RGB mode: the same three colour registers now compose a 24-bit pixel.
+    let rgb_pixel = fill_24bpp_and_sample(rex, DM1_RGB24_PLANES | (1 << 15));
+    assert_eq!(rgb_pixel & 0xFFFFFF, 0x204080,
+        "RGBMODE=1 must compose blue<<16 | green<<8 | red");
+    assert_eq!(read_reg(rex, REX3_COLORI), 0x204080,
+        "RGB-mode COLORI should compose all three channels");
+
+    // Every pixel of the block, not just the first: a bug that only the first
+    // pixel of a primitive sees would otherwise pass.
+    for x in 0..16 {
+        assert_eq!(read_pixel(rex, x, 0) & 0xFFFFFF, 0x204080,
+            "RGB-mode fill pixel x={x}");
+    }
+}
+
+/// The emulated GFIFO is 65536 entries deep (65535 live), not the hardware's
+/// 32, and STATUS reports only the last 32 slots of it.
+///
+/// Pins all three facts a driver can observe: the queue accepts 65535 writes
+/// with no consumer running; GFIFOLEVEL is 1 for every non-empty depth below
+/// `GFIFO_DEPTH - GFIFO_HW_DEPTH`, then counts up to 31 at the brim; and
+/// overflow is back-pressure (BUS_BUSY, the write is refused and retried)
+/// rather than the hardware's silent drop at level 32.
+#[test]
+fn status_reports_only_the_last_32_fifo_slots() {
+    let rex = &make_rex3_unstarted();
+    // Leave the queue empty even if an assertion below fires: TestBoard::drop
+    // pushes a shutdown sentinel with a blocking push and there is no consumer.
+    let _reset = FifoResetGuard(rex);
+
+    let s = read_status_now(rex);
+    assert_eq!(s & STATUS_GFXBUSY, 0, "empty GFIFO must read idle");
+    assert_eq!(gfifo_level(s), 0, "empty GFIFO must read level 0");
+
+    // One queued entry is enough to set GFXBUSY: the spec defines the bit as
+    // "graphics pipeline not idle or GFIFO not empty".
+    assert_eq!(rex.write32(set_addr(REX3_WRMASK), 0xFF), BUS_OK);
+    let s = read_status_now(rex);
+    assert_ne!(s & STATUS_GFXBUSY, 0, "one queued entry must read busy");
+    assert_eq!(gfifo_level(s), 1, "one queued entry must read level 1");
+
+    // Fill past a real 32-entry FIFO's capacity many times over. IRIS accepts
+    // every write and still reports level 1, because only its last 32 slots
+    // are visible in the 6-bit field.
+    let mut pending = 1usize;
+    let visible_from = GFIFO_DEPTH - GFIFO_HW_DEPTH; // 65504
+    while pending < visible_from + 1 {
+        assert_eq!(rex.write32(set_addr(REX3_WRMASK), 0xFF), BUS_OK,
+            "write {pending} must be accepted");
+        pending += 1;
+    }
+    // 65505 entries: pending - visible_from is 1, so the level still reads 1.
+    assert_eq!(gfifo_level(read_status_now(rex)), 1,
+        "level stays 1 until the emulated ring is within 32 slots of full");
+
+    // One more entry and the level starts counting upwards.
+    assert_eq!(rex.write32(set_addr(REX3_WRMASK), 0xFF), BUS_OK);
+    pending += 1;
+    assert_eq!(gfifo_level(read_status_now(rex)), 2,
+        "the level counts only once the ring is inside the last 32 slots");
+
+    while rex.write32(set_addr(REX3_WRMASK), 0xFF) == BUS_OK {
+        pending += 1;
+        assert!(pending < GFIFO_DEPTH,
+            "the ring must refuse a write at DEPTH-1, not wrap");
+    }
+    assert_eq!(pending, GFIFO_DEPTH - 1,
+        "a DEPTH-entry ring holds DEPTH-1 entries (one empty slot distinguishes full from empty)");
+    assert_eq!(gfifo_level(read_status_now(rex)), 31,
+        "the visible level tops out at 31, not the hardware's 32");
+    assert_eq!(rex.gfifo.len(), GFIFO_DEPTH - 1);
+
+    // Overflow is back-pressure, not data loss: the refused write is still
+    // owed to the caller (the CPU re-executes the store on BUS_BUSY).
+    assert_eq!(rex.write32(set_addr(REX3_WRMASK), 0xFF), BUS_BUSY);
+    assert_eq!(rex.gfifo.len(), GFIFO_DEPTH - 1, "a refused write must not be queued");
+}
+
+/// The GFIFO threshold interrupt is not modelled.
+///
+/// The spec has GFIFOLEVEL compared against CONFIG GFIFODEPTH, raising the
+/// sticky STATUS.GFIFO_INT and stalling the bus with GRXDLY above it. IRIS
+/// stores the CONFIG fields and reports the level, but never raises the
+/// interrupt and never stalls. A driver that *only* waits for GFIFO_INT instead
+/// of polling GFXBUSY would therefore hang here.
+///
+/// This is a documented divergence (docs/Indy/rex3.md); if the interrupt is
+/// ever wired up, this test is the reminder to change the documentation too.
+#[test]
+fn fifo_threshold_interrupt_stays_clear() {
+    let rex = &make_rex3_unstarted();
+    let _reset = FifoResetGuard(rex);
+
+    let config = (1 << CONFIG_GFIFODEPTH_SHIFT) | CONFIG_GFIFOABOVEINT;
+    assert_eq!(rex.write32(set_addr(REX3_CONFIG), config), BUS_OK);
+    assert_eq!(read_reg(rex, REX3_CONFIG) & 0x3FFF, config,
+        "CONFIG should at least store the threshold fields");
+
+    for _ in 0..8 {
+        assert_eq!(rex.write32(set_addr(REX3_WRMASK), 0xFF), BUS_OK);
+    }
+    let s = read_status_now(rex);
+    assert_ne!(s & STATUS_GFXBUSY, 0);
+    assert_eq!(s & STATUS_GFIFO_INT, 0,
+        "IRIS does not raise GFIFO_INT; a level-based wait would hang (see docs/Indy/rex3.md)");
+}
+
+/// Back-to-back fills with no STATUS poll in between all land, in order.
+///
+/// This is the driver-visible half of the shallow-FIFO divergence: a real
+/// 32-entry FIFO needs a drain between bursts of primitives, IRIS's 65536-entry
+/// ring does not. The test offers 384 queue entries (64 fills of six writes
+/// each) with no `wait_idle` and no STATUS read, then drains once and checks
+/// every row separately — a dropped or reordered entry shows up as a wrong row,
+/// not just a missing pixel. `reg_go` (the `REX3WAIT(REX)` equivalent in the
+/// SGI diagnostics) is deliberately not used in the loop; `wait` once at the end
+/// is the whole drain.
+///
+/// Note what this does *not* prove: `w32` retries on BUS_BUSY the way the CPU
+/// does, so this would still pass if the ring shrank to 32 entries with correct
+/// back-pressure. `status_reports_only_the_last_32_fifo_slots` pins the depth.
+#[test]
+fn back_to_back_fills_need_no_status_poll() {
+    let rex = &make_rex3();
+    rex3init(rex);
+
+    const ROWS: i32 = 64;
+    const WIDTH: i32 = 32;
+
+    reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+    reg(rex, REX3_WRMASK,    0xFFFFFF);
+
+    for row in 0..ROWS {
+        // A different red value per row, so a row drawn with another row's
+        // colour (or not at all) is visible.
+        reg(rex, REX3_COLORRED,  (row as u32 * 4) << 11);
+        reg(rex, REX3_COLORGRN,  0x80 << 11);
+        reg(rex, REX3_COLORBLUE, 0x40 << 11);
+        reg(rex, REX3_XYSTARTI,  xy(0, row));
+        reg(rex, REX3_XYENDI,    xy(WIDTH - 1, row));
+        // GO with no wait and no STATUS read in between.
+        w32(rex, go_addr(REX3_DRAWMODE0), DM0_DRAW_BLOCK);
+    }
+
+    // One drain at the end of the whole burst.
+    wait(rex);
+
+    // The drain really finished: the REX3WAIT-equivalent state is idle.
+    let s = read_status_now(rex);
+    assert_eq!(s & STATUS_GFXBUSY, 0, "GFXBUSY must clear once the burst drains");
+    assert_eq!(gfifo_level(s), 0, "GFIFOLEVEL must be 0 once the burst drains");
+
+    for row in 0..ROWS {
+        let expected = (0x40u32 << 16) | (0x80 << 8) | (row as u32 * 4);
+        for x in 0..WIDTH {
+            assert_eq!(read_pixel(rex, x, row) & 0xFFFFFF, expected,
+                "row {row} x={x} after a {ROWS}-fill burst with no poll");
+        }
     }
 }

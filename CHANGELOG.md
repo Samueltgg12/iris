@@ -13,6 +13,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Newport (REX3)
+
+- **Conformance tests for RGBMODE and the command FIFO.** A 24-bit RGB fill
+  needs `DRAWMODE1` bit 15 as well as the RGB plane selection; fills issued
+  back to back are accepted without polling because the emulated FIFO is much
+  deeper than the hardware's and back-pressures rather than dropping writes at
+  its brim. Both behaviours, and the deliberate divergences from a real REX3
+  (reset values, visible `GFIFOLEVEL` only for the last 32 slots, no FIFO
+  threshold interrupt), are now pinned by tests and recorded in
+  `docs/Indy/rex3.md`.
+
 ### NAT gateway
 
 - **Gateway replies no longer wait for a poll tick.** A reply to a guest
