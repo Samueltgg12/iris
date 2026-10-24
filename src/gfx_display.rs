@@ -22,6 +22,13 @@ pub trait GfxDisplay: Send + Sync {
     /// Ask the display thread to read the next frame back into `screen().rgba`.
     fn request_screenshot(&self);
 
+    /// True while a [`request_screenshot`](Self::request_screenshot) readback is
+    /// still pending. Callers wait for this to clear (bounded) so they copy the
+    /// requested frame rather than the one that happened to be current. The
+    /// default is `false`: a board that does not consume the request has
+    /// nothing to wait for.
+    fn screenshot_pending(&self) -> bool { false }
+
     /// CPU cycle counter the board was wired to (GUI's live MIPS estimate).
     fn cycles(&self) -> CyclesPtr;
 }

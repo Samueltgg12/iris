@@ -13,6 +13,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### CI and automation
+
+- **`iris-ci screenshot` produces the guest screen in `--ci`.** A `--ci`
+  instance installs no front-end renderer, so nothing filled the readback
+  buffer and every screenshot came out black. The command now waits for the
+  frame it requested instead of sampling whatever was current, and composites
+  the guest screen from the display caches when no renderer is present. With
+  a GUI renderer attached it still returns the readback that renderer
+  produced. (`src/ci.rs`, `src/gfx_display.rs`)
 ### SGI O2 (IP32)
 
 - **A new machine: the SGI O2.** `[machine] profile = "o2_ip32"` with an `[o2]`

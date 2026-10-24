@@ -4865,6 +4865,7 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
     fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
+    fn screenshot_pending(&self) -> bool { self.screenshot_pending.load(Ordering::Relaxed) }
     fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.cycles.get() }
 }
 
