@@ -15,6 +15,29 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### JIT v2
 
+- **FPU integer conversions are compiled inline.** `CVT.W/L.S/D`,
+  `ROUND/TRUNC/CEIL/FLOOR.W/L.S/D` and the reverse `CVT.S/D.W/L` each emitted
+  a `call_indirect` into the interpreter's own conversion helper, so a guest
+  conversion cost 17-19 ns against 3.1 ns for the already-inline `cvt.d.s`
+  widening (and 8.9 ns for `cvt.s.d`, which still calls out). The common
+  case now compiles to a rounding step, the saturation cast and one Cause
+  store: RN-even rounding for the two dynamic-rounding instructions is an
+  add/subtract of a format-sized power of two in the source's sign direction
+  (only under `FCSR.RM == 0`, which is the only case where host MXCSR is
+  known to hold nearest-even), the fixed-mode instructions keep the existing
+  mode-independent bit manipulation. NaN, infinities, out-of-range values,
+  every other rounding mode and every Invalid/Inexact trap still branch to
+  the unchanged callout, so the exception model is the interpreter's own.
+  Per compiled instruction on an R4400 with `--cache shadow`: `cvt.w.s`
+  17.5 -> 6.4 ns, `cvt.l.d` 18.5 -> 6.7, `cvt.w.d` 18.6 -> 7.0,
+  `cvt.l.s` 18.6 -> 6.1, `trunc.w.s` 17.1 -> 8.9, `cvt.s.w` 8.6 -> 5.0,
+  `cvt.d.w` 7.2 -> 4.7, `cvt.s.l` 8.2 -> 5.1, `cvt.d.l` 7.7 -> 4.9;
+  the untouched `cvt.s.d` control is unchanged at 8.7-8.9. The equivalence
+  suite pins the whole core snapshot, `fpu_fcsr` included, across the range
+  edges, all four rounding modes, both FR modes and the enable-bit/trap
+  paths. (`src/cpu/jitv2/codegen.rs`) (Motivation and the A/B kernel method:
+  ranked recommendation 5 of
+  [Jupiter Belic's irix7/iris performance study](https://github.com/irix7/iris/blob/510adc5/clanker/perf/mem-and-fpu-hot-paths.md).)
 - **FP arithmetic skips the exception model for ordinary operands.** A guest
   `fadd.s` in a jitv2 build emitted about 106 x86 instructions for the model
   around one `vaddss`. Two ordinary finite operands — a biased exponent that

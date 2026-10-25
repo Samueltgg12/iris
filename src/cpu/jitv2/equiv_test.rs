@@ -6220,6 +6220,189 @@ mod tests {
         cvt_from_int_case(crate::cpu::mips_isa::FUNCT_FCVT_D, crate::cpu::mips_isa::RS_L, -123456789);
     }
 
+    // ---- CP1 conversions: inline fast-path edge and flag coverage ------
+    //
+    // The conversions used to be a callout into the interpreter's own
+    // `cvt_to_int_and_commit`/`cvt_int_to_float_and_commit`, so agreement was
+    // structural. `emit_fcvt_to_int`/`emit_fcvt_from_int` now inline the
+    // common path and keep the callout for what they cannot prove; these
+    // tests pin the *whole* core snapshot — `fpu_fcsr` included, with no
+    // flag mask — against the interpreter across the fast path, the callout
+    // fallbacks, both FR modes, all four FCSR rounding modes, and the
+    // enable-bit/trap paths.
+    //
+    // fs is rd=2 and fd is sa=4 in every encoding below, which addresses
+    // fpr[2]/fpr[4] identically in FR=0 (even slot, low word for W) and FR=1.
+
+    /// Values that bracket every branch of the to-int path: in range, the
+    /// four boundary values the identical range test turns on (including
+    /// +2^31, which `i32::MAX as f32` rounds up to and which the interpreter
+    /// therefore admits), values just outside them, subnormals, NaN and both
+    /// infinities.
+    const CVT_TO_INT_EDGES: &[f64] = &[
+        0.0, -0.0, 0.25, -0.25, 0.5, -0.5, 0.999_999_9, -0.999_999_9,
+        1.0, -1.0, 1.5, -1.5, 2.5, -2.5, 3.5, -3.5, 3.7, -3.7,
+        8_388_608.0, 8_388_609.0, 16_777_216.0, 16_777_217.0,
+        2_147_483_520.0, 2_147_483_647.0, 2_147_483_648.0,
+        -2_147_483_648.0, -2_147_483_649.0,
+        1.0e20, -1.0e20, 9_223_372_036_854_775_808.0, -9_223_372_036_854_775_808.0,
+        9_223_372_036_854_774_784.0, -9_223_372_036_854_774_784.0,
+        1.4e-45, -1.4e-45, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+    ];
+
+    fn cvt_to_int_exact_case(funct: u32, fmt: u32, fs_val: f64, fr1: bool, fcsr: Option<u32>) {
+        let mut fpr = [0u64; 32];
+        fpr[2] = if fmt == crate::cpu::mips_isa::RS_S {
+            (fs_val as f32).to_bits() as u64
+        } else {
+            fs_val.to_bits()
+        };
+        // Pre-existing destination: a trapping conversion must leave it
+        // untouched, so it must not look like a computed result.
+        fpr[4] = 0xDEAD_BEEF_DEAD_BEEF;
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, 0, 2, 4, funct);
+        assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, fr1, fcsr);
+    }
+
+    #[test]
+    fn cvt_to_int_range_edges_match_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FCVT_L, FUNCT_FCVT_W, RS_D, RS_S};
+        for &v in CVT_TO_INT_EDGES {
+            for fr1 in [false, true] {
+                for fmt in [RS_S, RS_D] {
+                    cvt_to_int_exact_case(FUNCT_FCVT_W, fmt, v, fr1, None);
+                    cvt_to_int_exact_case(FUNCT_FCVT_L, fmt, v, fr1, None);
+                }
+            }
+        }
+    }
+
+    /// ROUND/TRUNC/CEIL/FLOOR pass a fixed rounding mode, so they share the
+    /// inline body but not the FCSR-dynamic mode selection; a half-way value
+    /// distinguishes all four.
+    #[test]
+    fn round_trunc_ceil_floor_edges_match_interpreter() {
+        use crate::cpu::mips_isa::*;
+        for &v in &[0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 3.7, -3.7, 0.0, -0.0, 1.0e20, -1.0e20, f64::NAN] {
+            for fr1 in [false, true] {
+                for fmt in [RS_S, RS_D] {
+                    for funct in [FUNCT_FROUND_W, FUNCT_FTRUNC_W, FUNCT_FCEIL_W, FUNCT_FFLOOR_W] {
+                        cvt_to_int_exact_case(funct, fmt, v, fr1, None);
+                    }
+                    for funct in [FUNCT_FROUND_L, FUNCT_FTRUNC_L, FUNCT_FCEIL_L, FUNCT_FFLOOR_L] {
+                        cvt_to_int_exact_case(funct, fmt, v, fr1, None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// FCSR.RM drives CVT.W/CVT.L directly; all four modes must produce the
+    /// interpreter's result and Cause/Flag bits from the inline rounding.
+    #[test]
+    fn cvt_to_int_all_rounding_modes_match_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FCVT_L, FUNCT_FCVT_W, RS_D, RS_S};
+        for rm in 0u32..4 {
+            for &v in &[0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 3.7, -3.7, -0.7, 1.0e10, -1.0e10] {
+                for fr1 in [false, true] {
+                    for fmt in [RS_S, RS_D] {
+                        cvt_to_int_exact_case(FUNCT_FCVT_W, fmt, v, fr1, Some(rm));
+                        cvt_to_int_exact_case(FUNCT_FCVT_L, fmt, v, fr1, Some(rm));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Invalid with the destination pre-set: Flag.V when EV is clear, a trap
+    /// with the destination untouched when EV is set. The latter is the
+    /// callout path, the former is too (NaN/inf/out-of-range never inline).
+    #[test]
+    fn cvt_to_int_invalid_enable_bits_match_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FCVT_L, FUNCT_FCVT_W, RS_D, RS_S};
+        for &v in &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.0e20, -1.0e20] {
+            for &fcsr in &[0x0000_0000u32, 0x0000_0800, 0x0000_0880, 0x0000_0004] {
+                for fmt in [RS_S, RS_D] {
+                    cvt_to_int_exact_case(FUNCT_FCVT_W, fmt, v, true, Some(fcsr));
+                    cvt_to_int_exact_case(FUNCT_FCVT_L, fmt, v, true, Some(fcsr));
+                }
+            }
+        }
+    }
+
+    /// The same snapshot comparison for the to-int fast path with a dirty
+    /// FCSR: a stale sticky Flag set and a stale Cause set must be handled
+    /// (Flag preserved, Cause rewritten) exactly as the interpreter does.
+    #[test]
+    fn cvt_to_int_dirty_fcsr_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FCVT_L, FUNCT_FCVT_W, RS_D, RS_S};
+        for &fcsr in &[0x0000_1004u32, 0x0000_007cu32, 0x0000_1000u32] {
+            for &v in &[1.5, -1.5, 42.0, -42.0] {
+                for fmt in [RS_S, RS_D] {
+                    cvt_to_int_exact_case(FUNCT_FCVT_W, fmt, v, true, Some(fcsr));
+                    cvt_to_int_exact_case(FUNCT_FCVT_L, fmt, v, true, Some(fcsr));
+                }
+            }
+        }
+    }
+
+    fn cvt_from_int_exact_case(funct: u32, fmt: u32, val: i64, fr1: bool, fcsr: Option<u32>) {
+        let mut fpr = [0u64; 32];
+        fpr[2] = if fmt == crate::cpu::mips_isa::RS_W {
+            (val as i32 as u32) as u64
+        } else {
+            val as u64
+        };
+        fpr[4] = 0xDEAD_BEEF_DEAD_BEEF;
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, 0, 2, 4, funct);
+        assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, fr1, fcsr);
+    }
+
+    /// Int→float: exact and inexact values in both widths, both FR modes, and
+    /// every FCSR rounding mode (non-RN takes the callout; RN-even is the
+    /// inline `fcvt_from_sint` path whose host `cvtsi2ss`/`cvtsi2sd` rounding
+    /// is only equivalent under MXCSR's RN-even mode).
+    #[test]
+    fn cvt_from_int_edges_match_interpreter() {
+        use crate::cpu::mips_isa::*;
+        let vals: &[i64] = &[
+            0, 1, -1, 42, -42, 16_777_215, 16_777_216, 16_777_217,
+            2_147_483_647, -2_147_483_648, 2_147_483_648,
+            9_007_199_254_740_991, 9_007_199_254_740_993,
+            i64::MAX, i64::MIN, 123_456_789, -123_456_789,
+        ];
+        for &v in vals {
+            for fr1 in [false, true] {
+                for rm in [0u32, 1, 2, 3] {
+                    for (funct, fmt) in [
+                        (FUNCT_FCVT_S, RS_W), (FUNCT_FCVT_D, RS_W),
+                        (FUNCT_FCVT_S, RS_L), (FUNCT_FCVT_D, RS_L),
+                    ] {
+                        cvt_from_int_exact_case(funct, fmt, v, fr1, Some(rm));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inexact with Enable.I set must trap with the destination already
+    /// written (unlike the to-int direction), and with it clear must set the
+    /// sticky Flag.I; a dirty Flag must be preserved either way.
+    #[test]
+    fn cvt_from_int_inexact_enable_bits_match_interpreter() {
+        use crate::cpu::mips_isa::*;
+        for &fcsr in &[0x0000_0000u32, 0x0000_0080, 0x0000_0100, 0x0000_1004, 0x0000_007c] {
+            for &v in &[9_007_199_254_740_993i64, i64::MAX, 2_147_483_647, -2_147_483_648] {
+                for fr1 in [false, true] {
+                    cvt_from_int_exact_case(FUNCT_FCVT_S, RS_W, v, fr1, Some(fcsr));
+                    cvt_from_int_exact_case(FUNCT_FCVT_D, RS_W, v, fr1, Some(fcsr));
+                    cvt_from_int_exact_case(FUNCT_FCVT_S, RS_L, v, fr1, Some(fcsr));
+                    cvt_from_int_exact_case(FUNCT_FCVT_D, RS_L, v, fr1, Some(fcsr));
+                }
+            }
+        }
+    }
+
     // ---- CP1: batch F4 compares — C.cond.fmt ------
 
     fn fcc_case(funct: u32, fmt: u32, cc: u32, fs_val: f64, ft_val: f64) {
@@ -7609,5 +7792,91 @@ mod tests {
     fn bne_not_taken_with_busy_delay_slot_skips_to_fallthrough() {
         // bne zero, zero never taken: lands on word 2 after the slot.
         busy_slot_case(make_i(crate::cpu::mips_isa::OP_BNE, 0, 0, 0x40), [0u64; 32], 0xFFFF_FFFF_8000_0008);
+    }
+
+    // ---- CP1 conversion cost probe (diagnostic, not a correctness gate) ----
+    //
+    // Page layout and the compiled-region shape make the guest benchmark
+    // kernels noisy for one-instruction families, so the per-instruction cost
+    // is measured here instead: one region of `N` conversions (destination
+    // registers rotated so the chain is not a single store-forward), called
+    // `REPS` times through the real `JitFn`. The region-entry/exit cost is
+    // common to both builds and identical for every instruction below, so the
+    // A/B ratio is the instruction's own cost. `cargo test --release -p iris
+    // --features lightning,jitv2 --lib cvt_perf_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cvt_perf_probe() {
+        use crate::cpu::mips_isa::*;
+        const N: usize = 128;
+        const REPS: usize = 20_000;
+
+        fn probe(instrs: &[u32], fr1: bool) -> f64 {
+            let mut page = [0u32; ENTRIES_PER_PAGE];
+            page[..instrs.len()].copy_from_slice(instrs);
+            let mut analyzer = Analyzer::new();
+            let (walked, non_empty) = analyzer.walk_bounded(&page, 0, 0, ENTRIES_PER_PAGE as usize);
+            assert!(non_empty, "probe region must not be empty");
+            let mut region = *walked;
+            let mut codegen = Codegen::new();
+            let jit_fn: JitFn = codegen
+                .compile_region(&mut region, 0, fr1, false)
+                .expect("probe instruction must be compilable");
+
+            let mut fpr = [0u64; 32];
+            for (i, slot) in fpr.iter_mut().enumerate() {
+                // Small integer bit patterns: as an L/W source they convert
+                // exactly (the common int->float case), and as an S/D source
+                // they are subnormals that still round to an in-range integer,
+                // so either direction stays on the fast path.
+                *slot = (i as u64) * 3;
+            }
+            let (mut exec, _mem) = fpu_seeded_executor([0u64; 32], fpr, 0xFFFF_FFFF_8000_1000, fr1);
+            exec.core.fpu_fcsr = 0;
+            exec.install_jit_hooks();
+            let core_ptr = &mut exec.core as *mut MipsCore;
+
+            // Warm up (first call faults in the code page).
+            for _ in 0..1_000 { unsafe { jit_fn(core_ptr) }; }
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..REPS { unsafe { jit_fn(core_ptr) }; }
+            let ns = t0.elapsed().as_secs_f64() * 1e9 / (REPS * instrs.len()) as f64;
+            std::mem::forget(codegen);
+            ns
+        }
+
+        fn fill(make: impl Fn(usize) -> u32) -> Vec<u32> {
+            (0..N).map(make).collect()
+        }
+
+        // fd rotated over four registers; fs fixed (to-int) or rotated too
+        // (from-int, so the source values differ).
+        let fds = [4u32, 6, 8, 10];
+        let cases: &[(&str, Vec<u32>)] = &[
+            ("cvt.s.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_S))),
+            ("cvt.d.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_D))),
+            ("cvt.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_W))),
+            ("cvt.l.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_L))),
+            ("cvt.w.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_W))),
+            ("cvt.l.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_L))),
+            ("trunc.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FTRUNC_W))),
+            ("cvt.s.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S))),
+            ("cvt.d.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D))),
+            ("cvt.s.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S))),
+            ("cvt.d.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D))),
+        ];
+
+        let mut best = std::collections::BTreeMap::new();
+        for _ in 0..3 {
+            for (name, instrs) in cases {
+                let ns = probe(instrs, true);
+                let e = best.entry(*name).or_insert(f64::MAX);
+                if ns < *e { *e = ns; }
+            }
+        }
+        for (name, ns) in &best {
+            println!("{:<12} {:8.3} ns/instruction", name, ns);
+        }
     }
 }
