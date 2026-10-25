@@ -81,6 +81,9 @@ pub struct Machine {
     /// When `cfg.ci` is set, the channel-A backend is replaced by this
     /// in-process one so the CI control socket can drive the console.
     ci_serial: Option<Arc<crate::dev::z85c30::CiSerialBackend>>,
+    /// The shared `--serial-log` sink, kept so `stop` can flush a final
+    /// partial line (wall-timestamp mode holds one until its newline).
+    serial_log: Option<Arc<crate::dev::serial_log::SerialLog>>,
     /// Most recent snapshot restored via `ci_restore`. `rollback` reuses this
     /// name as the fallback path if the in-memory checkpoint is absent.
     last_restore: Option<String>,
@@ -360,38 +363,42 @@ impl Machine {
         let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28(), cfg.serial_ports());
         ioc.ps2().set_layout(cfg.keyboard);
 
+        // One sink for both serial paths, so the CI and TCP logs are the same
+        // bytes (timestamps included). Opened once, before any peripheral
+        // `start()` clones the current backend Arc into the RX/TX threads.
+        let serial_log = cfg.serial_log.as_deref().and_then(|path| {
+            match crate::dev::serial_log::SerialLog::open(
+                std::path::Path::new(path),
+                cfg.serial_log_timestamps,
+            ) {
+                Ok(log) => {
+                    eprintln!("iris: serial console mirroring to {}", path);
+                    Some(log)
+                }
+                Err(e) => {
+                    eprintln!("iris: serial_log: failed to open {}: {}", path, e);
+                    None
+                }
+            }
+        });
+
         // CI mode replaces the default TCP backend on channel B (tty1, the
         // SGI serial console) with an in-process backend the control socket
         // drives directly. Channel A (tty2) keeps its default TCP backend.
-        // Must happen before any peripheral `start()` call (which clones the
-        // current backend Arc into the RX/TX threads).
         let ci_serial = if ci_enabled {
             let b = Arc::new(crate::dev::z85c30::CiSerialBackend::new());
-            if let Some(path) = cfg.serial_log.as_deref() {
-                if let Err(e) = b.set_log_file(path) {
-                    eprintln!("iris: serial_log: failed to open {}: {}", path, e);
-                } else {
-                    eprintln!("iris: serial console mirroring to {}", path);
-                }
+            if let Some(log) = &serial_log {
+                b.set_log(log.clone());
             }
             ioc.scc().set_backend_b(b.clone());
             Some(b)
         } else {
             // Non-CI mode: channel B already has its TCP listener on
-            // 127.0.0.1:8881 (or `serial_port_b`).  If --serial-log was passed, wrap it in a
-            // TeeBackend so guest-emitted bytes get mirrored to the file
-            // in addition to whatever client is attached to the TCP socket.
-            if let Some(path) = cfg.serial_log.as_deref() {
+            // 127.0.0.1:8881 (or `serial_port_b`). Wrap it in a TeeBackend so
+            // guest-emitted bytes also reach the file.
+            if let Some(log) = &serial_log {
                 let inner = ioc.scc().backend_b();
-                match crate::dev::z85c30::TeeBackend::new(inner, path) {
-                    Ok(tee) => {
-                        ioc.scc().set_backend_b(Arc::new(tee));
-                        eprintln!("iris: serial console mirroring to {}", path);
-                    }
-                    Err(e) => {
-                        eprintln!("iris: serial_log: failed to open {}: {}", path, e);
-                    }
-                }
+                ioc.scc().set_backend_b(Arc::new(crate::dev::z85c30::TeeBackend::new(inner, log.clone())));
             }
             None
         };
@@ -953,6 +960,7 @@ impl Machine {
             event_rx: Some(event_rx),
             timer_manager,
             ci_serial,
+            serial_log,
             last_restore: None,
             last_restore_checkpoint: None,
             scratch_path,
@@ -1070,6 +1078,8 @@ impl Machine {
         if self.lifecycle != GuestState::Idle {
             self.lifecycle = GuestState::Halted;
         }
+        // A graceful stop must not lose the final partial line.
+        if let Some(log) = &self.serial_log { log.flush(); }
     }
 
     /// The address this Machine's own monitor is serving on, or None when it

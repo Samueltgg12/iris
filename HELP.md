@@ -711,6 +711,7 @@ Automation and debugging
   --ci-socket <PATH>          Socket path (default /tmp/iris.sock)
   --ci-display                With --ci, keep the window
   --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
+  --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
   --monitor-port <PORT>       Monitor TCP port (default 8888)
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)

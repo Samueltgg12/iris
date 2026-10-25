@@ -15,6 +15,7 @@ use std::io::Write as IoWrite;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u8, u8_slice_to_toml, load_u8_slice, hex_u8};
 use crate::devlog::LogModule;
+use crate::dev::serial_log::SerialLog;
 
 pub mod scc_regs {
     pub const WR0: u8 = 0; // Command/Pointer
@@ -368,22 +369,18 @@ impl SerialBackend for NullBackend {
 /// working unchanged.
 pub struct TeeBackend {
     inner: Arc<dyn SerialBackend>,
-    log: Mutex<std::fs::File>,
+    log: Arc<SerialLog>,
 }
 
 impl TeeBackend {
-    pub fn new(inner: Arc<dyn SerialBackend>, path: &str) -> io::Result<Self> {
-        let log = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { inner, log: Mutex::new(log) })
+    pub fn new(inner: Arc<dyn SerialBackend>, log: Arc<SerialLog>) -> Self {
+        Self { inner, log }
     }
 }
 
 impl SerialBackend for TeeBackend {
     fn send_byte(&self, byte: u8) {
-        let mut f = self.log.lock();
-        let _ = f.write_all(&[byte]);
-        let _ = f.flush();
-        drop(f);
+        self.log.write(&[byte]);
         self.inner.send_byte(byte);
     }
     fn recv_byte(&self) -> io::Result<u8> {
@@ -1161,7 +1158,7 @@ pub struct CiSerialBackend {
     /// direction is appended here. Host-injected bytes are echoed by IRIX
     /// anyway, so writing only guest output already captures the full
     /// transcript without duplication.
-    log: Mutex<Option<std::fs::File>>,
+    log: Mutex<Option<Arc<SerialLog>>>,
 }
 
 impl CiSerialBackend {
@@ -1174,15 +1171,10 @@ impl CiSerialBackend {
         }
     }
 
-    /// Open a log file that will receive every guest output byte. Append-only;
-    /// existing contents are preserved. Errors are returned to the caller.
-    pub fn set_log_file(&self, path: &str) -> io::Result<()> {
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        *self.log.lock() = Some(f);
-        Ok(())
+    /// Attach the shared serial-log sink. The caller opens the file (and
+    /// picks the timestamp mode), so the CI and TCP paths write the same bytes.
+    pub fn set_log(&self, log: Arc<SerialLog>) {
+        *self.log.lock() = Some(log);
     }
 
     /// Inject bytes from host to guest (the harness typing on the console).
@@ -1249,9 +1241,8 @@ fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 impl SerialBackend for CiSerialBackend {
     fn send_byte(&self, byte: u8) {
         self.guest_to_host.lock().push(byte);
-        if let Some(f) = self.log.lock().as_mut() {
-            let _ = f.write_all(&[byte]);
-            let _ = f.flush();
+        if let Some(log) = self.log.lock().as_ref() {
+            log.write(&[byte]);
         }
         self.cv.notify_all();
     }

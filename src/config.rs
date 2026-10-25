@@ -1424,6 +1424,11 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_log: Option<String>,
 
+    /// Prefix each completed line of `serial_log` with a UTC ISO-8601 stamp.
+    /// `off` (the default) writes raw bytes, byte-for-byte a transcript.
+    #[serde(default)]
+    pub serial_log_timestamps: crate::dev::serial_log::SerialLogTimestamps,
+
     // --- table / array-of-table fields: must be emitted after all scalars ---
 
     /// SCSI devices keyed by ID 1–7. Missing IDs are not attached.
@@ -1634,6 +1639,7 @@ impl Default for MachineConfig {
             ci_socket: default_ci_socket(),
             ci_display: false,
             serial_log: None,
+            serial_log_timestamps: Default::default(),
             vino: VinoConfig::default(),
             network: NetworkSection::default(),
             mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
@@ -2219,6 +2225,11 @@ pub struct Cli {
     #[arg(long = "serial-log", value_name = "FILE")]
     pub serial_log: Option<String>,
 
+    /// `off` (raw transcript) or `wall`: prefix each completed serial-log
+    /// line with a UTC ISO-8601 timestamp.
+    #[arg(long = "serial-log-timestamps", value_name = "MODE")]
+    pub serial_log_timestamps: Option<crate::dev::serial_log::SerialLogTimestamps>,
+
     /// Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28).
     /// IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50.
     #[arg(long = "clock-fixed-mhz", value_name = "MHZ")]
@@ -2273,6 +2284,7 @@ impl Cli {
         if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); }
         if self.ci_display { cfg.ci_display = true; }
         if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
+        if let Some(mode) = self.serial_log_timestamps { cfg.serial_log_timestamps = mode; }
         if let Some(mhz) = self.clock_fixed_mhz { cfg.clock.fixed_mhz = Some(mhz); }
         // NB: --ci does NOT imply --headless. REX3 stays alive so screenshots
         // work; main.rs simply skips the host window when ci && !ci_display.

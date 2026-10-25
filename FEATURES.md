@@ -160,6 +160,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `mouse_scroll_pixels_per_line` | `40.0` | Host scrolling distance per guest PS/2 detent. |
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
 | `serial_log` | `unset` | Append guest channel-B output (the O2's first serial port); used by CI and GUI serial capture. |
+| `serial_log_timestamps` | `off` | `off` (raw transcript) or `wall`: prefix each completed serial-log line with a UTC ISO-8601 stamp. A partial line is held until its newline and written on stop. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
 
 ### [machine]
