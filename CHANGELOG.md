@@ -13,6 +13,22 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### JIT v2
+
+- **FP arithmetic skips the exception model for ordinary operands.** A guest
+  `fadd.s` in a jitv2 build emitted about 106 x86 instructions for the model
+  around one `vaddss`. Two ordinary finite operands — a biased exponent that
+  is neither zero nor all ones — cannot be denormal or NaN, cannot be a
+  signalling NaN and cannot make DIV divide by zero, so the instruction
+  provably raises no flag: the two operand checks, the by-value flags and the
+  per-instruction Cause store are skipped, and Cause is still cleared
+  whenever it is set. Every special operand (zero, denormal, infinity, NaN,
+  and a negative square root) runs the previous code unchanged, out of line;
+  the interpreter is untouched. Isolated kernels on an R4400 with
+  `--cache shadow`: `fadd.s` 8.2 -> 4.3 ns/op, `fmul.s` 8.2 -> 4.4,
+  `fdiv.s` 8.5 -> 4.2, `fsqrt.d` 6.1 -> 3.5; conversion kernels, which this
+  change does not touch, are unchanged. (`src/cpu/jitv2/codegen.rs`)
+
 ### CI and automation
 
 - **`iris-ci screenshot` produces the guest screen in `--ci`.** A `--ci`

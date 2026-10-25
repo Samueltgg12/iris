@@ -1264,12 +1264,26 @@ mod tests {
     }
 
     fn run_interpreter_fpu(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, fr1: bool) -> CoreSnapshot {
+        run_interpreter_fpu_fcsr(instr, gpr, fpr, pc, fr1, None)
+    }
+
+    /// As above, with `core.fpu_fcsr` seeded to `fcsr` before the instruction
+    /// runs (or left at its initial value when `None`). Needed to test the
+    /// instruction's handling of pre-existing FCSR state — e.g. a Cause field
+    /// left set by an earlier instruction.
+    fn run_interpreter_fpu_fcsr(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, fr1: bool, fcsr: Option<u32>) -> CoreSnapshot {
         let (mut exec, _mem) = fpu_seeded_executor(gpr, fpr, pc, fr1);
+        if let Some(fcsr) = fcsr { exec.core.fpu_fcsr = fcsr; }
         exec.exec(instr);
         CoreSnapshot::capture(&exec.core)
     }
 
     fn run_jit_fpu(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, word_offset: u16, fr1: bool) -> Option<CoreSnapshot> {
+        run_jit_fpu_fcsr(instr, gpr, fpr, pc, word_offset, fr1, None)
+    }
+
+    /// `run_interpreter_fpu_fcsr`'s JIT counterpart.
+    fn run_jit_fpu_fcsr(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, word_offset: u16, fr1: bool, fcsr: Option<u32>) -> Option<CoreSnapshot> {
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[word_offset as usize] = instr;
 
@@ -1284,6 +1298,7 @@ mod tests {
         let (exec, _mem) = fpu_seeded_executor(gpr, fpr, pc, fr1);
         let mut exec = Box::new(exec);
         exec.install_jit_hooks();
+        if let Some(fcsr) = fcsr { exec.core.fpu_fcsr = fcsr; }
 
         unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
         std::mem::forget(codegen);
@@ -1292,12 +1307,20 @@ mod tests {
     }
 
     fn assert_fpu_matches_interpreter(instr: u32, gpr: [u64; 32], fpr: [u64; 32], fr1: bool) {
+        assert_fpu_matches_interpreter_fcsr(instr, gpr, fpr, fr1, None);
+    }
+
+    /// `assert_fpu_matches_interpreter` with `core.fpu_fcsr` seeded before both
+    /// engines run, returning the JIT's snapshot so a test can also pin the
+    /// absolute result rather than only JIT/interpreter agreement.
+    fn assert_fpu_matches_interpreter_fcsr(instr: u32, gpr: [u64; 32], fpr: [u64; 32], fr1: bool, fcsr: Option<u32>) -> CoreSnapshot {
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let word_offset = (pc as u16 / 4) & 0x3FF;
-        let interp = run_interpreter_fpu(instr, gpr, fpr, pc, fr1);
-        let jit = run_jit_fpu(instr, gpr, fpr, pc, word_offset, fr1)
+        let interp = run_interpreter_fpu_fcsr(instr, gpr, fpr, pc, fr1, fcsr);
+        let jit = run_jit_fpu_fcsr(instr, gpr, fpr, pc, word_offset, fr1, fcsr)
             .expect("FPU instruction must be compilable for this test to be meaningful");
         assert_eq!(jit, interp, "JIT and interpreter diverged for instr=0x{:08x} fr1={}", instr, fr1);
+        jit
     }
 
     /// `run_interpreter_fpu`/`run_jit_fpu`'s counterpart for LWC1/LDC1 —
@@ -5434,6 +5457,43 @@ mod tests {
         // match the interpreter's FCSR flag accumulation exactly.
         fbinop_case(crate::cpu::mips_isa::FUNCT_FDIV, crate::cpu::mips_isa::RS_S, 1.0, 0.0);
         fbinop_case(crate::cpu::mips_isa::FUNCT_FDIV, crate::cpu::mips_isa::RS_D, 1.0, 0.0);
+    }
+
+    /// An ordinary-operand arithmetic instruction must rewrite Cause to zero
+    /// even when it raises nothing itself ("the results of only one
+    /// instruction"), and must not disturb the sticky Flag field. Seeded with
+    /// Cause.V|Cause.Z and Flag.V|Flag.I already set and every Enable clear,
+    /// so the JIT takes its "Cause is already set, clear it" arm rather than
+    /// the skip-the-store one, and both engines must agree and deliver the
+    /// flags unchanged.
+    #[test]
+    fn arithmetic_clears_preexisting_cause_and_keeps_sticky_flags() {
+        const FCSR_CAUSE_VZ: u32 = 0x0001_8000;
+        const FCSR_FLAG_VI: u32 = 0x0000_0044;
+        const SEED: u32 = FCSR_CAUSE_VZ | FCSR_FLAG_VI;
+        for fmt in [crate::cpu::mips_isa::RS_S, crate::cpu::mips_isa::RS_D] {
+            for funct in [
+                crate::cpu::mips_isa::FUNCT_FADD,
+                crate::cpu::mips_isa::FUNCT_FSUB,
+                crate::cpu::mips_isa::FUNCT_FMUL,
+                crate::cpu::mips_isa::FUNCT_FDIV,
+            ] {
+                let mut fpr = [0u64; 32];
+                if fmt == crate::cpu::mips_isa::RS_S {
+                    fpr[1] = (1.5f32).to_bits() as u64;
+                    fpr[2] = (2.5f32).to_bits() as u64;
+                } else {
+                    fpr[1] = (1.5f64).to_bits();
+                    fpr[2] = (2.5f64).to_bits();
+                }
+                let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, 2, 1, 3, funct);
+                let jit = assert_fpu_matches_interpreter_fcsr(
+                    instr, [0u64; 32], fpr, true, Some(SEED));
+                assert_eq!(jit.fpu_fcsr, FCSR_FLAG_VI,
+                    "ordinary-operand arithmetic must clear Cause and keep sticky Flags \
+                     (instr=0x{:08x} fmt={} funct={})", instr, fmt, funct);
+            }
+        }
     }
 
     fn funop_case(funct: u32, fmt: u32, fs_val: f64) {
