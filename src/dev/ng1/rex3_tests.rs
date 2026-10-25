@@ -2722,6 +2722,87 @@ mod jit_tests {
         );
     }
 
+    /// IRIX 7's `gfx::init` clears the overlay, popup and CID planes with a
+    /// full-screen 1280x1024 block fill before it touches the rest of the
+    /// display. #108 reported the guest trapping at EPC=0 with the REX3 JIT
+    /// during that clear, so exercise the exact sequence on both engines: the
+    /// JIT must match the interpreter, must not write past the 1280th column,
+    /// must leave the command FIFO idle (the guest's `wait_idle` polls
+    /// STATUS), and must leave the primitive state clean.
+    #[test]
+    fn jit_full_screen_aux_clear_like_irix7() {
+        const SENTINEL: u32 = 0xA5A5_A5A5;
+        let pixel = |x: i32, y: i32| (y as usize * 2048) + x as usize;
+
+        for planes in [DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_CID] {
+            let dm1 = (DM1_RGB24_SRC & !0x7) | planes;
+            let setup = |rex: &Rex3| {
+                unsafe { (*rex.fb_aux.get()).fill(SENTINEL); }
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK, 0x00FF_FFFF);
+                reg(rex, REX3_COLORRED, 0);
+                reg(rex, REX3_COLORGRN, 0);
+                reg(rex, REX3_COLORBLUE, 0);
+                reg(rex, REX3_COLORALPHA, 0);
+                reg(rex, REX3_COLORVRAM, 0);
+                reg(rex, REX3_XYENDI, xy(1279, 1023));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+            };
+
+            let rex_interp = &make_rex3();
+            rex3init(rex_interp);
+            setup(rex_interp);
+            reg_go(rex_interp, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+            let fb_interp = unsafe { (*rex_interp.fb_aux.get()).clone() };
+
+            let rex_jit = &make_rex3_jit();
+            rex3init(rex_jit);
+            setup(rex_jit);
+            wait(rex_jit);
+            let cm = {
+                use crate::dev::ng1::rex3::CLIPMODE_JIT_KEY_MASK;
+                let ctx = unsafe { &*rex_jit.context.get() };
+                ctx.clipmode & CLIPMODE_JIT_KEY_MASK
+            };
+            // First GO triggers compilation and runs on the generic fallback.
+            reg_go(rex_jit, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+            let compiled = rex_jit.rex_jit.as_ref()
+                .map(|jit| jit.wait_compiled(DM0_DRAW_BLOCK, dm1, cm))
+                .unwrap_or(false);
+            assert!(compiled, "REX3 JIT did not compile the aux clear for planes={planes}");
+
+            // Reset and re-run through the freshly compiled shader.
+            unsafe { (*rex_jit.fb_aux.get()).fill(SENTINEL); }
+            rex3init(rex_jit);
+            setup(rex_jit);
+            reg_go(rex_jit, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+            let fb_jit = unsafe { (*rex_jit.fb_aux.get()).clone() };
+            assert_eq!(fb_interp, fb_jit,
+                "aux clear JIT/interp mismatch for planes={planes}");
+
+            for &(x, y) in &[(0, 0), (1279, 0), (0, 1023), (1279, 1023), (640, 512)] {
+                // WRMASK is 0x00FF_FFFF, so the fill clears the 24 plane
+                // bits and leaves the top byte of the sentinel alone.
+                assert_eq!(fb_jit[pixel(x, y)] & 0x00FF_FFFF, 0,
+                    "planes={planes}: screen pixel ({x},{y}) was not cleared");
+            }
+            for &(x, y) in &[(1280, 0), (2047, 0), (1280, 512), (2047, 1023)] {
+                assert_eq!(fb_jit[pixel(x, y)], SENTINEL,
+                    "planes={planes}: the fill wrote outside the 1280-wide screen at ({x},{y})");
+            }
+
+            let status = read_status_now(rex_jit);
+            assert_eq!(status & STATUS_GFXBUSY, 0,
+                "planes={planes}: GFIFO still busy after the fill (guest wait_idle would spin)");
+            assert_eq!(gfifo_level(status), 0,
+                "planes={planes}: GFIFO not drained after the fill");
+            let ctx = unsafe { &*rex_jit.context.get() };
+            assert!(!ctx.mid_primitive,
+                "planes={planes}: the fill left the primitive mid-flight");
+        }
+    }
+
     /// CI8 solid fill block — 8bpp palette mode.
     #[test]
     fn jit_solid_fill_ci8() {
