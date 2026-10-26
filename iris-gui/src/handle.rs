@@ -1,5 +1,6 @@
 use crate::framebuffer::{new_capture_renderer, FrameSink};
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use iris::block_node::BlockNode;
 use iris::config::{MachineConfig, PortForwardConfig};
 use iris::workstation::Workstation;
 use iris::dev::ps2::Ps2Controller;
@@ -561,7 +562,20 @@ fn worker_loop(
                 } else {
                     let overlay = format!("{base}.overlay");
                     if std::path::Path::new(&overlay).exists() {
-                        match iris::cow_disk::CowDisk::new(&base, &overlay).and_then(|mut c| c.commit()) {
+                        let size = std::fs::metadata(&base).map(|m| m.len()).unwrap_or(0);
+                        let commit = (|| -> std::io::Result<usize> {
+                            let backing = iris::block_node::RawNode::open_readonly(
+                                std::path::Path::new(&base),
+                            )?;
+                            let mut node = iris::block_node::CowNode::new(
+                                Some(Box::new(backing)),
+                                &overlay,
+                                size,
+                            )?
+                            .with_base_path(&base);
+                            node.commit()
+                        })();
+                        match commit {
                             Ok(_) => { let _ = evt_tx.send(Evt::CowDone { committed: true }); }
                             Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-commit-failed", error = e.to_string()))); }
                         }

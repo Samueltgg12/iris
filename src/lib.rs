@@ -188,6 +188,7 @@ pub mod benchsuite;
 pub mod bench_runner;
 pub mod cow_disk;
 pub mod chd_disk;
+pub mod block_node;
 pub mod scsi;
 pub mod scsi_monitor;
 pub mod irq;
