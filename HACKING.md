@@ -218,6 +218,16 @@ when the guest is in its idle loop. A producer that adds work, or a device
 that raises an interrupt, unparks the thread it is waiting on. See
 `clanker/perf/` for what went wrong each time a parking rule was missed.
 
+The idle detector samples the guest PC every 32 sample calls (about 320
+instructions in the batch loop) and parks only when one long kernel cluster of
+code dominates the sample ring (at least 12 of 32 samples and 12 distinct PCs,
+no user-mode majority), with interrupts enabled, a mask bit set, nothing
+pending and Compare armed. That accepts IRIX 5.3's 14-instruction loop and
+6.5's ~89-instruction scheduler path while rejecting short DELAY and
+device-poll loops. Parking starts 60 s after the CPU thread starts
+(`IRIS_IDLE_WARMUP_SECS` overrides), so boot runs at full speed. The monitor's
+`idle on|off|status` controls and reports it.
+
 ## 5. Locks
 
 The rules, in order of importance:

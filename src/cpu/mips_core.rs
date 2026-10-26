@@ -2680,13 +2680,43 @@ mod ip7_ticket_tests {
     fn core_past_its_compare() -> MipsCore {
         let mut core = MipsCore::default();
         core.cp0_compare = 0x40;
-        std::thread::sleep(std::time::Duration::from_millis(3));
         // `materialize_count` memoizes per cycle count: a core that has never
         // executed has `hot.cycles == count_read_cycle == 0` and short-circuits
         // before materializing anything, so Count would stay 0 and no crossing
-        // could ever be detected. Make it look like it has run.
-        core.hot.cycles = 1;
+        // could ever be detected. Make it look like it has run: real time
+        // under the wall clock, retired cycles under `ci_clock` (~0.33 ticks
+        // per cycle at the default 33 MHz).
+        #[cfg(not(feature = "ci_clock"))]
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        #[cfg(not(feature = "ci_clock"))]
+        {
+            core.hot.cycles = 1;
+        }
+        #[cfg(feature = "ci_clock")]
+        {
+            core.hot.cycles = 100_000;
+        }
         core
+    }
+
+    /// Let enough time pass for Count to move the requested distance:
+    /// wall-clock time under the default build, retired cycles under
+    /// `ci_clock` (10 ns each).
+    fn advance_count(core: &mut MipsCore, count_ticks: u64) {
+        #[cfg(not(feature = "ci_clock"))]
+        {
+            let _ = count_ticks;
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            core.hot.cycles += 1; // see core_past_its_compare: let Count move
+        }
+        #[cfg(feature = "ci_clock")]
+        {
+            let ns = (count_ticks as u128 * 1_000_000_000) / core.count_hz as u128;
+            core.hot.cycles = core
+                .hot
+                .cycles
+                .saturating_add((ns as u64 / NS_PER_GUEST_CYCLE).max(1));
+        }
     }
 
     /// The ticket `schedule_compare_timer` arms its one-shot with is
@@ -2785,8 +2815,7 @@ mod ip7_ticket_tests {
     fn a_missed_deadline_across_a_count_wrap_still_raises_ip7() {
         let mut core = core_past_its_compare();
         core.write_cp0(9, 0xFFFF_FF00);
-        std::thread::sleep(std::time::Duration::from_millis(3));
-        core.hot.cycles += 1; // see core_past_its_compare: let Count move
+        advance_count(&mut core, 1_000_000);
         let now = core.count_peek();
         assert!(now < 0x8000_0000, "Count should have wrapped by now: {now:#x}");
 

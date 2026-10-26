@@ -6113,8 +6113,11 @@ mod tests {
         const T4: u32 = 12; // 1, for the handler to store
         const T5: u32 = 13; // the handler's Status: EXL | IE | IM6
         const STATUS: u32 = 12;
-        const NOPS: u32 = 194; // a pass is NOPS + 6 = 200 instructions:
-                               // 1000-step batches end at one place in it
+        // A pass is NOPS + 6 = 197 instructions. The PC-cluster detector
+        // samples every 32 instructions, so the loop length must not share a
+        // factor with the sample interval in a way that aliases to one PC;
+        // 197 is coprime with 32 and with the 1000-instruction batch.
+        const NOPS: u32 = 191;
         let mtc0 = |rt: u32, rd: u32| (OP_COP0 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11);
         let lw = |rt: u32, base: u32| (OP_LW << 26) | (base << 21) | (rt << 16);
         let sw = |rt: u32, base: u32| (OP_SW << 26) | (base << 21) | (rt << 16);
@@ -6164,19 +6167,27 @@ mod tests {
             exec.core.cp0_compare = 1; // (park only once a deadline is armed)
             ptr_tx.send(Ptr(&exec.core.hot.interrupts as *const AtomicU64)).unwrap();
 
-            let mut idle = IdleParkState::default();
+            let mut idle = IdleParkState::ready();
             let mut parks = 0u32;
             while run.load(Ordering::Relaxed) {
                 for _ in 0..1000 {
                     exec.step_int();
+                    idle.sample(&exec.core);
                 }
                 if exec.core.pc == kseg0(done_pa) || exec.core.pc == kseg0(done_pa + 4) {
                     done_tx.send(Ok(parks)).unwrap();
                     return;
                 }
-                if idle.update(&exec.core) {
-                    parks += 1;
-                    idle.park(&mut exec.core, &run);
+                match idle.update(&exec.core) {
+                    crate::cpu::idle_park::IdleDecision::Park => {
+                        parks += 1;
+                        idle.park(&mut exec.core, &run);
+                    }
+                    crate::cpu::idle_park::IdleDecision::Pace => {
+                        parks += 1;
+                        idle.pace(&mut exec.core, &run);
+                    }
+                    crate::cpu::idle_park::IdleDecision::None => {}
                 }
             }
             done_tx.send(Err(exec.core.pc)).unwrap();

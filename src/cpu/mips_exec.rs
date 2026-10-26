@@ -11522,13 +11522,13 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             // --features idle-pause). When compiled in, set IRIS_NO_IDLE to keep
             // spinning the host CPU at runtime (for benchmarking/debug).
             //
-            // We only park when the architectural state (PC + all GPRs) REPEATS
-            // across batches. A polling/idle loop (e.g. the kernel idle loop
-            // waiting on the run queue) cycles through the same states and exits
-            // only on an interrupt — safe to park. A busy-delay loop (e.g. IRIX
-            // DELAY(): `bgezl v1,-1; subu v1,v1,v0`) changes a counter every
-            // iteration, so its state never repeats — we must NOT park it or
-            // boot stalls. The state-repeat test distinguishes the two.
+            // The detector samples the PC once per 32 sample calls (about 320
+            // instructions in the batch loop) and parks only when the execution
+            // stayed inside one long, narrow, kernel code window with
+            // interrupts enabled and nothing pending. Short poll/delay loops
+            // (2-3 instructions) are rejected by the window's minimum span and
+            // distinct-PC count; user-mode code is never parked. See
+            // src/cpu/idle_park.rs.
             #[cfg(feature = "idle-pause")]
             let mut idle_state = crate::cpu::idle_park::IdleParkState::default();
 
@@ -11562,12 +11562,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         for _ in 0..1000 {
                             guard.step_jit(); guard.step_jit(); guard.step_jit(); guard.step_jit(); guard.step_jit();
                             guard.step_jit(); guard.step_jit(); guard.step_jit(); guard.step_jit(); guard.step_jit();
+                            #[cfg(feature = "idle-pause")]
+                            idle_state.sample(&guard.core);
                         }
                     } else {
                         // is this going to be a problem for netbsd?
                         for _ in 0..1000 {
                             guard.step_int(); guard.step_int(); guard.step_int(); guard.step_int(); guard.step_int();
                             guard.step_int(); guard.step_int(); guard.step_int(); guard.step_int(); guard.step_int();
+                            #[cfg(feature = "idle-pause")]
+                            idle_state.sample(&guard.core);
                         }
                                                  
                     }
@@ -11578,6 +11582,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         ($step:ident) => {
                             for _ in 0..1000 {
                                 let status = guard.$step();
+                                #[cfg(feature = "idle-pause")]
+                                idle_state.sample(&guard.core);
                                 match status {
                                     EXEC_BREAKPOINT => {
                                         running.store(false, Ordering::SeqCst);
@@ -11606,13 +11612,26 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     guard.batch_hook = Some(hook);
                 }
                 #[cfg(feature = "idle-pause")]
-                if crate::cpu::idle_park::idle_park_enabled() && idle_state.update(&guard.core) {
-                    drop(guard);
-                    {
-                        let mut guard = executor.lock();
-                        idle_state.park(&mut guard.core, &running);
+                if crate::cpu::idle_park::idle_park_enabled() {
+                    match idle_state.update(&guard.core) {
+                        crate::cpu::idle_park::IdleDecision::Park => {
+                            drop(guard);
+                            {
+                                let mut guard = executor.lock();
+                                idle_state.park(&mut guard.core, &running);
+                            }
+                            guard = executor.lock();
+                        }
+                        crate::cpu::idle_park::IdleDecision::Pace => {
+                            drop(guard);
+                            {
+                                let mut guard = executor.lock();
+                                idle_state.pace(&mut guard.core, &running);
+                            }
+                            guard = executor.lock();
+                        }
+                        crate::cpu::idle_park::IdleDecision::None => {}
                     }
-                    guard = executor.lock();
                 }
                 // --- end idle park ---
                 // --- perf sampling (comment out to disable) ---
@@ -11711,7 +11730,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("ex".to_string(), "Alias for exception".to_string()),
             ("undo".to_string(), "Undo N instructions or control undo buffer: undo [count] | undo <on|off|clear|resize <n>> [DEV]".to_string()),
             ("dt".to_string(), "Disassemble traceback: dt [count] | dt file <path> [count]".to_string()),
-            ("idleprof".to_string(), "Locate idle/spin loops via PC sampling: idleprof <on|off|report [count]>".to_string()),
+            ("idleprof".to_string(), "Locate idle/spin loops: idleprof <on|off|report [count]|stats>".to_string()),
+            #[cfg(feature = "idle-pause")]
+            ("idle".to_string(), "Idle parking: idle <on|off|status>".to_string()),
             #[cfg(feature = "instr_stats")]
             ("instrstats".to_string(), "Per-instruction decode/execution counters: instrstats [report|clear|dump] [DEV]".to_string()),
             ("u".to_string(), "Alias for undo [DEV]".to_string()),
@@ -14467,6 +14488,43 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 Ok(())
             }
             #[cfg(feature = "idle-pause")]
+            "idle" => {
+                let sub = actual_args.first().copied().unwrap_or("status");
+                match sub {
+                    "on" => {
+                        crate::cpu::idle_park::set_idle_park_enabled(true);
+                        writeln!(writer, "idle: parking enabled").unwrap();
+                    }
+                    "off" => {
+                        crate::cpu::idle_park::set_idle_park_enabled(false);
+                        writeln!(writer, "idle: parking disabled").unwrap();
+                    }
+                    "status" => {
+                        use std::sync::atomic::Ordering::Relaxed as R;
+                        let n = crate::cpu::idle_park::PARK_COUNT.load(R);
+                        let ns = crate::cpu::idle_park::PARK_SLEEP_NS.load(R);
+                        let irq = crate::cpu::idle_park::PARK_WAKE_IRQ.load(R);
+                        let other = crate::cpu::idle_park::PARK_WAKE_OTHER.load(R);
+                        writeln!(writer, "idle: {}  parks={} slept={:.3}s wake_irq={} wake_other={}",
+                            if crate::cpu::idle_park::idle_park_enabled() { "on" } else { "off" },
+                            n, ns as f64 / 1e9, irq, other).unwrap();
+                        writeln!(writer, "  updates={} full={} largest={} distinct={}",
+                            crate::cpu::idle_park::UPDATES.load(R),
+                            crate::cpu::idle_park::WINDOW_FULL.load(R),
+                            crate::cpu::idle_park::WINDOW_SAMPLES.load(R),
+                            crate::cpu::idle_park::WINDOW_DISTINCT.load(R)).unwrap();
+                        writeln!(writer, "  resets: irq={} ip={} im0={} ie0={} user={}",
+                            crate::cpu::idle_park::RESET_IRQ.load(R),
+                            crate::cpu::idle_park::RESET_IP.load(R),
+                            crate::cpu::idle_park::RESET_IM0.load(R),
+                            crate::cpu::idle_park::RESET_IE0.load(R),
+                            crate::cpu::idle_park::RESET_USER.load(R)).unwrap();
+                    }
+                    _ => return Err("Usage: idle <on|off|status>".to_string()),
+                }
+                Ok(())
+            }
+            #[cfg(feature = "idle-pause")]
             "idleprof" => {
                 let sub = actual_args.first().copied().unwrap_or("report");
                 match sub {
@@ -14483,7 +14541,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         let mut exec = self.try_lock_executor()?;
                         exec.idle_profile_report(count, &mut writer);
                     }
-                    _ => return Err("Usage: idleprof <on | off | report [count]>".to_string()),
+                    "stats" => {
+                        use std::sync::atomic::Ordering;
+                        let n = crate::cpu::idle_park::PARK_COUNT.load(Ordering::Relaxed);
+                        let ns = crate::cpu::idle_park::PARK_SLEEP_NS.load(Ordering::Relaxed);
+                        let irq = crate::cpu::idle_park::PARK_WAKE_IRQ.load(Ordering::Relaxed);
+                        let other = crate::cpu::idle_park::PARK_WAKE_OTHER.load(Ordering::Relaxed);
+                        writeln!(writer, "idleprof: parks={} slept={:.3}s wake_irq={} wake_other={}",
+                            n, ns as f64 / 1e9, irq, other).unwrap();
+                    }
+                    _ => return Err("Usage: idleprof <on | off | report [count] | stats>".to_string()),
                 }
                 Ok(())
             }

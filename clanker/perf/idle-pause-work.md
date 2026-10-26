@@ -165,7 +165,12 @@ break out as soon as an unmasked interrupt is pending. `IRIS_NO_IDLE` disables i
   dropped from **~100 % to ~2 %** (headless), the system stayed responsive (serial
   input echoes → wake-on-IRQ works) and the clock stayed correct (`date` in shell).
 
-### Detector — WORKING (architectural-state repeat, k0/k1 excluded)
+### Detector — architectural-state repeat (SUPERSEDED, see below)
+
+> **Superseded 2026-10-27.** The hash below never fires on IRIX 6.5, whose idle
+> path is a long scheduler loop with evolving registers, and it *does* match
+> short device-poll loops that must keep running. The PC-cluster detector now
+> in `src/cpu/idle_park.rs` replaces it; see "Detector — PC-cluster sample".
 
 The crux was distinguishing the kernel idle loop from a busy **delay loop**:
 - IRIX boot calls a calibrated `DELAY()` at `0x88003d70`: `bgezl v1,-1; subu v1,v1,v0`
@@ -207,3 +212,37 @@ targets.
 **Other TODO:** the v1 JIT path that bypassed this run loop entirely has been
 removed. Whether/how `jitv2` (`--features jitv2`, a from-scratch region compiler)
 needs its own idle-park hook has not yet been investigated.
+
+### Detector — PC-cluster sample (current, 2026-10-27)
+
+`idleprof` at a settled IRIX 6.5 IP22 getty shows the idle path is not a tight
+branch: it is a ~470-byte scheduler loop (0x880daedc..0x880db0b4, ~89
+instructions) with calls to `spl` and the ll/sc lock and stores to kernel
+globals. Its registers evolve every iteration (the run-queue scan rotates
+state), so PC+GPRs never repeats exactly — the old detector could not fire.
+It also matched a 3-instruction device poll seen during boot
+(`lbu/andi/bne -3` on a SCSI bit), which must keep executing.
+
+The replacement samples the guest PC every 32 sample calls: the batch loop
+calls `sample` after each ten-instruction group, so that is about 320 guest
+instructions per record and ~10,000 per ring. `update` sorts the samples into
+PC-space clusters (consecutive PCs <=256 bytes apart) and parks when one
+**kernel** cluster holds at least 12 of the 32 samples with 12 distinct PCs.
+That rejects the 2-instruction DELAY loop, 3-instruction device polls, the
+8-instruction ll/sc lock spin and mixed work, while accepting the 5.3
+14-instruction loop and 6.5's 89-instruction scheduler path. User-mode samples
+are allowed up to a quarter of the ring (a syscall wake runs a few user
+instructions between kernel stretches), but a user-dominated ring is refused.
+
+The earlier safety rules remain: no parking with IE=0 or every mask clear,
+wake on any pending line and on `running=false`, the masked-wake back-off
+(no re-park for ~20 ms after waking on a line the guest cannot take), and no
+park before Compare is armed. Parking waits 60 s after the CPU thread starts
+(`IRIS_IDLE_WARMUP_SECS` overrides) so boot runs at full speed. `idle
+on|off|status` and `idleprof stats` expose the switch and counters.
+
+Measured on the fork's rig (6-core i5-8500T, IRIX 6.5 IP22, R4400, fresh
+disk): a settled getty with the `lightning,idle-pause` build uses 1-2 % host
+CPU; the wall-clock cold boot is 35 s; `ci_clock,idle-pause` boots in 52 s and
+its getty runs at ~16-19 % (guest time is retired instructions, so the timer
+handler is a larger share of host time). IRIX 5.3 was not tested (no image).

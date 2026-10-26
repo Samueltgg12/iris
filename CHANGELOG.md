@@ -13,6 +13,25 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Idle parking
+
+- **IRIX 6.5's idle loop is recognised and parked.** With `--features
+  idle-pause`, a settled 6.5 IP22 getty now uses ~1-2 % host CPU instead of
+  ~100 %. The previous detector hashed PC and registers and required an exact
+  repeat; 6.5's idle path is a ~470-byte scheduler loop whose registers
+  evolve every iteration, so it never fired, while the same hash matched
+  short device-poll loops that must keep running. The replacement samples the
+  PC every 32 sample calls (about 320 instructions in the batch loop), groups
+  the samples into PC-space clusters, and parks when one long kernel cluster
+  dominates the ring; short countdown/device-poll loops and user-mode code
+  are never parked. Parking waits 60 s after CPU start
+  (`IRIS_IDLE_WARMUP_SECS` overrides) so boot is not slowed.
+- **New monitor commands.** `idle on|off|status` switches parking at runtime
+  and reports park/sleep/wake counters; `idleprof stats` prints the park
+  counters.
+- The `ci_clock` unit tests that materialise Count now advance it by retired
+  cycles, so `--features ci_clock,idle-pause` passes.
+
 ### JIT v2
 
 - **FPU integer conversions are compiled inline.** `CVT.W/L.S/D`,
