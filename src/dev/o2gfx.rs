@@ -1211,7 +1211,7 @@ impl CrimeRe {
                     self.busy.store(false, Release);
                 }
                 // Stays set across sleeps, so an idle engine wakes only for
-                // the 2 ms timeout and goes straight back to sleep.
+                // the park backstop and goes straight back to sleep.
                 let since = *idle_since.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() < IDLE_SPIN {
                     backoff.spin();
@@ -1235,14 +1235,17 @@ impl CrimeRe {
         }
     }
 
-    /// Park the engine's thread for up to 2 ms, unless a write came in
+    /// Park the engine's thread for up to 50 ms, unless a write came in
     /// before `asleep` was raised. The fence pairs with [`Self::wake`]'s.
+    /// The timeout is only a backstop for a wake the fence protocol should
+    /// never lose: long enough that an idle engine costs ~20 wakeups/s
+    /// rather than 500.
     fn sleep(&self) {
         use std::sync::atomic::Ordering::*;
         self.asleep.store(true, Relaxed);
         std::sync::atomic::fence(SeqCst);
         if self.ib.is_empty() {
-            std::thread::park_timeout(std::time::Duration::from_millis(2));
+            std::thread::park_timeout(std::time::Duration::from_millis(50));
         }
         self.asleep.store(false, Relaxed);
     }

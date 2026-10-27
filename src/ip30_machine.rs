@@ -236,7 +236,10 @@ impl OctaneMachine {
                 save_check = Instant::now();
                 bus.save();
             }
-            std::thread::sleep(Duration::from_micros(100));
+            // 1 ms, not the 100 µs this loop once paid: nothing it services
+            // (UART typing, the compare timer) is hurt by a millisecond, and
+            // a 10 kHz poll burns real CPU on small hosts for no return.
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 

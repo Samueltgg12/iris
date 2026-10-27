@@ -1914,19 +1914,20 @@ impl Wd33c93aState {
             while i < total {
                 let is_last = i == last_idx;
                 let (mut st, _) = dma_dev.write(data[i] as u32, is_last);
-                // On first byte, if channel not yet active (driver calls wdsc_dmago after
-                // issuing TRANSFER_INFO), spin up to 1ms for it to become ready.
                 if i == 0 && st.not_active() {
                     // Driver calls wdsc_dmago *after* writing TRANSFER_INFO, so the channel
-                    // may not be active yet. Spin up to 100ms to let the CPU thread arm it.
+                    // may not be active yet. Wait up to 100ms for the CPU thread to arm it.
+                    // Sleep between attempts rather than yield_now(): a tight yield loop
+                    // pins this thread's core and hammers the channel lock the CPU thread
+                    // needs, which on few-core hosts delays the very arming it waits for.
+                    // 100 µs is far below the command timescales SCSI runs at.
                     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
                     while st.not_active() && std::time::Instant::now() < deadline {
-                        std::thread::yield_now();
+                        std::thread::sleep(std::time::Duration::from_micros(100));
                         (st, _) = dma_dev.write(data[i] as u32, is_last);
                     }
                     if st.not_active() {
-                        dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 1ms — pausing", self.id);
-                        //eprintln!("WD33C93A: DMA channel still not active after 1ms — pausing");
+                        dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — pausing", self.id);
                     }
                 }
                 // On refused: byte was not accepted, do not advance or decrement.
@@ -1994,12 +1995,14 @@ impl Wd33c93aState {
                             if data.is_empty() {
                                 // Channel not yet active — driver issues TRANSFER_INFO before dmago
                                 // (NetBSD: SET_SBIC_cmd then sc_dmago on same CPU thread).
-                                // Spin up to 100ms for the CPU thread to call dmago.
+                                // Wait up to 100ms for the CPU thread to call dmago, sleeping
+                                // between attempts: a yield_now() hot loop steals the core the
+                                // CPU thread needs to arm the channel (see send_data_chunked).
                                 wdt!("DMA_IN spin-wait: channel not yet active");
                                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
                                 let mut got = false;
                                 while std::time::Instant::now() < deadline {
-                                    std::thread::yield_now();
+                                    std::thread::sleep(std::time::Duration::from_micros(100));
                                     if let Some((val, st, _)) = dma_dev.read() {
                                         data.push(val as u8);
                                         self.decrement_transfer_count();

@@ -587,13 +587,17 @@ impl Mgras {
         }
     }
 
-    /// An engine thread with nothing to do: park for up to 2 ms, unless
-    /// `has_work` finds a push made before `asleep` was raised.
+    /// An engine thread with nothing to do: park for up to 50 ms, unless
+    /// `has_work` finds a push made before `asleep` was raised. The timeout
+    /// is only a backstop for a wake the fence protocol should never lose,
+    /// so it is long enough that an idle engine costs ~20 wakeups/s rather
+    /// than 500; a hypothetical missed wake would cost one interval of
+    /// latency, never correctness.
     fn sleep(asleep: &AtomicBool, has_work: impl FnOnce() -> bool) {
         asleep.store(true, Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::SeqCst);
         if !has_work() {
-            thread::park_timeout(std::time::Duration::from_millis(2));
+            thread::park_timeout(std::time::Duration::from_millis(50));
         }
         asleep.store(false, Ordering::Relaxed);
     }

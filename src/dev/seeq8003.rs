@@ -637,10 +637,23 @@ impl Device for Seeq8003 {
             // lost (the condvar has no memory), so waiting here would pace a
             // burst at one frame per timeout.
             let mut busy = false;
+            // How long an idle pass waits for a wake before polling TX DMA.
+            // Backs off from 1ms to ENET_POLL_MAX while nothing moves so an
+            // idle network costs ~20 wakeups/s instead of 1000. The real wake
+            // paths — kick_tx from HPC3 when the CPU arms the TX channel, and
+            // rx_wake from NAT when a frame arrives — never lose a notify
+            // (Wake keeps it pending for the next wait), so the timeout is a
+            // safety net for a re-armed descriptor chain that arrives while
+            // the channel stays active. Any notify or activity drops it back
+            // to 1ms, so bursts still drain at speed.
+            const ENET_POLL_MAX: Duration = Duration::from_millis(50);
+            let mut poll = Duration::from_millis(1);
             while running_enet.load(Ordering::Relaxed) {
-                // Wait for an RX frame from NAT, or 1ms timeout to poll TX DMA
+                let mut notified = false;
+                // Wait for an RX frame from NAT (or a TX kick), or the poll
+                // timeout to check TX DMA.
                 if !busy {
-                    rx_wake_enet.wait(Duration::from_millis(1));
+                    notified = rx_wake_enet.wait(poll);
                 }
 
                 // Snapshot rx_cmd and station_addr for address filtering outside state lock.
@@ -728,6 +741,13 @@ impl Device for Seeq8003 {
 
                 let did_something = tx_activity || rx_activity || dma_irq;
                 busy = tx_moved || rx_moved;
+                // Idle-poll backoff (see the wait above): reset while the
+                // guest or the network is active, grow while idle.
+                if notified || did_something {
+                    poll = Duration::from_millis(1);
+                } else if poll < ENET_POLL_MAX {
+                    poll = (poll * 2).min(ENET_POLL_MAX);
+                }
                 if did_something {
                     dlog_dev!(LogModule::Seeq, "[ts={}] raise_interrupt caller=enet_thread dma_irq={} rx_stat={:02x} rx_cmd={:02x} tx_stat={:02x} tx_cmd={:02x}", st.ts, dma_irq, st.rx_stat, st.rx_cmd, st.tx_stat, st.tx_cmd);
                     Self::raise_interrupt(&mut st, dma_irq, &irq);

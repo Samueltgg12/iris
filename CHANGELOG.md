@@ -13,6 +13,32 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Host efficiency on small machines
+
+- **Threads that have nothing to do now sleep in milliseconds, not
+  microseconds.** On hosts with few cores (2-core/4-thread laptops, small
+  boards) the constant wake-up rate of idle device threads was a measurable
+  tax, and it prevented deep host C-states on machines that were otherwise
+  doing nothing. The wake paths were already event-driven — these timeouts
+  were only safety nets — so lengthening them changes idle behaviour and no
+  throughput path. Idle wake-up rates: the SEEQ ethernet pump 1000/s to
+  ~20/s; the GR2, IMPACT and O2 engine threads ~500/s each to ~20/s; the O2
+  service thread 10 000/s to ~500/s; the Octane service thread 10 000/s to
+  1000/s. (`src/dev/seeq8003.rs`, `src/dev/gr2/mod.rs`, `src/dev/mgras/mod.rs`,
+  `src/dev/o2gfx.rs`, `src/ip32_machine.rs`, `src/ip30_machine.rs`)
+- The ethernet pump backs off adaptively: any frame moved, interrupt raised or
+  wake signal (a TX kick from HPC3, an RX frame from NAT) returns it to its
+  1 ms poll, so bursts and re-armed descriptor chains still drain at speed,
+  and the O2 service poll likewise stays at 100 µs whenever CRIME is
+  interrupting, i.e. whenever the machine is doing anything.
+- **The WD33C93A no longer spin-yields waiting for the DMA channel to be
+  armed.** A disk command whose DMA channel the driver had not armed yet made
+  the SCSI thread retry the channel in a tight `yield_now()` loop for up to
+  100 ms — pinning its own core and taking the channel lock on every retry,
+  the same lock the CPU thread needed to arm it. It now sleeps 100 µs between
+  attempts, which is still far below the timescales a disk command runs at.
+  (`src/dev/wd33c93a.rs`)
+
 ### Idle parking
 
 - **IRIX 6.5's idle loop is recognised and parked.** With `--features
