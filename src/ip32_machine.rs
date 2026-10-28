@@ -583,6 +583,16 @@ impl O2Machine {
         // has written there (setenv) and the writing has stopped.
         let mut flash_seen = bus.flash_writes();
         let mut flash_check = Instant::now();
+        // How long to sleep between service passes. While CRIME is
+        // interrupting the machine is busy, so keep the tight 100 µs poll;
+        // while it is quiet back off to 2 ms so an idle machine costs ~500
+        // wakeups/s instead of 10 000. The backoff only adds latency to
+        // asynchronous input (a typed key, a frame from the network) —
+        // and while any of that is flowing, its interrupts keep the poll
+        // at 100 µs anyway.
+        const SERVICE_POLL: Duration = Duration::from_micros(100);
+        const SERVICE_POLL_IDLE: Duration = Duration::from_millis(2);
+        let mut poll = SERVICE_POLL;
         while running.load(Ordering::Relaxed) {
             if paused.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
@@ -598,7 +608,10 @@ impl O2Machine {
             }
             // Frames from the network, and any line that changed without a
             // register access (a disk finishing, a key from the window).
-            bus.service();
+            let interrupting = bus.service();
+            poll = if interrupting { SERVICE_POLL } else {
+                (poll * 2).min(SERVICE_POLL_IDLE)
+            };
             // A cold reset through CRIME (NetBSD's reboot): the CPU starts
             // again at the reset vector with every device as at power-on.
             if bus.crime.regs.take_reset_request() {
@@ -620,7 +633,7 @@ impl O2Machine {
                 running.store(false, Ordering::SeqCst);
                 std::process::exit(0);
             }
-            std::thread::sleep(Duration::from_micros(100));
+            std::thread::sleep(poll);
         }
     }
 
