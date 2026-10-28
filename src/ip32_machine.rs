@@ -108,6 +108,17 @@ impl crate::irq::InterruptController for CpuIrq {
     }
 }
 
+/// Memory into the snapshot chunk store, bank after bank. Banks are whole
+/// chunks (32 or 128 MB), so the list is the one the memory as a single
+/// store gave, and older snapshots load.
+fn put_bank_words(store: &crate::chunk_store::ChunkStore, ram: &crate::dev::crime_mem::O2Memory) -> std::io::Result<Vec<crate::chunk_store::ChunkHash>> {
+    let mut hashes = Vec::new();
+    for words in ram.bank_words() {
+        hashes.extend(crate::chunk_store::put_words_as_chunks(store, words)?);
+    }
+    Ok(hashes)
+}
+
 pub struct O2Machine {
     pub bus: Arc<Ip32Bus>,
     cpu: Arc<dyn CpuDevice>,
@@ -175,24 +186,24 @@ impl O2Machine {
         let kits = cfg.o2_kits();
         let mem = O2Memory::from_kits(&kits)?;
         // The PROM's flash, and so its environment, lives in `nvram`.
-        let opts = Ip32Options { scsi: true, flash_file: Some(cfg.nvram.clone().into()) };
-        let mut bus = Ip32Bus::with_options(mem, prom, opts);
-        // `[network] mac` is the address in the 1-Wire ID chip.
-        if let Some(mac) = cfg.network.mac.as_deref() {
-            let mac = crate::config::parse_mac(mac).map_err(|e| format!("network.mac: {e}"))?;
-            bus.mace.onewire = crate::dev::onewire::OneWireId::from_mac(mac);
-        }
+        // `[network] mac` is the address in the 1-Wire ID chip. `headless`:
+        // no keyboard, so the PROM and the OS take the serial console, as on
+        // an O2 booted without one. The GBE stays: it is part of every O2.
+        let mac = match cfg.network.mac.as_deref() {
+            Some(mac) => Some(crate::config::parse_mac(mac).map_err(|e| format!("network.mac: {e}"))?),
+            None => None,
+        };
+        let opts = Ip32Options {
+            scsi: true,
+            flash_file: Some(cfg.nvram.clone().into()),
+            keyboard: (!cfg.headless).then_some(o2.mouse),
+            mac,
+        };
+        let bus = Ip32Bus::with_options(mem, prom, opts);
         // MACE audio plays through the host unless audio is off.
         if !cfg.no_audio {
             bus.mace.audio.enable_output(cfg.audio.clone());
         }
-        // `headless`: no keyboard, so the PROM and the OS take the serial
-        // console, as on an O2 booted without one. The GBE stays: it is part
-        // of every O2.
-        if !cfg.headless {
-            bus.attach_keyboard(o2.mouse);
-        }
-        let bus = Arc::new(bus);
         // The SCSI devices, from the same `[scsi.N]` tables as the other
         // machines; `controller` is the bus (0 internal, 1 external).
         let mut scratch_path: Option<std::path::PathBuf> = None;
@@ -310,7 +321,7 @@ impl O2Machine {
         }
 
         let timer_manager = Arc::new(TimerManager::new());
-        let sysad: Arc<dyn BusDevice> = bus.clone();
+        let sysad: Arc<dyn BusDevice> = bus.phys.clone();
         let arcs_fpu = o2.arcs_fpu;
         // `[clock] fixed_mhz` is CP0 Count; the CPU clock the PROM measures
         // and reports is twice it.
@@ -343,7 +354,7 @@ impl O2Machine {
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
                 let stats = g.stats.clone();
-                g.compile_queue.start(bus.clone() as Arc<dyn BusDevice>, stats);
+                g.compile_queue.start(bus.phys.clone() as Arc<dyn BusDevice>, stats);
             }
             // The compile pool keeps only a weak handle on the CPU.
             std::mem::forget(cpu_device);
@@ -355,11 +366,9 @@ impl O2Machine {
         // control write), which is the window's contract.
         {
             use crate::ppmem::MappedMemory;
-            let ram = bus.ram.lock().unwrap();
-            let sp = ram.space();
+            let sp = bus.phys.ppmem_space().ok_or("ppmem: the O2 needs its memory window")?;
             unsafe {
                 sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
-                bus.set_fast_ram(sp.window_base(), cpu.ppmem_bitmap_ptr());
                 cpu.set_tcache_window(sp.window_base());
                 let bitmap = cpu.tcache_bitmap_ptr();
                 if !bitmap.is_null() {
@@ -368,6 +377,8 @@ impl O2Machine {
                 #[cfg(feature = "jitv2")]
                 cpu.set_tcache_gen_window(sp.gen_window_base());
             }
+            // The bus's direct paths read the same bitmap.
+            bus.phys.resync_ppmem_bitmap();
         }
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
@@ -396,6 +407,8 @@ impl O2Machine {
         monitor.register_device(crate::devlog::init_devlog());
         monitor.register_device(cpu.clone().as_device());
         monitor.register_device(bus.clone());
+        // `phys`: the physical bus's decode table, memory and traces.
+        monitor.register_device(bus.phys.clone());
         // The SCSI controllers' `scsi`/`scsi1` and `cow`/`cow1`.
         for ctl in bus.scsi.lock().unwrap().iter() {
             monitor.register_device(ctl.clone());
@@ -543,6 +556,7 @@ impl O2Machine {
         let running = self.running.clone();
         let events = (self.events.clone(), self.controller_up.clone());
         let paused = self.paused.clone();
+        self.start_scsi();
         self.threads.push(
             std::thread::Builder::new()
                 .name("O2-Service".into())
@@ -630,6 +644,11 @@ impl O2Machine {
     pub fn stop(&mut self) {
         self.cpu.clone().as_device().stop();
         self.paused.store(true, Ordering::SeqCst);
+        // After the CPU, so nothing queues more; each finishes the command
+        // it is running, so a snapshot finds none half done.
+        for ctl in self.bus.scsi.lock().unwrap().iter() {
+            ctl.stop();
+        }
         if !self.bus.crime.re.drain(Duration::from_secs(2)) {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
@@ -643,6 +662,15 @@ impl O2Machine {
     /// Let the service thread look after the devices again.
     pub fn restart_peripherals(&mut self) {
         self.paused.store(false, Ordering::SeqCst);
+        self.start_scsi();
+    }
+
+    /// Give each SCSI controller its own thread, so disk transfers do not
+    /// run on the CPU's.
+    fn start_scsi(&self) {
+        for ctl in self.bus.scsi.lock().unwrap().iter() {
+            ctl.start();
+        }
     }
 
     /// The hardware as at power-on, with the CPU stopped: what a CRIME cold
@@ -690,7 +718,7 @@ impl O2Machine {
         snap.write_bin("flash.bin", &self.bus.flash_bytes()).map_err(|e| e.to_string())?;
         let store = ChunkStore::new("saves");
         let mut chunks = ChunksManifest::default();
-        chunks.bank_chunks[0] = put_words_as_chunks(&store, self.bus.ram.lock().unwrap().words())
+        chunks.bank_chunks[0] = put_bank_words(&store, &self.bus.ram)
             .map_err(|e| format!("CAS memory put: {e}"))?;
         snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
         for (i, ctl) in self.bus.scsi.lock().unwrap().iter().enumerate() {
@@ -768,9 +796,9 @@ impl O2Machine {
         let chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;
         let memory = get_chunks_as_words(&ChunkStore::new("saves"), &chunks.bank_chunks[0])
             .map_err(|e| format!("CAS memory get: {e}"))?;
-        if memory.len() * 4 != self.bus.ram.lock().unwrap().len() {
+        if memory.len() * 4 != self.bus.ram.len() {
             return Err(format!("snapshot memory is {} MB, this O2 has {} MB",
-                memory.len() >> 18, self.bus.ram.lock().unwrap().len() >> 20));
+                memory.len() >> 18, self.bus.ram.len() >> 20));
         }
         let ctrls = self.bus.scsi.lock().unwrap().len();
         let overlays = (0..ctrls)
@@ -797,7 +825,7 @@ impl O2Machine {
         self.bus.load_state(&s.bus)?;
         self.boot.load(&s.boot);
         self.bus.set_flash(&s.flash)?;
-        self.bus.ram.lock().unwrap().restore_words(&s.memory)?;
+        self.bus.ram.restore_words(&s.memory)?;
         for (i, ctl) in self.bus.scsi.lock().unwrap().iter().enumerate() {
             if let Some(Some(sets)) = s.overlays.get(i) {
                 ctl.import_overlays(&s.dir.join(format!("ctrl{i}")), sets)

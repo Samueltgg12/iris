@@ -106,8 +106,48 @@ hashes are given where a change is easiest to understand by reading the commit.
   the guest screen from the display caches when no renderer is present. With
   a GUI renderer attached it still returns the readback that renderer
   produced. (`src/ci.rs`, `src/gfx_display.rs`)
+### SGI Octane (IP30)
+
+- **A new machine: the SGI Octane.** `[machine] profile = "octane_ip30"` with
+  an `[octane]` section ([guide](docs/octane-ip30.md)): a 195 MHz R10000 on
+  HEART, the Crossbow, the onboard Bridge with two QLogic ISP1040 SCSI
+  controllers, IOC3 (serial ports, PS/2, the DS1685 clock and NVRAM,
+  Ethernet on the NAT gateway) and RAD audio, the boot flash, and Solid
+  IMPACT graphics on widget 11. The stock IP30 PROM boots IRIX 6.5.30 to a
+  serial login or, on the graphics console, to the X login and desktop.
+  Needs the IP30 PROM image. Runs under jitv2 as well as the interpreter.
+  The devices are time-driven by `hptimer` and per-port receive threads, with
+  no polling thread; every thread is joined when the machine stops.
+  iris-gui can run it.
+- **One 1-wire bus for the board records.** `dev::w1` holds the bus, the
+  slot decode and the Dallas parts (DS2501/2502, DS2505); HEART, the Bridge,
+  IOC3 and the graphics board each own a wire. `sgi_nic` only builds the SGI
+  record formats.
+- **CP0 Count writes can open the late-Compare window** (`count_write_samples`,
+  opt-in; the Octane sets it): IRIX on the Octane arms Compare a few
+  instructions after writing Count, and a host stall in between no longer
+  costs a full Count wrap.
+- **IMPACT gains hooks for boards outside the Indigo2**: a settable board
+  identity, pixel reads started at the DMA kick, a bound on how long STATUS
+  reads busy, and a board callback for GE state readbacks and raster
+  register decode. The Indigo2 path is unchanged.
+- **A machine with no graphics board runs on its serial console** instead of
+  stopping when it is not headless.
+- **A PCI function's configuration header can be reset** (`PciConfig::reset`),
+  as a bus reset drives it: the command register and BARs return to power-up.
+
 ### SGI O2 (IP32)
 
+- **The O2 is on `Physical`.** Its bus is the same decode table and memory
+  window as the Indy's: CRIME's banks are RAM banks a bank-control write
+  remaps, CRIME, GBE, VICE, MACE and the flash are table entries, and
+  addresses nothing claims still read zero and show in `o2 unmapped`. The
+  Ethernet, serial and audio DMA, the PCI bridge's bus masters and GBE's
+  scan-out reach memory through the bus; the rendering engine draws through
+  the window. The monitor has the `phys` commands. Raw disk reads went from
+  about 1 to 1.9 MB/s with 4 KiB blocks and from about 11 to 19 MB/s with
+  1 MiB blocks, together with the interpreter fixes below. Snapshots are
+  unchanged.
 - **A new machine: the SGI O2.** `[machine] profile = "o2_ip32"` with an `[o2]`
   section ([guide](docs/o2-ip32.md)): R10000 or R5000, CRIME memory and
   rendering engine, MACE (PCI with two Adaptec 7880 SCSI controllers,
@@ -126,6 +166,56 @@ hashes are given where a change is easiest to understand by reading the commit.
   now gives a busy engine up to 100 us of host time before it answers.
   Tested to login with 32, 64, 128, 256, 224 (128+64+32), 384, 512 MB and
   1 GB, and headless.
+- **O2 SCSI commands run on their own thread.** Each AIC-7880 now has a
+  worker (`AIC-7880-0`, `AIC-7880-1`) that fetches the command, moves the
+  data and does the disk I/O; the CPU's register write only queues the tag.
+  Before, a whole transfer ran inside that write and the guest stopped for
+  it. `scsi regs` reports the worker.
+- **O2 interrupts are delivered like the Indy's.** Devices drive their
+  line when an access, a host event or a timer tick changes it, through
+  MACE's ISA status or the PCI router into CRIME and on to IP2, each
+  controller under one lock. Before, every CRIME register read and MACE
+  write re-drove every MACE device's lines (about 200 lock operations), and
+  the service thread did it again 10,000 times a second. IRIX `diskperf -D`
+  gains 30-45% at every request size (4 KiB: 1.46 to 2.11 MB/s writes;
+  4 MiB: 14.0 to 18.0), and boot to login is about 10% faster. A key typed
+  on the host now interrupts as it arrives.
+- **CRIME's debug records are off the register path.** The
+  interrupt-register log records only after `crime irqlog on` (IRIX touches
+  those registers on every interrupt and priority change), the
+  touched-register list costs one relaxed load after a register's first
+  access, CRIME's counter offset is an atomic, and the bus stops looking at
+  its unmapped-access list once it holds 64 entries. A `lightning` build
+  keeps none of them. A 32-bit CRIME store no longer logs a read the guest
+  never made.
+- **The O2 interpreter is about 2.5x faster.** Three faults compounded, so
+  O2 R10000 interpreter builds ran IRIX at about a third of an IP28's speed:
+  - Without `tcache` (every build without `jitv2`), the cache model the
+    kernel runs on never learned where RAM was, so every load, store and
+    instruction fetch went through the bus.
+  - Every fetch, load and store went through an out-of-line call that
+    switched between the PROM's cache model and the kernel's.
+  - The decoded-instruction cache was indexed by the low bits of the page
+    number. The O2's IRIX places program and library code on pages that
+    share those bits, so they evicted each other on every call. The index is
+    now a hash of the page number, which every machine uses.
+
+  Dhrystone (4M loops) went from about 35 000/s, after the first fix, to
+  42 000/s; an IP28 runs 47 000/s.
+- **The O2's clock reads take no lock.** UST and CRIME's counter lock only
+  while the PROM bit-bangs the 1-Wire ID chip, the one time the guest clock
+  holds host stalls out. A UART keeps the last 64 KiB it sent, not every
+  byte since boot.
+- **O2 PCI register accesses take no bridge locks.** MACE's bridge keeps a
+  table of the functions' open BAR windows, rebuilt after each
+  configuration write, and a CPU access reads it without locking; the
+  AIC-7880 locks its state once per access rather than once per byte.
+- **O2 memory has no lock.** Devices and the CPU's slow path reach RAM
+  without taking a mutex, as the hardware's masters do; PCI DMA decodes
+  once per page instead of once per byte. A disk transfer on the SCSI
+  thread no longer holds up the CPU. Disk throughput under IRIX is bounded
+  by the emulated CPU, not by SCSI or DMA (the controller's thread uses
+  about 1% of a core while IRIX reads at its full rate).
 - **The AIC-7880 is specified.** [docs/o2/aic7880.md](docs/o2/aic7880.md)
   describes the O2's SCSI controller from the Adaptec data books, the
   open-source drivers, the MACE spec and what the PROM and IRIX download: principles of operation, PCI
@@ -167,6 +257,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Physical address decoding
 
+- **`Physical` belongs to no machine.** It is the decode table, the RAM
+  banks with ppmem's window, and the plain devices every machine needs; each
+  machine maps its own devices and memory on it. The Indy and Indigo2 address
+  map and MEMCFG remap moved to `src/ip22_bus.rs`, so the O2 and the Octane
+  can build their buses from the same parts. `phys bench` now fills the first
+  fully mapped 64 MB of RAM instead of the Indy's high-memory window.
 - **The decode table is sparse and spans 40 bits.** `Physical` used to embed
   a 1 MB array of device pointers covering a 32-bit physical space. It is now
   a host-mapped table over a 40-bit space (`SparseDeviceMap`,
@@ -177,6 +273,23 @@ hashes are given where a change is easiest to understand by reading the commit.
   swap whole pages in, so the DMA worker dispatching through the table during
   a MEMCFG remap can no longer read a torn pointer. `phys map` in the monitor
   shows the table. Groundwork for machines with a 40-bit address space.
+- **4 KB slots.** The table has one entry per 4 KB, the guest's page size
+  and the smallest window a PCI BAR gets, so small devices no longer need
+  to answer a whole 64 KB. A page filled with one device is only recorded
+  and mapped the first time it is used, which keeps host mappings in
+  proportion to what the guest touches (an Octane's 64 GB widget windows
+  cost nothing until used).
+- **The Octane uses `Physical`.** Its bus (`Ip30Bus`) and HEART's memory
+  placement are built from the same parts as the Indy's and the O2's: RAM
+  banks placed as bank views, the low-memory window as a view of the same
+  bank, and `phys` monitor commands on the Octane too. Bus masters still
+  reach memory through HEART's DMA view, now with `physical::read_bytes`
+  and `write_bytes`.
+- **PCI BARs go on the bus.** The Octane's Bridge and the O2's MACE publish
+  the pages of their windows that one BAR decodes whole, and the machine
+  maps them on `Physical`, so a CPU access to a PCI register goes straight
+  to the function through the bridge's lane rules, with no search of the
+  slots and no bridge lock.
 - **The bus takes 64-bit addresses.** Every `BusDevice` method now takes
   `addr: u64`. `Physical` masks to the table's 40 bits before dispatch, and
   devices below 4 GB turn the address into a 32-bit offset from their base,

@@ -130,18 +130,17 @@ impl SdmaPort {
 /// What the engines reach outside themselves: memory, the two UARTs, and
 /// where the rings are.
 pub struct SdmaIo<'a> {
-    pub ram: &'a Mutex<O2Memory>,
+    pub ram: &'a O2Memory,
     pub com: [&'a Com16550; 2],
     /// The ring block's physical address, from the ring base register.
     pub ring_base: u32,
 }
 
 impl SdmaIo<'_> {
-    /// Where block `ptr` of ring `ring` is in memory, as an offset into it.
-    /// The rings are a DMA master's view of memory, as the Ethernet's are.
-    fn block(&self, ram: &O2Memory, ring: u32, ptr: u32) -> Option<usize> {
-        let i = ram.dma_offset(self.ring_base | (ring << 12) | ptr)?;
-        (i + sdma::BLOCK as usize <= ram.len()).then_some(i)
+    /// Where block `ptr` of ring `ring` is on the bus, if it is memory. The
+    /// rings are a DMA master's view of memory, as the Ethernet's are.
+    fn block(&self, ram: &O2Memory, ring: u32, ptr: u32) -> Option<u64> {
+        ram.dma_offset(self.ring_base | (ring << 12) | ptr).map(|p| p as u64)
     }
 }
 
@@ -272,13 +271,17 @@ impl MaceSerialDma {
     /// accesses (the TCP console, a script's `feed`), and any transmit work
     /// left over.
     pub fn poll(&self, io: &SdmaIo) {
-        let mut st = self.ports.lock().unwrap();
-        for (p, port) in st.iter_mut().enumerate() {
-            if port.owned {
-                Self::tx_run(p, port, io);
-                Self::rx_run(p, port, io);
+        {
+            let mut st = self.ports.lock().unwrap();
+            for (p, port) in st.iter_mut().enumerate() {
+                if port.owned {
+                    Self::tx_run(p, port, io);
+                    Self::rx_run(p, port, io);
+                }
             }
         }
+        // Blocks moved: thresholds and overruns may have changed.
+        self.update_irq();
     }
 
     /// Send every block between the read and write pointers.
@@ -287,7 +290,7 @@ impl MaceSerialDma {
         while port.tx.running() && port.tx.rptr != port.tx.wptr {
             let mut b = [0u8; sdma::BLOCK as usize];
             {
-                let ram = io.ram.lock().unwrap();
+                let ram = &*io.ram;
                 let Some(i) = io.block(&ram, ring, port.tx.rptr) else {
                     // Nowhere to read from: the hardware stops the channel and
                     // says why.
@@ -295,7 +298,7 @@ impl MaceSerialDma {
                     port.tx.ctrl &= !sdma::CTRL_ENABLE;
                     return;
                 };
-                b.copy_from_slice(&ram.bytes(i, sdma::BLOCK as usize));
+                crate::physical::read_bytes(&**ram.phys(), i, &mut b);
             }
             for pair in b.chunks_exact(8) {
                 for slot in 0..4 {
@@ -330,7 +333,7 @@ impl MaceSerialDma {
     fn rx_run(p: usize, port: &mut SdmaPort, io: &SdmaIo) {
         let ring = 5 + 2 * p as u32;
         while port.rx.running() && port.rx.depth() < sdma::RING_FULL && !io.com[p].input_empty() {
-            let mut ram = io.ram.lock().unwrap();
+            let ram = &*io.ram;
             let Some(i) = io.block(&ram, ring, port.rx.wptr) else { return };
             let mut chars = [0u8; 16];
             let n = io.com[p].take_input(&mut chars);
@@ -343,8 +346,7 @@ impl MaceSerialDma {
                 b[8 * (j / 4) + j % 4] = ctrl;
                 b[8 * (j / 4) + 4 + j % 4] = data;
             }
-            ram.write(i, &b);
-            drop(ram);
+            crate::physical::write_bytes(&**ram.phys(), i, &b);
             port.rx.blocks += 1;
             port.rx.bytes += n as u64;
             port.rx.wptr = (port.rx.wptr + sdma::BLOCK) & sdma::PTR_MASK;

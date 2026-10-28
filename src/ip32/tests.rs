@@ -73,6 +73,32 @@ fn a_waiting_byte_raises_the_keyboard_interrupt_only_when_enabled() {
     assert_eq!(k.isa_bits(), 0);
 }
 
+/// A key from the host raises the keyboard's ISA bits as it arrives, the
+/// way the Indy's IOC hears its PS/2 controller: nothing polls the port.
+#[test]
+fn a_key_from_the_host_interrupts_without_a_poll() {
+    #[derive(Default)]
+    struct Bits(std::sync::Mutex<u64>);
+    impl crate::irq::InterruptController for Bits {
+        fn set_line(&self, line: u32, level: bool) {
+            let mut b = self.0.lock().unwrap();
+            if level { *b |= 1 << line } else { *b &= !(1 << line) }
+        }
+    }
+    let bits = std::sync::Arc::new(Bits::default());
+    let k = MacePs2::with_devices(false);
+    k.connect_irq(bits.clone());
+    ps2_send(&k, 0, 0xf4); // enable scanning
+    assert_eq!(ps2_recv(&k, 0), Some(0xfa));
+    k.write(MACE_PS2 + 0x10, ps2_ctl::TX_ENABLE | ps2_ctl::CLKEN | ps2_ctl::RX_INT);
+    k.update_irq();
+    assert_eq!(*bits.0.lock().unwrap() & (1 << 9), 0, "nothing waiting yet");
+    k.devices().unwrap().push_kb(winit::keyboard::KeyCode::KeyA, true);
+    assert_eq!(*bits.0.lock().unwrap() & ((1 << 9) | (1 << 10)), (1 << 9) | (1 << 10),
+        "the make code latched and raised the port's request at once");
+    assert!(ps2_recv(&k, 0).is_some());
+}
+
 #[test]
 fn crime_is_a_64_bit_register_file() {
     let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
@@ -90,8 +116,8 @@ fn crime_save_load_round_trip() {
     let src = Crime::new(std::sync::Arc::new(MaceUst::new()));
     src.write64((CRIME_BASE + crime_reg::INTMASK) as u64, 0x0000_ff00);
     src.write64((CRIME_BASE + crime_reg::SOFTINT) as u64, 0x0000_0100);
-    src.set_int(9, true);
-    src.latch_int(16);
+    crate::irq::InterruptController::set_line(&src, 9, true);
+    crate::irq::InterruptController::set_line(&src, 16, true);
     src.write64((CRIME_BASE + crime_reg::TIME) as u64, 12345);
     src.set_revision(0xa1);
     let v1 = src.save_state();
@@ -107,7 +133,7 @@ fn crime_save_load_round_trip() {
 fn crime_space_load_restores_the_memory_banks() {
     use crate::traits::Saveable;
     let make = || {
-        let ram = std::sync::Arc::new(Mutex::new(crate::dev::crime_mem::O2Memory::with_total(256).unwrap()));
+        let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::with_total(256).unwrap());
         let crime = std::sync::Arc::new(Crime::new(std::sync::Arc::new(MaceUst::new())));
         (crate::dev::crime::CrimeSpace::new(crime, ram.clone()), ram)
     };
@@ -120,7 +146,7 @@ fn crime_space_load_restores_the_memory_banks() {
     let (dst, dst_ram) = make();
     dst.load_state(&v1).expect("load_state");
     assert_eq!(v1, dst.save_state(), "CrimeSpace save_state mismatch after load_state round-trip");
-    assert_eq!(dst_ram.lock().unwrap().ctrls(), src_ram.lock().unwrap().ctrls(), "banks mapped as saved");
+    assert_eq!(dst_ram.ctrls(), src_ram.ctrls(), "banks mapped as saved");
 }
 
 #[test]
@@ -174,7 +200,7 @@ fn a_bus_saves_and_loads_whole() {
     src.write32((GBE_BASE + 0x50000 + 4 * 3) as u64, 0x0011_2233);
     src.mace.com0.feed(b"x");
     src.mace.rtc.poke(0x40, 0x99);
-    src.ram.lock().unwrap().write(0x1234, b"saved bytes");
+    src.ram.write(0x1234, b"saved bytes");
     let v1 = src.save_state();
     src.save_raw(&dir).unwrap();
 
@@ -183,8 +209,8 @@ fn a_bus_saves_and_loads_whole() {
     dst.load_state(&v1).expect("load_state");
     let v2 = dst.save_state();
     assert_eq!(first_difference(&v1, &v2, "bus"), None, "Ip32Bus save_state mismatch after load_state round-trip");
-    assert_eq!(dst.ram.lock().unwrap().bytes(0x1234, 11), b"saved bytes");
-    assert_eq!(dst.prom.lock().unwrap()[0x100], 0x42);
+    assert_eq!(dst.ram.bytes(0x1234, 11), b"saved bytes");
+    assert_eq!(dst.flash_bytes()[0x100], 0x42);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -234,6 +260,24 @@ fn the_time_counter_tracks_the_clock_and_can_be_reset() {
 }
 
 #[test]
+#[cfg(not(feature = "lightning"))]
+fn the_interrupt_log_records_only_while_on() {
+    let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    let mask = (CRIME_BASE + crime_reg::INTMASK) as u64;
+    c.write64(mask, 1);
+    assert_eq!(c.irqlog_text(), "", "off until asked for");
+    c.set_irqlog(true).unwrap();
+    // A 32-bit store merges into the register without reading it as the
+    // guest: one write, no read.
+    c.write32(mask + 4, 2);
+    assert_eq!(c.irqlog_text(), format!("W {:#04x} 0x0000000000000002\n", crime_reg::INTMASK));
+    c.set_irqlog(false).unwrap();
+    let _ = c.read64(mask);
+    assert_eq!(c.irqlog_text().lines().count(), 1, "stopped");
+}
+
+#[test]
+#[cfg(not(feature = "lightning"))]
 fn every_touched_register_is_recorded_once_per_direction() {
     let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
     c.write64((CRIME_BASE + crime_reg::MEM_CONTROL) as u64, 1);
@@ -334,7 +378,7 @@ const RX_RPTR: u32 = 5;
 const RX_WPTR: u32 = 6;
 const RX_DEPTH: u32 = 7;
 
-fn sdma_bus() -> Ip32Bus {
+fn sdma_bus() -> std::sync::Arc<Ip32Bus> {
     let bus = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
     bus.write64(MACE_ISA_RING_BASE as u64, SDMA_RING as u64);
     bus

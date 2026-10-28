@@ -19,8 +19,15 @@ use crate::ip32::*;
 /// Transmit only. The line status register always reports the holding register
 /// empty, so the PROM never waits on us, and bytes are appended to a buffer
 /// rather than going anywhere.
+/// How much of a UART's output it keeps.
+pub const OUT_KEEP: usize = 64 * 1024;
+
 pub struct Com16550 {
-    out: Mutex<Vec<u8>>,
+    /// The last [`OUT_KEEP`] bytes sent, for the monitor and tests, and how
+    /// many were sent in all. A console left running for days would
+    /// otherwise keep every byte it ever printed.
+    out: Mutex<std::collections::VecDeque<u8>>,
+    sent: std::sync::atomic::AtomicUsize,
     /// The host end of the serial line, as the Z85C30's channels have:
     /// a TCP console, a log tee, or nothing.
     backend: Mutex<std::sync::Arc<dyn SerialBackend>>,
@@ -93,7 +100,8 @@ impl Com16550 {
     /// A UART answering monitor commands as `name`.
     pub fn named(name: &'static str) -> Self {
         Self {
-            out: Mutex::new(Vec::new()),
+            out: Mutex::new(std::collections::VecDeque::new()),
+            sent: std::sync::atomic::AtomicUsize::new(0),
             backend: Mutex::new(crate::dev::z85c30::null_serial_backend()),
             input: Default::default(),
             regs: Mutex::new([0u8; 8]),
@@ -114,14 +122,20 @@ impl Com16550 {
     /// driver polling for data sees it at once.
     pub fn pump(&self) {
         let backend = self.backend.lock().unwrap().clone();
+        let mut got = false;
         while let Ok(b) = backend.recv_byte() {
             self.input.lock().unwrap().push_back(b);
+            got = true;
+        }
+        if got {
+            self.update_irq();
         }
     }
 
     /// Queue characters for the guest to read.
     pub fn feed(&self, bytes: &[u8]) {
         self.input.lock().unwrap().extend(bytes.iter().copied());
+        self.update_irq();
     }
 
     /// Characters still unread by the guest.
@@ -129,19 +143,22 @@ impl Com16550 {
         self.input.lock().unwrap().len()
     }
 
-    /// Everything written to the transmit register so far.
+    /// What was written to the transmit register, the last [`OUT_KEEP`]
+    /// bytes of it.
     pub fn output(&self) -> String {
-        String::from_utf8_lossy(&self.out.lock().unwrap()).to_string()
+        self.output_tail(OUT_KEEP)
     }
 
+    /// Bytes sent in all, including those no longer kept.
     pub fn bytes_out(&self) -> usize {
-        self.out.lock().unwrap().len()
+        self.sent.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The last `n` bytes written, without copying the whole history.
+    /// The last `n` bytes written (at most [`OUT_KEEP`]).
     pub fn output_tail(&self, n: usize) -> String {
         let o = self.out.lock().unwrap();
-        String::from_utf8_lossy(&o[o.len().saturating_sub(n)..]).to_string()
+        let tail: Vec<u8> = o.iter().skip(o.len().saturating_sub(n)).copied().collect();
+        String::from_utf8_lossy(&tail).to_string()
     }
 
     /// Decode a MACE ISA address into a 16550 register number, if it names one.
@@ -269,7 +286,13 @@ impl Com16550 {
             self.input.lock().unwrap().push_back(val);
             return;
         }
-        self.out.lock().unwrap().push(val);
+        let mut o = self.out.lock().unwrap();
+        if o.len() == OUT_KEEP {
+            o.pop_front();
+        }
+        o.push_back(val);
+        drop(o);
+        self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let backend = self.backend.lock().unwrap().clone();
         backend.send_byte(val);
     }
@@ -368,6 +391,20 @@ impl Resettable for Com16550 {
     }
 }
 
+impl Com16550 {
+    fn access_read(&self, addr: u64) -> u8 {
+        let v = self.read_reg((addr | 7) as u32);
+        self.update_irq();
+        v
+    }
+
+    fn access_write(&self, addr: u64, val: u8) -> u32 {
+        self.write_reg((addr | 7) as u32, val);
+        self.update_irq();
+        BUS_OK
+    }
+}
+
 impl BusDevice for Com16550 {
     // Every width must be answered. An unimplemented one falls through to the
     // trait default, which reports a bus error — and a DBE inside POST looks
@@ -375,14 +412,17 @@ impl BusDevice for Com16550 {
     // The UART sits on MACE's 8-bit ISA bus, so its byte answers on any lane
     // of the doubleword: IRIX and the BSDs use +7, Linux's 8250 driver +0
     // (mapbase 0x1f390000, regshift 8).
-    fn read8(&self, addr: u64) -> BusRead8 { BusRead8::ok(self.read_reg((addr | 7) as u32)) }
-    fn read16(&self, addr: u64) -> BusRead16 { BusRead16::ok(self.read_reg((addr | 7) as u32) as u16) }
-    fn write16(&self, addr: u64, val: u16) -> u32 { self.write_reg((addr | 7) as u32, val as u8); BUS_OK }
-    fn write8(&self, addr: u64, val: u8) -> u32 { self.write_reg((addr | 7) as u32, val); BUS_OK }
-    fn read32(&self, addr: u64) -> BusRead32 { BusRead32::ok(self.read_reg((addr | 7) as u32) as u32) }
-    fn write32(&self, addr: u64, val: u32) -> u32 { self.write_reg((addr | 7) as u32, val as u8); BUS_OK }
-    fn read64(&self, addr: u64) -> BusRead64 { BusRead64::ok(self.read_reg((addr | 7) as u32) as u64) }
-    fn write64(&self, addr: u64, val: u64) -> u32 { self.write_reg((addr | 7) as u32, val as u8); BUS_OK }
+    // Reading the data or IIR register and writing IER can each move the
+    // interrupt, so every access drives it again: nothing else does on an
+    // access (the service thread covers input arriving from the host).
+    fn read8(&self, addr: u64) -> BusRead8 { BusRead8::ok(self.access_read(addr)) }
+    fn read16(&self, addr: u64) -> BusRead16 { BusRead16::ok(self.access_read(addr) as u16) }
+    fn write16(&self, addr: u64, val: u16) -> u32 { self.access_write(addr, val as u8) }
+    fn write8(&self, addr: u64, val: u8) -> u32 { self.access_write(addr, val) }
+    fn read32(&self, addr: u64) -> BusRead32 { BusRead32::ok(self.access_read(addr) as u32) }
+    fn write32(&self, addr: u64, val: u32) -> u32 { self.access_write(addr, val as u8) }
+    fn read64(&self, addr: u64) -> BusRead64 { BusRead64::ok(self.access_read(addr) as u64) }
+    fn write64(&self, addr: u64, val: u64) -> u32 { self.access_write(addr, val as u8) }
 }
 
 #[cfg(test)]

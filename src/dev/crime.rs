@@ -2,6 +2,7 @@
 //! bank control (the rendering engine is `o2gfx`).
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::snapshot::{get_field, hex_u64, load_u64_slice, toml_u64, u64_slice_to_toml};
@@ -57,40 +58,68 @@ pub const CRIME_LATCHED_BITS: u64 = 0x41cf_0000;
 /// modelled; a headless machine differs only in its console.
 pub const CRIME_REV: u64 = 0x0000_0000_0000_00a1;
 
+/// CRIME's interrupt controller: what the level-type inputs drive (INTSTAT's
+/// hardware bits), INTMASK, SOFTINT, and the edge-triggered sources CRIME
+/// holds until software writes a 0 to the bit in HARDINT: GBE's four timing
+/// lines (16..19), the rendering engine's empty/full/idle edges (22..24) and
+/// bit 30.
+#[derive(Default)]
+struct IntState {
+    levels: u64,
+    mask: u64,
+    soft: u64,
+    latched: u64,
+}
+
+impl IntState {
+    fn intstat(&self) -> u64 {
+        self.levels | self.soft | self.latched
+    }
+
+    fn pending(&self) -> bool {
+        self.intstat() & self.mask != 0
+    }
+}
+
+/// Words of `Crime::touched_bits`: a bit per 64-bit register and direction.
+const TOUCHED_WORDS: usize = (CRIME_SIZE / 8 * 2 / 64) as usize;
+
 /// Minimal CRIME: a 64-bit register file that remembers what it is told, with
 /// the handful of reads the PROM cannot be fobbed off with zero for.
 pub struct Crime {
     regs: Mutex<Vec<u64>>,
     /// Every distinct offset the guest has touched, in first-touch order, with
     /// whether it was read or written. This is the actual product of the first
-    /// milestone: the list of CRIME registers POST depends on.
+    /// milestone: the list of CRIME registers POST depends on. `touched_bits`
+    /// has a bit per register and direction, so an access already recorded
+    /// costs one relaxed load and the list is locked only on a first touch.
+    /// Not kept in a `lightning` build.
     trace: Mutex<Vec<(u32, bool)>>,
-    /// Values written, in order, as `(offset, value)` — the bank programming
-    /// is only meaningful if you can see what it was told.
-    writes: Mutex<Vec<(u32, u64)>>,
-    /// Edge-triggered sources CRIME holds until software writes a 0 to the
-    /// bit in HARDINT: GBE's four timing lines (16..19), the rendering
-    /// engine's empty/full/idle edges (22..24) and bit 30.
-    latched: Mutex<u64>,
+    touched_bits: [AtomicU64; TOUCHED_WORDS],
+    /// The interrupt state, apart from `regs`. Every change to it, an input
+    /// driven or a mask written, recomputes the output and hands it to IP2
+    /// under this lock, so two threads cannot deliver it out of order.
+    /// `regs` keeps no copy of INTSTAT, INTMASK or SOFTINT.
+    int: Mutex<IntState>,
     /// The guest's last accesses to the interrupt registers (status, mask,
     /// HARDINT, SOFTINT): `(write, offset, value)`, newest last, for the
     /// control port's `crimelog` (chasing interrupt storms).
+    /// Off until the monitor's `crime irqlog on`, and not kept in a
+    /// `lightning` build: IRIX reads INTSTAT and writes INTMASK on every
+    /// interrupt and every spl change.
     irqlog: Mutex<std::collections::VecDeque<(bool, u32, u64)>>,
+    irqlog_on: AtomicBool,
     revision: std::sync::atomic::AtomicU64,
     /// The clock CRIME's free-running counter is derived from, so the PROM's
     /// delays take the time they ask for rather than a number of reads.
     ust: std::sync::Arc<MaceUst>,
     /// Subtracted from the counter, so a write sets what the next read sees.
-    time_base: Mutex<u64>,
-    /// CRIME's one output, to the CPU's IP2 (`connect_output`), the level
-    /// last handed to it, and the lock that makes computing and handing on
-    /// one step. Unlocked, one thread could record "low" while another
-    /// raised IP2, after which every update saw no change and IP2 stayed up
-    /// with nothing behind it: IRIX re-entered its CRIME dispatcher forever
-    /// and the clock interrupt starved (the O2's input stall).
+    time_base: AtomicU64,
+    /// CRIME's one output, to the CPU's IP2 (`connect_output`). Driven under
+    /// `int`: computed and handed on as one step, a "low" and a "high" from
+    /// two threads cannot cross and leave IP2 up with nothing behind it (the
+    /// O2's input stall, when IRIX re-entered its CRIME dispatcher forever).
     out: std::sync::OnceLock<crate::irq::IrqLine>,
-    out_level: std::sync::atomic::AtomicBool,
-    out_lock: Mutex<()>,
     /// Software asked for a cold reset (CONTROL bit 11); the machine takes
     /// it ([`Crime::take_reset_request`]).
     reset_request: std::sync::atomic::AtomicBool,
@@ -106,15 +135,14 @@ impl Crime {
         Self {
             regs: Mutex::new(vec![0u64; (CRIME_SIZE / 8) as usize]),
             trace: Mutex::new(Vec::new()),
-            writes: Mutex::new(Vec::new()),
-            latched: Mutex::new(0),
+            touched_bits: std::array::from_fn(|_| AtomicU64::new(0)),
+            int: Mutex::new(IntState::default()),
             irqlog: Mutex::new(std::collections::VecDeque::new()),
+            irqlog_on: AtomicBool::new(false),
             revision: std::sync::atomic::AtomicU64::new(CRIME_REV),
             ust,
-            time_base: Mutex::new(0),
+            time_base: AtomicU64::new(0),
             out: std::sync::OnceLock::new(),
-            out_level: std::sync::atomic::AtomicBool::new(false),
-            out_lock: Mutex::new(()),
             reset_request: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -144,49 +172,47 @@ impl Crime {
         self.out.get().is_some()
     }
 
-    /// Hand the output on if it changed. Whoever changes CRIME's state calls
-    /// this after the change, so a caller that finds no change can leave it
-    /// to them; a change is computed and handed on under the lock.
-    pub fn update_output(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        let Some(out) = self.out.get() else { return self.interrupting() };
-        if self.interrupting() == self.out_level.load(Ordering::Acquire) {
-            return self.out_level.load(Ordering::Acquire);
-        }
-        let _held = self.out_lock.lock().unwrap();
-        let level = self.interrupting();
-        if self.out_level.swap(level, Ordering::AcqRel) != level {
+    /// Hand IP2 the output as `s` stands, with `int` held. Returns it.
+    fn drive(&self, s: &IntState) -> bool {
+        let level = s.pending();
+        if let Some(out) = self.out.get() {
             out.set(level);
         }
         level
     }
 
-    /// Raise or lower one of CRIME's interrupt inputs.
-    pub fn set_int(&self, bit: u32, on: bool) {
-        let mut r = self.regs.lock().unwrap();
-        let i = (crime_reg::INTSTAT / 8) as usize;
-        if on {
-            r[i] |= 1u64 << bit;
-        } else {
-            r[i] &= !(1u64 << bit);
-        }
+    /// Hand IP2 the output as it stands (after a snapshot restores the
+    /// state, or a CPU reset re-wires IP2). Returns it.
+    pub fn update_output(&self) -> bool {
+        self.drive(&self.int.lock().unwrap())
     }
 
-    /// Latch an edge-triggered source until software clears it in HARDINT.
-    pub fn latch_int(&self, bit: u32) {
-        *self.latched.lock().unwrap() |= (1u64 << bit) & CRIME_LATCHED_BITS;
+    /// Change the interrupt state and drive IP2 from the result.
+    fn change(&self, f: impl FnOnce(&mut IntState)) {
+        let mut s = self.int.lock().unwrap();
+        f(&mut s);
+        self.drive(&s);
     }
 
     /// INTSTAT: the level sources, the latched ones and the software ones.
     pub(crate) fn intstat(&self) -> u64 {
-        let r = self.regs.lock().unwrap();
-        r[(crime_reg::INTSTAT / 8) as usize] | r[(crime_reg::SOFTINT / 8) as usize] | *self.latched.lock().unwrap()
+        self.int.lock().unwrap().intstat()
     }
 
     /// True when something is pending that the mask lets through.
     pub fn interrupting(&self) -> bool {
-        let mask = self.regs.lock().unwrap()[(crime_reg::INTMASK / 8) as usize];
-        self.intstat() & mask != 0
+        self.int.lock().unwrap().pending()
+    }
+
+    /// The register file as the guest sees it, the interrupt registers
+    /// included: for the monitor and snapshots.
+    fn regs_view(&self) -> Vec<u64> {
+        let mut r = self.regs.lock().unwrap().clone();
+        let s = self.int.lock().unwrap();
+        r[(crime_reg::INTSTAT / 8) as usize] = s.levels;
+        r[(crime_reg::INTMASK / 8) as usize] = s.mask;
+        r[(crime_reg::SOFTINT / 8) as usize] = s.soft;
+        r
     }
 
     /// The raw counter, before the offset a write installs.
@@ -194,11 +220,18 @@ impl Crime {
         self.ust.guest_us().wrapping_mul(CRIME_TICKS_PER_US)
     }
 
+    #[inline]
     fn note(&self, off: u32, write: bool) {
-        let mut t = self.trace.lock().unwrap();
-        if !t.iter().any(|&(o, w)| o == off && w == write) {
-            t.push((off, write));
+        #[cfg(not(feature = "lightning"))]
+        {
+            let bit = (off / 8) * 2 + write as u32;
+            let (word, mask) = (&self.touched_bits[(bit / 64) as usize], 1u64 << (bit % 64));
+            if word.load(Ordering::Relaxed) & mask == 0 && word.fetch_or(mask, Ordering::Relaxed) & mask == 0 {
+                self.trace.lock().unwrap().push((off, write));
+            }
         }
+        #[cfg(feature = "lightning")]
+        let _ = (off, write);
     }
 
     /// Registers touched so far, in first-touch order: `(offset, was_write)`.
@@ -206,14 +239,33 @@ impl Crime {
         self.trace.lock().unwrap().clone()
     }
 
+    #[inline]
     fn log_irq(&self, write: bool, off: u32, val: u64) {
-        if matches!(off, crime_reg::INTSTAT | crime_reg::INTMASK | crime_reg::HARDINT | crime_reg::SOFTINT) {
+        #[cfg(not(feature = "lightning"))]
+        if self.irqlog_on.load(Ordering::Relaxed)
+            && matches!(off, crime_reg::INTSTAT | crime_reg::INTMASK | crime_reg::HARDINT | crime_reg::SOFTINT)
+        {
             let mut l = self.irqlog.lock().unwrap();
             if l.len() >= 8192 {
                 l.pop_front();
             }
             l.push_back((write, off, val));
         }
+        #[cfg(feature = "lightning")]
+        let _ = (write, off, val);
+    }
+
+    /// Start or stop recording interrupt-register accesses. Starting clears
+    /// what an earlier recording left. A `lightning` build records nothing.
+    pub fn set_irqlog(&self, on: bool) -> Result<(), String> {
+        if cfg!(feature = "lightning") {
+            return Err("crime: a lightning build does not record the interrupt log".into());
+        }
+        if on {
+            self.irqlog.lock().unwrap().clear();
+        }
+        self.irqlog_on.store(on, Ordering::Relaxed);
+        Ok(())
     }
 
     /// The interrupt-register log, one access per line, oldest first.
@@ -227,17 +279,24 @@ impl Crime {
         v
     }
 
-    fn load_inner(&self, off: u32) -> u64 {
+    /// A register's value, as a read would return it, without recording
+    /// the access.
+    pub(crate) fn load_inner(&self, off: u32) -> u64 {
         match off {
             // Identity. Returning zero here is the one thing guaranteed to make
             // a PROM decide it is running on hardware it does not recognise.
             crime_reg::REVISION => self.revision(),
             crime_reg::INTSTAT => self.intstat(),
-            crime_reg::HARDINT => self.regs.lock().unwrap()[(crime_reg::INTSTAT / 8) as usize] | *self.latched.lock().unwrap(),
+            crime_reg::INTMASK => self.int.lock().unwrap().mask,
+            crime_reg::SOFTINT => self.int.lock().unwrap().soft,
+            crime_reg::HARDINT => {
+                let s = self.int.lock().unwrap();
+                s.levels | s.latched
+            }
             // A free-running microsecond-ish counter. POST loops on this to time
             // out, so a constant would hang it forever.
             crime_reg::TIME => {
-                let base = *self.time_base.lock().unwrap();
+                let base = self.time_base.load(Ordering::Relaxed);
                 self.raw_time().wrapping_sub(base) & 0x0000_ffff_ffff_ffff
             }
             _ => self.regs.lock().unwrap()[(off / 8) as usize],
@@ -247,9 +306,6 @@ impl Crime {
     fn store(&self, off: u32, val: u64) {
         self.log_irq(true, off, val);
         self.store_inner(off, val);
-        if matches!(off, crime_reg::INTMASK | crime_reg::SOFTINT | crime_reg::HARDINT) {
-            self.update_output();
-        }
     }
 
     /// Whether software has asked for a cold reset since the last call.
@@ -266,32 +322,17 @@ impl Crime {
             }
             // Read-only: the sources set it, not the CPU.
             crime_reg::INTSTAT => return,
-            crime_reg::HARDINT => {
-                let mut l = self.latched.lock().unwrap();
-                *l &= val | !CRIME_LATCHED_BITS;
-                return;
-            }
-            crime_reg::SOFTINT => {
-                self.regs.lock().unwrap()[(off / 8) as usize] = val & 0xf1ff_ffff;
-                return;
-            }
+            crime_reg::HARDINT => return self.change(|s| s.latched &= val | !CRIME_LATCHED_BITS),
+            crime_reg::SOFTINT => return self.change(|s| s.soft = val & 0xf1ff_ffff),
+            crime_reg::INTMASK => return self.change(|s| s.mask = val),
             _ => {}
         }
         if off == crime_reg::TIME {
             // The PROM zeroes the counter and then waits for it to reach a
             // deadline, so a write has to set where it counts from.
-            *self.time_base.lock().unwrap() = self.raw_time().wrapping_sub(val);
+            self.time_base.store(self.raw_time().wrapping_sub(val), Ordering::Relaxed);
         }
         self.regs.lock().unwrap()[(off / 8) as usize] = val;
-        let mut w = self.writes.lock().unwrap();
-        if w.len() < 256 {
-            w.push((off, val));
-        }
-    }
-
-    /// Values written, in order.
-    pub fn written(&self) -> Vec<(u32, u64)> {
-        self.writes.lock().unwrap().clone()
     }
 }
 
@@ -301,14 +342,18 @@ impl Crime {
 /// them in HARDINT; the rest follow their level.
 impl crate::irq::InterruptController for Crime {
     fn set_line(&self, line: u32, level: bool) {
-        if (1u64 << line) & CRIME_LATCHED_BITS != 0 {
-            if level {
-                self.latch_int(line);
+        let bit = 1u64 << line;
+        self.change(|s| {
+            if bit & CRIME_LATCHED_BITS != 0 {
+                if level {
+                    s.latched |= bit;
+                }
+            } else if level {
+                s.levels |= bit;
+            } else {
+                s.levels &= !bit;
             }
-        } else {
-            self.set_int(line, level);
-        }
-        self.update_output();
+        });
     }
 }
 
@@ -320,33 +365,42 @@ impl Device for Crime {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("crime".to_string(), "CRIME: crime status | crime regs | crime irqlog [n] | crime touched".to_string())]
+        vec![("crime".to_string(), "CRIME: crime status | crime regs | crime irqlog [on|off|n] | crime touched".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
         if cmd != "crime" {
             return Err("Command not found".to_string());
         }
-        let reg = |off: u32| self.regs.lock().unwrap()[(off / 8) as usize];
+        let regs = self.regs_view();
+        let reg = |off: u32| regs[(off / 8) as usize];
         match args.first().copied().unwrap_or("status") {
             "status" => {
                 let (stat, mask) = (self.intstat(), reg(crime_reg::INTMASK));
                 writeln!(w, "CRIME revision {:#x}", self.revision()).ok();
                 writeln!(w, "  interrupts: status {stat:#010x} mask {mask:#010x} pending {:#010x} latched {:#010x} soft {:#010x}",
-                    stat & mask, *self.latched.lock().unwrap(), reg(crime_reg::SOFTINT)).ok();
+                    stat & mask, self.int.lock().unwrap().latched, reg(crime_reg::SOFTINT)).ok();
                 writeln!(w, "  control {:#x} time {:#x}", reg(crime_reg::CONTROL), self.load_inner(crime_reg::TIME)).ok();
                 for i in 0..8u32 {
                     writeln!(w, "  bank {i}: ctrl {:#06x}", reg(crime_reg::MEM_BANK_CTRL0 + 8 * i)).ok();
                 }
             }
             "regs" => {
-                for (i, &v) in self.regs.lock().unwrap().iter().enumerate() {
+                for (i, &v) in regs.iter().enumerate() {
                     if v != 0 {
                         writeln!(w, "  {:#06x}: {v:#018x}", i * 8).ok();
                     }
                 }
             }
+            "irqlog" if matches!(args.get(1).copied(), Some("on" | "off")) => {
+                let on = args[1] == "on";
+                self.set_irqlog(on)?;
+                writeln!(w, "  interrupt-register log {}", if on { "recording" } else { "stopped" }).ok();
+            }
             "irqlog" => {
+                if !self.irqlog_on.load(Ordering::Relaxed) {
+                    writeln!(w, "  (not recording; `crime irqlog on` starts)").ok();
+                }
                 let n: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(32);
                 let log = self.irqlog_text();
                 let lines: Vec<&str> = log.lines().collect();
@@ -359,7 +413,7 @@ impl Device for Crime {
                     writeln!(w, "  {off:#06x} {}", if write { "W" } else { "R" }).ok();
                 }
             }
-            _ => return Err("Usage: crime status | regs | irqlog [n] | touched".to_string()),
+            _ => return Err("Usage: crime status | regs | irqlog [on|off|n] | touched".to_string()),
         }
         Ok(())
     }
@@ -370,8 +424,8 @@ impl Resettable for Crime {
     /// the revision is the chip's and stays.
     fn power_on(&self) {
         self.regs.lock().unwrap().fill(0);
-        *self.latched.lock().unwrap() = 0;
-        *self.time_base.lock().unwrap() = 0;
+        self.change(|s| *s = IntState::default());
+        self.time_base.store(0, Ordering::Relaxed);
         self.irqlog.lock().unwrap().clear();
     }
 }
@@ -382,22 +436,28 @@ impl Resettable for Crime {
 impl Saveable for Crime {
     fn save_state(&self) -> toml::Value {
         let mut t = toml::map::Map::new();
-        t.insert("regs".into(), u64_slice_to_toml(&self.regs.lock().unwrap()));
-        t.insert("latched".into(), hex_u64(*self.latched.lock().unwrap()));
+        t.insert("regs".into(), u64_slice_to_toml(&self.regs_view()));
+        t.insert("latched".into(), hex_u64(self.int.lock().unwrap().latched));
         t.insert("revision".into(), hex_u64(self.revision()));
-        t.insert("time_base".into(), hex_u64(*self.time_base.lock().unwrap()));
+        t.insert("time_base".into(), hex_u64(self.time_base.load(Ordering::Relaxed)));
         toml::Value::Table(t)
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let mut int = IntState { latched: get_field(v, "latched").and_then(toml_u64).unwrap_or(0), ..Default::default() };
         if let Some(r) = get_field(v, "regs") {
-            load_u64_slice(r, &mut self.regs.lock().unwrap());
+            let mut regs = self.regs.lock().unwrap();
+            load_u64_slice(r, &mut regs);
+            let mut take = |off: u32| std::mem::take(&mut regs[(off / 8) as usize]);
+            int.levels = take(crime_reg::INTSTAT);
+            int.mask = take(crime_reg::INTMASK);
+            int.soft = take(crime_reg::SOFTINT);
         }
-        *self.latched.lock().unwrap() = get_field(v, "latched").and_then(toml_u64).unwrap_or(0);
+        *self.int.lock().unwrap() = int;
         if let Some(rev) = get_field(v, "revision").and_then(toml_u64) {
             self.set_revision(rev);
         }
-        *self.time_base.lock().unwrap() = get_field(v, "time_base").and_then(toml_u64).unwrap_or(0);
+        self.time_base.store(get_field(v, "time_base").and_then(toml_u64).unwrap_or(0), Ordering::Relaxed);
         self.update_output();
         Ok(())
     }
@@ -429,7 +489,7 @@ impl BusDevice for Crime {
 
     fn write32(&self, addr: u64, val: u32) -> u32 {
         let off = (addr as u32) & (CRIME_SIZE - 1) & !7;
-        let cur = self.load(off);
+        let cur = self.load_inner(off);
         let merged = if (addr & 4) == 0 {
             (cur & 0x0000_0000_ffff_ffff) | ((val as u64) << 32)
         } else {
@@ -448,11 +508,11 @@ impl BusDevice for Crime {
 pub struct CrimeSpace {
     pub regs: std::sync::Arc<Crime>,
     pub re: crate::dev::o2gfx::CrimeRe,
-    ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>,
+    ram: std::sync::Arc<crate::dev::crime_mem::O2Memory>,
 }
 
 impl CrimeSpace {
-    pub fn new(regs: std::sync::Arc<Crime>, ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>) -> Self {
+    pub fn new(regs: std::sync::Arc<Crime>, ram: std::sync::Arc<crate::dev::crime_mem::O2Memory>) -> Self {
         Self { re: crate::dev::o2gfx::CrimeRe::new(ram.clone()), regs, ram }
     }
 
@@ -472,8 +532,8 @@ impl CrimeSpace {
     fn regs_wrote(&self, addr: u32) {
         let off = (addr - CRIME_BASE) & !7;
         if (crime_reg::MEM_BANK_CTRL0..crime_reg::MEM_BANK_CTRL0 + 8 * 8).contains(&off) {
-            let v = self.regs.load(off);
-            self.ram.lock().unwrap().set_ctrl(((off - crime_reg::MEM_BANK_CTRL0) / 8) as usize, v);
+            let v = self.regs.load_inner(off);
+            self.ram.set_ctrl(((off - crime_reg::MEM_BANK_CTRL0) / 8) as usize, v);
         }
     }
 }
@@ -505,20 +565,27 @@ impl Saveable for CrimeSpace {
 
 // Narrow accesses reach both as the 32-bit word they fall in: neither has a
 // byte-wide register, and the engine's busy status passes through.
+/// CRIME's registers and its rendering engine are smaller than a slot of
+/// the bus's decode table, so the space takes whole slots and answers the
+/// rest as the bus does where nothing is: reads find zero, writes fail.
 impl BusDevice for CrimeSpace {
     fn read8(&self, addr: u64) -> crate::traits::BusRead8 {
-        let r = if Self::in_re(addr as u32) { self.re.read32(addr & !3) } else { self.regs.read32(addr & !3) };
+        let r = self.read32(addr & !3);
         crate::traits::BusRead8 { status: r.status, data: r.data as u8 }
     }
     fn read16(&self, addr: u64) -> crate::traits::BusRead16 {
-        let r = if Self::in_re(addr as u32) { self.re.read32(addr & !3) } else { self.regs.read32(addr & !3) };
+        let r = self.read32(addr & !3);
         crate::traits::BusRead16 { status: r.status, data: r.data as u16 }
     }
     fn read32(&self, addr: u64) -> BusRead32 {
-        if Self::in_re(addr as u32) { self.re.read32(addr) } else { self.regs.read32(addr) }
+        if Self::in_re(addr as u32) { self.re.read32(addr) }
+        else if Self::in_regs(addr as u32) { self.regs.read32(addr) }
+        else { BusRead32::ok(0) }
     }
     fn read64(&self, addr: u64) -> BusRead64 {
-        if Self::in_re(addr as u32) { self.re.read64(addr) } else { self.regs.read64(addr) }
+        if Self::in_re(addr as u32) { self.re.read64(addr) }
+        else if Self::in_regs(addr as u32) { self.regs.read64(addr) }
+        else { BusRead64::ok(0) }
     }
     fn write8(&self, addr: u64, val: u8) -> u32 {
         self.write32(addr & !3, val as u32)
@@ -530,6 +597,9 @@ impl BusDevice for CrimeSpace {
         if Self::in_re(addr as u32) {
             return self.re.write32(addr, val);
         }
+        if !Self::in_regs(addr as u32) {
+            return crate::traits::BUS_ERR;
+        }
         let r = self.regs.write32(addr, val);
         self.regs_wrote(addr as u32);
         r
@@ -537,6 +607,9 @@ impl BusDevice for CrimeSpace {
     fn write64(&self, addr: u64, val: u64) -> u32 {
         if Self::in_re(addr as u32) {
             return self.re.write64(addr, val);
+        }
+        if !Self::in_regs(addr as u32) {
+            return crate::traits::BUS_ERR;
         }
         let r = self.regs.write64(addr, val);
         self.regs_wrote(addr as u32);

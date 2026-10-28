@@ -35,6 +35,7 @@ use std::time::Instant;
 use parking_lot::Mutex;
 use crate::config::AudioConfig;
 use crate::dev::crime_mem::O2Memory;
+use crate::traits::BusDevice;
 use crate::host_audio::{HostOut, Resampler};
 
 /// Where the audio registers sit, and their 16 KB block.
@@ -260,7 +261,7 @@ impl State {
 
 /// What playback reaches outside the block.
 pub struct AudioIo<'a> {
-    pub ram: &'a std::sync::Mutex<O2Memory>,
+    pub ram: &'a O2Memory,
     /// The ring block's physical address, from the ISA ring base register.
     pub ring_base: u32,
     /// The MACE UST counter now, for the channels' stamps.
@@ -474,7 +475,7 @@ impl MaceAudio {
         let now = Instant::now();
         let mut pcm: [Vec<(i16, i16)>; 2] = [Vec::new(), Vec::new()];
         let mut rates = [0u32; 2];
-        let mut ram = io.ram.lock().unwrap();
+        let ram = &*io.ram;
         // The input: no host capture yet, so the ADC delivers silence at its
         // rate, as a quiet microphone would. A recording program (amesh)
         // then sees its ring fill instead of waiting for ever.
@@ -487,10 +488,10 @@ impl MaceAudio {
                         break; // full: the engine never fills the last slot
                     }
                     let addr = io.ring_base | c.wptr | c.sub * 8;
-                    if let Some(o) = ram.dma_offset(addr).filter(|&o| o + 8 <= ram.len()) {
+                    if let Some(o) = ram.dma_offset(addr).map(|o| o as u64) {
                         // Each half: sign extension, the sample, 0xff.
-                        ram.put_be(o, 4, 0xff);
-                        ram.put_be(o + 4, 4, 0xff);
+                        ram.phys().write32(o, 0xff);
+                        ram.phys().write32(o + 4, 0xff);
                     }
                     c.sub += 1;
                     if c.sub == 4 {
@@ -526,9 +527,9 @@ impl MaceAudio {
                     }
                     c.dry = 0;
                     let addr = io.ring_base | (n as u32) << 12 | c.rptr | c.sub * 8;
-                    if let Some(o) = ram.dma_offset(addr).filter(|&o| o + 8 <= ram.len()) {
+                    if let Some(o) = ram.dma_offset(addr).map(|o| o as u64) {
                         let half = |w: u32| ((w as i32) >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                        let (l, r) = (half(ram.get_be(o, 4)), half(ram.get_be(o + 4, 4)));
+                        let (l, r) = (half(ram.phys().read32(o).data), half(ram.phys().read32(o + 4).data));
                         let scale = |v: i16, g: f32| (v as f32 * g).round() as i16;
                         item = (scale(l, gain_l), scale(r, gain_r));
                         if l != 0 || r != 0 {
@@ -546,8 +547,9 @@ impl MaceAudio {
                 pcm[out].push(item);
             }
         }
-        drop(ram);
         drop(st);
+        // The pointers moved: a ring may have crossed its threshold.
+        self.update_irq();
         if tracing() {
             let mut last = self.last_report.lock();
             if last.is_none_or(|t| t.elapsed().as_secs() >= 1) {
@@ -716,10 +718,16 @@ impl crate::traits::BusDevice for MaceAudio {
         crate::traits::BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 })
     }
     fn read64(&self, addr: u64) -> crate::traits::BusRead64 { crate::traits::BusRead64::ok(self.read(addr as u32)) }
-    fn write8(&self, addr: u64, val: u8) -> u32 { self.write(addr as u32, val as u64); crate::traits::BUS_OK }
-    fn write16(&self, addr: u64, val: u16) -> u32 { self.write(addr as u32, val as u64); crate::traits::BUS_OK }
-    fn write32(&self, addr: u64, val: u32) -> u32 { self.write(addr as u32, val as u64); crate::traits::BUS_OK }
-    fn write64(&self, addr: u64, val: u64) -> u32 { self.write(addr as u32, val); crate::traits::BUS_OK }
+    fn write8(&self, addr: u64, val: u8) -> u32 { self.write64(addr, val as u64) }
+    fn write16(&self, addr: u64, val: u16) -> u32 { self.write64(addr, val as u64) }
+    fn write32(&self, addr: u64, val: u32) -> u32 { self.write64(addr, val as u64) }
+    /// A write can start, stop or acknowledge a channel, so the ISA bits
+    /// are driven again after it.
+    fn write64(&self, addr: u64, val: u64) -> u32 {
+        self.write(addr as u32, val);
+        self.update_irq();
+        crate::traits::BUS_OK
+    }
 }
 
 impl crate::traits::Device for MaceAudio {
@@ -832,7 +840,7 @@ mod tests {
     /// each half) up to one block short of full.
     #[test]
     fn the_input_ring_fills_with_silence() {
-        let ram = std::sync::Mutex::new(O2Memory::single(8 << 20));
+        let ram = O2Memory::single(8 << 20);
         let a = MaceAudio::new();
         a.write(MACE_AUDIO, 0);
         write_codec(&a, 28, 0x1000); // clock 2 on, converters up
@@ -848,9 +856,8 @@ mod tests {
         a.poll(&io);
         let wp = a.read(MACE_AUDIO + 0x30) as u32;
         assert!(wp > 0, "the engine wrote");
-        let m = ram.lock().unwrap();
+        let m = &ram;
         assert_eq!(m.get_be(m.dma_offset(ring_base).unwrap(), 4), 0xff);
-        drop(m);
         std::thread::sleep(std::time::Duration::from_millis(250));
         a.poll(&io);
         assert_eq!(a.read(MACE_AUDIO + 0x38) as u32, PTR_MASK, "full: one block short");
@@ -881,7 +888,7 @@ mod tests {
     /// read pointer follows, and the threshold bit says when it runs low.
     #[test]
     fn an_output_ring_plays_at_the_dac_rate() {
-        let ram = std::sync::Mutex::new(O2Memory::single(8 << 20));
+        let ram = O2Memory::single(8 << 20);
         let a = MaceAudio::new();
         a.write(MACE_AUDIO, 0);
         write_codec(&a, 28, 0x0800); // clock 1 on, converters up
@@ -891,7 +898,7 @@ mod tests {
         let ring_base = 0x0010_0000u32;
         for i in 0..64u32 {
             let s = ((i as i32 * 100) << 8) as u32;
-            let mut m = ram.lock().unwrap();
+            let m = &ram;
             let o = m.dma_offset(ring_base | 0x1000 | i * 8).unwrap();
             m.put_be(o, 4, s);
         }

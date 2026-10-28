@@ -310,9 +310,21 @@ interpreter), `--features jitv2_smc_check` (writes onto executing pages), and
 | `cow status` / `cow commit [id]` / `cow reset [id]` | Copy-on-write overlays (`cow1 ...` on the O2's second controller) |
 
 On the O2 the controllers are Adaptec 7880s: `scsi regs` shows that chip's
-interrupt status, queues and command totals, and `wdt`, `defer`, `debug` and
+interrupt status, queues and command totals, whether its worker thread is
+running (commands run on it, off the CPU's thread), any completions held
+for a paused sequencer and NetBSD's doorbell, and `wdt`, `defer`, `debug` and
 `dayna` are not there. Ids are per controller, as in the `[scsi.N]` tables
 (`[scsi.17]` is id 1 on controller 1, so `scsi1 eject 1`).
+
+On the Octane the controllers are ISP1040s: `scsi notes` (`scsi1 notes`)
+shows the command total and anything odd the driver did; `regs`, `wdt`,
+`defer`, `debug` and `dayna` are not there. It also has `heart status`
+(interrupt bits, mask, counter, bank descriptors), `heart unsupported`
+(HEART registers touched but not modelled) and `ip30 memcfg|bridge|gfx|xbow|unmapped`
+(the banks as HEART places them, the Bridge's interrupt routing, the graphics
+widget's link, refused Crossbow accesses, and accesses to physical addresses
+nothing is mapped at, with the PC). The `phys` commands work on the Octane as
+well.
 
 Queue position `[0]` is the mounted disc, `[1]` the next on eject. A disc
 change reaches IRIX as a Unit Attention ("medium changed") on its next
@@ -441,11 +453,11 @@ a forced termination; a normal stop saves them automatically.
 |---|---|
 | `phys mem <addr> [n]` / `mm` | Dump physical memory |
 | `phys dis <addr> [n]` / `md` | Disassemble physical memory |
-| `phys map` | The decode table: pages by kind (untouched, shared, private), memory in use, slots faulted in, and the table as runs of devices |
+| `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2, Octane) |
 | `phys trace <on\|off>` / `trace <on\|off>` | Log physical bus accesses |
 | `phys error <on\|off>` | Stop on bus errors |
 | `phys hole <on\|off>` | Stop on accesses to unmapped addresses |
-| `phys bench` / `bench` | Memory write benchmark |
+| `phys bench` / `bench` | Memory write benchmark: fills the first fully mapped 64 MB of RAM (overwrites it) |
 
 ### Logging
 
@@ -491,7 +503,7 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 
 | Command | Description |
 |---|---|
-| `crime status` / `crime regs` / `crime irqlog [n]` / `crime touched` | CRIME interrupts, mask and memory banks / registers / recent interrupt changes / registers the guest used |
+| `crime status` / `crime regs` / `crime irqlog [on\|off\|n]` / `crime touched` | CRIME interrupts, mask and memory banks / registers / the last *n* interrupt-register accesses (recorded only after `crime irqlog on`, which clears the old log; never in a `lightning` build) / registers the guest used (not kept in a `lightning` build) |
 | `re status` / `re notes` | CRIME rendering engine state / notes on unusual commands |
 | `gbe status` | GBE display engine: timing, frame buffer, tiles |
 | `isa status` | MACE ISA interrupts |
@@ -518,8 +530,8 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 | `o2 peek ADDR LEN PATH` | Physical memory to a file (up to 1 MB) |
 | `o2 retrace PATH` | Recorded rendering-engine primitives (`IRIS_IP32_RE_TRACE`) |
 | `o2 scsi PATH` | The SCSI controllers' recent commands |
-| `o2 unmapped` | Bus accesses that reached no device (the first 64 distinct), with the PC that made each |
-| `o2 ps2log PATH` / `o2 crimelog PATH` / `o2 nictrace PATH` | PS/2 traffic / recent CRIME interrupt-register accesses / the MAC-address chip's register trace and 1-Wire protocol log |
+| `o2 unmapped` | Bus accesses that reached no device (the first 64 distinct), with the PC that made each (not kept in a `lightning` build) |
+| `o2 ps2log PATH` / `o2 crimelog PATH` / `o2 nictrace PATH` | PS/2 traffic / CRIME interrupt-register accesses recorded since `crime irqlog on` / the MAC-address chip's register trace and 1-Wire protocol log |
 
 ## Recipes
 

@@ -25,9 +25,11 @@
 //! in force is read from scratch RAM at each doorbell, never latched,
 //! because one boot can hand the chip from one driver to the next.
 
+use crate::locks::{SpinGuard, SpinLock};
 use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiDevice, ScsiIdentity, ScsiRequest};
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::snapshot::{get_field, hex_u16, hex_u32, hex_u64, hex_u8, load_u8_slice, toml_u16, toml_u32, toml_u64, toml_u8, u8_slice_to_toml};
 
@@ -258,6 +260,71 @@ pub mod scb {
 pub const SCB_COUNT: usize = 16;
 pub const SCB_SIZE: usize = (reg::SCBARRAY_LAST - reg::SCBARRAY_FIRST + 1) as usize;
 
+/// A command the sequencer has taken off a queue, with what it read from
+/// the chip to run it.
+enum Job {
+    /// A tag from `QINFIFO` (the HIM, and drivers without a doorbell):
+    /// the SCB array's address, whether errors go back as pausing
+    /// interrupts, and the chip's own SCSI id.
+    Tag { tag: u8, array: u32, errors: bool, own: u8 },
+    /// A tag from NetBSD's queue-in ring.
+    NetBsd { tag: u8, hscb_base: u32, shared: u32 },
+}
+
+/// What a finished command leaves for the sequencer to tell the host.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Done {
+    /// Nobody answered at the id: `SCSIINT` with `SELTO`, the sequencer stopped.
+    SelectionTimeout { tag: u8 },
+    /// The target ended with this status: `SEQINT` for the HIM to collect.
+    BadStatus { tag: u8, status: u8 },
+    /// A tag for the queue-out, the HIM's way or the plain one.
+    Complete { tag: u8, target: u8 },
+    /// A tag for NetBSD's queue-out ring at `shared`.
+    NetBsd { tag: u8, shared: u32 },
+}
+
+impl Done {
+    fn to_toml(self) -> toml::Value {
+        let (kind, tag, arg, ring) = match self {
+            Done::SelectionTimeout { tag } => ("seltimeout", tag, 0, 0),
+            Done::BadStatus { tag, status } => ("badstatus", tag, status, 0),
+            Done::Complete { tag, target } => ("complete", tag, target, 0),
+            Done::NetBsd { tag, shared } => ("netbsd", tag, 0, shared),
+        };
+        let mut t = toml::map::Map::new();
+        t.insert("kind".into(), toml::Value::String(kind.into()));
+        t.insert("tag".into(), hex_u8(tag));
+        t.insert("arg".into(), hex_u8(arg));
+        t.insert("ring".into(), hex_u32(ring));
+        toml::Value::Table(t)
+    }
+
+    fn from_toml(v: &toml::Value) -> Option<Self> {
+        let b = |k: &str| get_field(v, k).and_then(toml_u8).unwrap_or(0);
+        let (tag, arg) = (b("tag"), b("arg"));
+        Some(match get_field(v, "kind")?.as_str()? {
+            "seltimeout" => Done::SelectionTimeout { tag },
+            "badstatus" => Done::BadStatus { tag, status: arg },
+            "complete" => Done::Complete { tag, target: arg },
+            "netbsd" => Done::NetBsd { tag, shared: get_field(v, "ring").and_then(toml_u32).unwrap_or(0) },
+            _ => return None,
+        })
+    }
+}
+
+/// What running one command produced, gathered without the state lock and
+/// applied under it.
+#[derive(Default)]
+struct Outcome {
+    notes: Vec<String>,
+    cmds: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    executed: Option<(u8, u32, Vec<u8>)>,
+    done: Option<Done>,
+}
+
 /// Everything the guest can see, plus a record of what it did.
 struct State {
     regs: [u8; 0x100],
@@ -286,6 +353,16 @@ struct State {
     qoutpos: u32,
     /// How far we have consumed NetBSD's queue-in ring.
     qinpos: u8,
+    /// NetBSD has rung: its ring may hold tags past `qinpos`. Decided when
+    /// `KERNEL_QINPOS` is written, acted on once the sequencer runs (the
+    /// driver writes it with the sequencer paused).
+    nb_doorbell: bool,
+    /// Finished commands that found the sequencer paused, posted in order
+    /// once it runs again.
+    held: VecDeque<Done>,
+    /// Bumped by a chip reset, so a command that was running across one is
+    /// not posted afterwards.
+    generation: u64,
     /// How many times the sequencer was paused or restarted.
     pauses: u64,
     /// Per SCB: filled in through the register window since last queued.
@@ -315,6 +392,9 @@ impl Default for State {
             executed: Vec::new(),
             qoutpos: 0,
             qinpos: 0,
+            nb_doorbell: false,
+            held: VecDeque::new(),
+            generation: 0,
             pauses: 0,
             scb_onchip: [false; SCB_COUNT],
             total_cmds: 0,
@@ -326,7 +406,19 @@ impl Default for State {
 }
 
 pub struct Aic7880 {
-    st: Mutex<State>,
+    /// The chip's state. The CPU takes it for every register access and the
+    /// worker only to take a command and to post its result, never across
+    /// a transfer, so the sections are short and a spin lock fits.
+    st: SpinLock<State>,
+    /// Held by whoever is running a command, so a command run inline (no
+    /// worker) can never overlap one on the worker while it is stopping.
+    exec: Mutex<()>,
+    /// The sequencer's thread, and whether it should be running. Commands
+    /// run there, off the CPU's thread; see [`Self::service_one`].
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    running: AtomicBool,
+    /// This controller, for the worker to hold.
+    me: Weak<Self>,
     /// The targets on the bus, by SCSI id (the shared SCSI devices: disks,
     /// CHDs, overlays, CD-ROMs). An install needs at least two -- the media
     /// to read and the disk to write.
@@ -360,16 +452,21 @@ pub const PCI_DEVICE_AIC7880: u16 = 0x8078;
 pub const PCI_CLASS_SCSI: u32 = 0x0100_00;
 
 impl Aic7880 {
-    pub fn new() -> Self {
+    pub fn new() -> Arc<Self> {
         Self::new_at(0)
     }
 
     /// The controller at `index`: 0 on the internal bus, 1 on the external
-    /// connector.
-    pub fn new_at(index: u8) -> Self {
-        Self {
+    /// connector. Commands run inline until [`crate::traits::Device::start`]
+    /// gives it its own thread.
+    pub fn new_at(index: u8) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
             index,
-            st: Mutex::new(State::default()),
+            st: SpinLock::new(State::default()),
+            exec: Mutex::new(()),
+            worker: Mutex::new(None),
+            running: AtomicBool::new(false),
+            me: me.clone(),
             targets: Mutex::new(std::array::from_fn(|_| None)),
             dma: std::sync::OnceLock::new(),
             sense: Mutex::new(None),
@@ -383,7 +480,7 @@ impl Aic7880 {
                     [Bar::Io(0x100), Bar::Mem(0x1000), Bar::Unused, Bar::Unused, Bar::Unused, Bar::Unused], PCI_INTA)
             },
             target: 1,
-        }
+        })
     }
 
     /// `n` bytes of host memory from bus address `addr`, through the bridge.
@@ -458,12 +555,12 @@ impl Aic7880 {
 
     /// A running commentary on what the driver asked for.
     pub fn notes(&self) -> Vec<String> {
-        self.st.lock().unwrap().notes.clone()
+        self.st.lock().notes.clone()
     }
 
     /// Commands, bytes read and bytes written for the whole session.
     pub fn totals(&self) -> (u64, u64, u64) {
-        let st = self.st.lock().unwrap();
+        let st = self.st.lock();
         (st.total_cmds, st.total_in, st.total_out)
     }
 
@@ -471,7 +568,7 @@ impl Aic7880 {
     /// interrupt bits count: the code bits above them say what a `SEQINT`
     /// is about and are not an interrupt of their own.
     pub fn interrupting(&self) -> bool {
-        self.st.lock().unwrap().intstat & 0x0f != 0
+        self.st.lock().intstat & 0x0f != 0
     }
 
     /// Wire the chip's interrupt pin to `line`.
@@ -480,34 +577,40 @@ impl Aic7880 {
         self.update_irq();
     }
 
-    /// Drive the interrupt pin to the chip's state. Commands run to
-    /// completion inside the register write that starts them, so after a
-    /// write is the only time it can change.
+    /// Drive the interrupt pin to the chip's state.
     fn update_irq(&self) {
+        self.drive_irq(&self.st.lock());
+    }
+
+    /// Drive the pin from `st`, with the state locked. The worker posts
+    /// completions and the CPU clears them, so the pin is set under the
+    /// same lock as the change; set after releasing it, a completion's
+    /// "high" could land after the host's clear and stick.
+    fn drive_irq(&self, st: &State) {
         if let Some(l) = self.irq.get() {
-            l.set(self.interrupting());
+            l.set(st.intstat & 0x0f != 0);
         }
     }
 
     /// How many times the driver paused or restarted the sequencer.
     pub fn pauses(&self) -> u64 {
-        self.st.lock().unwrap().pauses
+        self.st.lock().pauses
     }
 
     /// The sequencer program the driver downloaded. Never executed; its
     /// length is how we know the download happened at all.
     pub fn seqram_len(&self) -> usize {
-        self.st.lock().unwrap().seqram.len()
+        self.st.lock().seqram.len()
     }
 
     /// Every SCB handed to the queue-in FIFO, as it looked when queued.
     /// Commands the controller fetched and ran.
     pub fn executed(&self) -> Vec<(u8, u32, Vec<u8>)> {
-        self.st.lock().unwrap().executed.clone()
+        self.st.lock().executed.clone()
     }
 
     pub fn queued(&self) -> Vec<(u8, [u8; SCB_SIZE])> {
-        self.st.lock().unwrap().queued.clone()
+        self.st.lock().queued.clone()
     }
 
     /// A 32-bit value from the sequencer's scratch RAM, which the driver
@@ -645,9 +748,36 @@ impl crate::scsi_monitor::ScsiTargets for Aic7880 {
 /// `scsi_monitor`'s, so the WD33C93A's `wdt`, `defer` and `debug` are not here.
 impl crate::traits::Device for Aic7880 {
     fn step(&self, _cycles: u64) {}
-    fn stop(&self) {}
-    fn start(&self) {}
-    fn is_running(&self) -> bool { true }
+
+    /// Stop the sequencer's thread. A command it is running finishes first,
+    /// and is posted or held, so a snapshot taken after this sees no
+    /// command half done. Commands then run inline until `start`.
+    fn stop(&self) {
+        let mut worker = self.worker.lock().unwrap();
+        self.running.store(false, Ordering::Release);
+        if let Some(w) = worker.take() {
+            w.thread().unpark();
+            let _ = w.join();
+        }
+    }
+
+    /// Give the sequencer its own thread, so disk I/O no longer runs on the
+    /// CPU's.
+    fn start(&self) {
+        let mut worker = self.worker.lock().unwrap();
+        if self.running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let me = self.me.clone();
+        *worker = Some(
+            std::thread::Builder::new()
+                .name(format!("AIC-7880-{}", self.index))
+                .spawn(move || Self::worker_loop(me))
+                .expect("aic7880: worker thread"),
+        );
+    }
+
+    fn is_running(&self) -> bool { self.running.load(Ordering::Acquire) }
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
@@ -673,10 +803,13 @@ impl crate::traits::Device for Aic7880 {
                 return done;
             }
             if args.first().copied() == Some("regs") {
-                let st = self.st.lock().unwrap();
+                let st = self.st.lock();
                 let _ = writeln!(w, "Adaptec AIC-7880, controller {}", self.index);
                 let _ = writeln!(w, "  INTSTAT={:02x} SSTAT0={:02x} SSTAT1={:02x} SEQADDR={:#x}", st.intstat, st.sstat0, st.sstat1, st.seqaddr);
                 let _ = writeln!(w, "  queue in: {} waiting (pos {})  queue out: {} waiting (pos {})", st.qin.len(), st.qinpos, st.qout.len(), st.qoutpos);
+                let _ = writeln!(w, "  worker: {}  held completions: {}  NetBSD doorbell: {}",
+                    if self.running.load(Ordering::Acquire) { "running" } else { "off (commands run inline)" },
+                    st.held.len(), st.nb_doorbell);
                 let _ = writeln!(w, "  sequencer pauses: {}  commands: {} ({} bytes in, {} out)", st.pauses, st.total_cmds, st.total_in, st.total_out);
                 for n in &st.notes {
                     let _ = writeln!(w, "  note: {n}");
@@ -888,23 +1021,19 @@ impl Aic7880 {
         self.request(target, cdb, Some(data)).1
     }
 
-    /// Consume everything the host has added to its queue-in ring.
-    fn drain_netbsd(&self, st: &mut State, want: u8) {
+    /// The next tag from NetBSD's queue-in ring, if the host has added one
+    /// the sequencer has not taken. Clears the doorbell once it has caught up.
+    fn plan_netbsd(&self, st: &mut State) -> Option<Job> {
+        let want = st.regs[nb::KERNEL_QINPOS as usize];
         let shared = Self::scratch_le32(st, nb::SHARED_DATA_ADDR);
         let hscb_base = Self::scratch_le32(st, nb::HSCB_ADDR);
-        if shared == 0 || hscb_base == 0 {
-            return;
+        if shared == 0 || hscb_base == 0 || st.qinpos == want {
+            st.nb_doorbell = false;
+            return None;
         }
-        // The ring is 256 entries, so it cannot legitimately need more than
-        // that many steps to catch up.
-        for _ in 0..nb::FIFO_LEN {
-            if st.qinpos == want {
-                break;
-            }
-            let tag = self.dma_read8(shared + nb::FIFO_LEN + st.qinpos as u32);
-            st.qinpos = st.qinpos.wrapping_add(1);
-            self.submit_netbsd(st, tag, hscb_base, shared);
-        }
+        let tag = self.dma_read8(shared + nb::FIFO_LEN + st.qinpos as u32);
+        st.qinpos = st.qinpos.wrapping_add(1);
+        Some(Job::NetBsd { tag, hscb_base, shared })
     }
 
     /// The buffers one command transfers through: the SCB carries the first
@@ -946,8 +1075,8 @@ impl Aic7880 {
         segs
     }
 
-    /// Run one command the NetBSD way.
-    fn submit_netbsd(&self, st: &mut State, tag: u8, hscb_base: u32, shared: u32) {
+    /// Run one command the NetBSD way. Called without the state lock.
+    fn run_netbsd(&self, out: &mut Outcome, tag: u8, hscb_base: u32, shared: u32) {
         let hscb = hscb_base + tag as u32 * nb::HSCB_STRIDE;
         let len = self.dma_read8(hscb + nb::CDB_LEN) as usize;
         // A CDB longer than the twelve bytes that fit inline is kept
@@ -969,6 +1098,7 @@ impl Aic7880 {
                 let data = self.gather_segs(&segs, want);
                 let n = data.len();
                 let t = self.target_of(Some((scsiid >> 4, lun))).unwrap_or(self.target);
+                out.bytes_out += n as u64;
                 (self.execute_write_on(&cdb, &data, t), n)
             }
             None => {
@@ -977,9 +1107,10 @@ impl Aic7880 {
                 // More data than the command's buffers hold: what does not
                 // fit is dropped, as the chip would. Say so.
                 if moved < data.len() {
-                    Self::note(st, format!("nb overrun: CDB {:02x} returned {} bytes into {}",
+                    out.notes.push(format!("nb overrun: CDB {:02x} returned {} bytes into {}",
                         cdb[0], data.len(), moved));
                 }
+                out.bytes_in += moved as u64;
                 (status, moved)
             }
         };
@@ -987,12 +1118,13 @@ impl Aic7880 {
         let hex: Vec<String> = cdb.iter().map(|b| format!("{b:02x}")).collect();
         let segtxt: Vec<String> = segs.iter()
             .map(|(a, l)| format!("0x{a:08x}+{l}")).collect();
-        Self::note(st, format!(
+        out.notes.push(format!(
             "nb tag {tag} id 0x{scsiid:02x} lun {lun}: CDB {} -> status {status}, {moved} bytes into [{}]",
             hex.join(" "), segtxt.join(" ")));
 
         // Status goes back in the SCB, and the residual words beside it are
-        // cleared so the driver does not go looking for one.
+        // cleared so the driver does not go looking for one. The SCB is the
+        // command's own, so this can happen before the tag is posted.
         for i in 0..8 {
             self.dma_write8(hscb + i, 0);
         }
@@ -1000,18 +1132,13 @@ impl Aic7880 {
         for i in 0..4 {
             self.dma_write8(hscb + nb::SGPTR + i, 0);
         }
-
-        st.total_cmds += 1;
-        st.total_in += moved as u64;
-
-        // And the tag goes back through the other ring.
-        self.dma_write8(shared + st.qoutpos, tag);
-        st.qoutpos = (st.qoutpos + 1) % nb::FIFO_LEN;
-        st.intstat |= intstat::CMDCMPLT;
+        out.cmds += 1;
+        out.done = Some(Done::NetBsd { tag, shared });
     }
 
-    /// Fetch a queued command and run it.
-    fn submit(&self, st: &mut State, tag: u8) {
+    /// What the sequencer needs from the chip to run a tag from `QINFIFO`,
+    /// read while the state is locked.
+    fn plan_tag(st: &mut State, tag: u8) -> Job {
         let i = (tag as usize) % SCB_COUNT;
         // The register window is used by both drivers, but only to *clear*
         // SCBs during initialisation -- a window write is not evidence that
@@ -1026,14 +1153,24 @@ impl Aic7880 {
                 Self::note(st, format!("tag {tag}: on-chip SCB carries {}", hex.join(" ")));
             }
         }
-        let array = Self::scratch_le32(st, sram::SCB_ARRAY);
+        Job::Tag {
+            tag,
+            array: Self::scratch_le32(st, sram::SCB_ARRAY),
+            errors: Self::him_errors(st),
+            own: st.regs[reg::SCSIID as usize] & 0x0f,
+        }
+    }
+
+    /// Fetch a queued command and run it. Called without the state lock:
+    /// everything here is host memory and the disk.
+    fn run_tag(&self, out: &mut Outcome, tag: u8, array: u32, errors: bool, own: u8) {
         if array == 0 {
-            Self::note(st, format!("tag {tag} queued with no SCB array configured"));
+            out.notes.push(format!("tag {tag} queued with no SCB array configured"));
             return;
         }
         let scb_addr = self.dma_read32(array + tag as u32 * 4);
         if scb_addr == 0 {
-            Self::note(st, format!("tag {tag} has no SCB address in the array"));
+            out.notes.push(format!("tag {tag} has no SCB address in the array"));
             return;
         }
         let scb = self.dma_read_bytes(scb_addr, SCB_SIZE);
@@ -1052,11 +1189,11 @@ impl Aic7880 {
         let cdb = self.dma_read_bytes(cmd_ptr, len);
 
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
-        Self::note(st, format!(
+        out.notes.push(format!(
             "tag {tag}: SCB at 0x{scb_addr:08x} control 0x{:02x} target {} lun {} cdblen {}",
             scb[scb::CONTROL], scb[scb::TCL] >> 4, scb[scb::TCL] & 0x07, len));
-        Self::note(st, format!("   CDB {}", hex(&cdb)));
-        Self::note(st, format!("   SCB {}", hex(&scb)));
+        out.notes.push(format!("   CDB {}", hex(&cdb)));
+        out.notes.push(format!("   SCB {}", hex(&scb)));
         let sg_ptr = u32::from_be_bytes([
             scb[scb::SG_PTR], scb[scb::SG_PTR + 1],
             scb[scb::SG_PTR + 2], scb[scb::SG_PTR + 3],
@@ -1064,18 +1201,14 @@ impl Aic7880 {
         let tcl = scb[scb::TCL];
         let target = tcl >> 4;
         let who = Some((target, tcl & 0x07));
-        let errors = Self::him_errors(st);
 
         // Nobody at that id, or our own: the selection times out. The HIM
         // finds the tag in the waiting-SCB byte and gives up on the id at
         // once, where an INQUIRY answered "no device" with GOOD status made
         // it look for a device that never comes.
-        let own = st.regs[reg::SCSIID as usize] & 0x0f;
         if errors && (target == own || !self.has_target(target)) {
-            st.regs[him::WAITING_SCB as usize] = tag;
-            st.sstat1 |= sstat1::SELTO;
-            Self::raise_pausing(st, intstat::SCSIINT);
-            Self::note(st, format!("   -> selection timeout at id {target}"));
+            out.notes.push(format!("   -> selection timeout at id {target}"));
+            out.done = Some(Done::SelectionTimeout { tag });
             return;
         }
         let (status, moved, sg, dir) = match Self::data_out_len(&cdb) {
@@ -1099,29 +1232,53 @@ impl Aic7880 {
             .map(|(a, l)| format!("0x{a:08x}+{l}")).collect();
         // Nothing is written back to the SCB. GOOD status means the zeros
         // the host left in it stand, and anything else is reported below.
-        st.total_cmds += 1;
-        if dir == "into" { st.total_in += moved as u64 } else { st.total_out += moved as u64 }
-        Self::note(st, format!(
+        out.cmds += 1;
+        if dir == "into" { out.bytes_in += moved as u64 } else { out.bytes_out += moved as u64 }
+        out.notes.push(format!(
             "   -> status {status}, {moved} bytes {dir} [{}]", sgtxt.join(" ")));
-        st.executed.push((tag, scb_addr, cdb));
+        out.executed = Some((tag, scb_addr, cdb));
 
         // Any status but GOOD stops the sequencer with the status in
         // scratch RAM for the HIM to collect. It rewrites the same SCB as a
         // REQUEST SENSE and queues the tag again at the head, and that one
         // completes normally with the sense `self.sense` is holding.
-        if errors && status != 0x00 {
-            st.regs[him::ACTIVE_SCB as usize] = tag;
-            st.regs[him::STATUS as usize] = status;
-            st.regs[reg::SCBPTR as usize] = tag;
-            st.intstat = (st.intstat & !intstat::INTCODE) | him::BAD_STATUS;
-            Self::raise_pausing(st, intstat::SEQINT);
-            return;
-        }
-
-        if Self::him(st) {
-            self.complete_him(st, tag, target);
+        out.done = Some(if errors && status != 0x00 {
+            Done::BadStatus { tag, status }
         } else {
-            self.complete(st, tag);
+            Done::Complete { tag, target }
+        });
+    }
+
+    /// Hand a finished command back to the host. Called with the state
+    /// locked and the sequencer running, so the host sees the completion
+    /// byte, the cursor and `CMDCMPLT` change together.
+    fn post(&self, st: &mut State, done: Done) {
+        match done {
+            Done::SelectionTimeout { tag } => {
+                st.regs[him::WAITING_SCB as usize] = tag;
+                st.sstat1 |= sstat1::SELTO;
+                Self::raise_pausing(st, intstat::SCSIINT);
+            }
+            Done::BadStatus { tag, status } => {
+                st.regs[him::ACTIVE_SCB as usize] = tag;
+                st.regs[him::STATUS as usize] = status;
+                st.regs[reg::SCBPTR as usize] = tag;
+                st.intstat = (st.intstat & !intstat::INTCODE) | him::BAD_STATUS;
+                Self::raise_pausing(st, intstat::SEQINT);
+            }
+            Done::Complete { tag, target } => {
+                if Self::him(st) {
+                    self.complete_him(st, tag, target);
+                } else {
+                    self.complete(st, tag);
+                }
+            }
+            Done::NetBsd { tag, shared } => {
+                // The tag goes back through the other ring.
+                self.dma_write8(shared + st.qoutpos, tag);
+                st.qoutpos = (st.qoutpos + 1) % nb::FIFO_LEN;
+                st.intstat |= intstat::CMDCMPLT;
+            }
         }
     }
 
@@ -1169,13 +1326,97 @@ impl Aic7880 {
         st.intstat |= intstat::CMDCMPLT;
     }
 
-    /// Run queued tags until the queue is empty or the sequencer stops.
-    /// A command that ends in a pausing interrupt stops it, and the rest
-    /// wait until the host has dealt with that one and restarts it.
-    fn run_queue(&self, st: &mut State) {
-        while !Self::paused(st) {
-            let Some(tag) = st.qin.pop_front() else { break };
-            self.submit(st, tag);
+    /// Whether the sequencer has anything to do now: it is running, and a
+    /// completion is held, a tag is queued or NetBSD has rung.
+    fn has_work(st: &State) -> bool {
+        !Self::paused(st) && (!st.held.is_empty() || !st.qin.is_empty() || st.nb_doorbell)
+    }
+
+    /// One step of the sequencer: post a held completion, or take one
+    /// command and run it. Returns false when there was nothing to do.
+    ///
+    /// The command's transfers and disk I/O run with the state unlocked, so
+    /// the CPU keeps reading and writing registers meanwhile; only taking
+    /// the work and posting the result hold the lock. A host that paused
+    /// the sequencer while the command ran finds it held until it unpauses,
+    /// as a stopped sequencer posts nothing. A chip reset in between drops it.
+    fn service_one(&self) -> bool {
+        let _one = self.exec.lock().unwrap();
+        let mut st = self.st.lock();
+        if Self::paused(&st) {
+            return false;
+        }
+        if let Some(done) = st.held.pop_front() {
+            self.post(&mut st, done);
+            self.drive_irq(&st);
+            return true;
+        }
+        let job = if let Some(tag) = st.qin.pop_front() {
+            Self::plan_tag(&mut st, tag)
+        } else if st.nb_doorbell {
+            match self.plan_netbsd(&mut st) {
+                Some(job) => job,
+                None => return false,
+            }
+        } else {
+            return false;
+        };
+        let generation = st.generation;
+        drop(st);
+
+        let mut out = Outcome::default();
+        match job {
+            Job::Tag { tag, array, errors, own } => self.run_tag(&mut out, tag, array, errors, own),
+            Job::NetBsd { tag, hscb_base, shared } => self.run_netbsd(&mut out, tag, hscb_base, shared),
+        }
+
+        let mut st = self.st.lock();
+        for n in out.notes {
+            Self::note(&mut st, n);
+        }
+        st.total_cmds += out.cmds;
+        st.total_in += out.bytes_in;
+        st.total_out += out.bytes_out;
+        if let Some(e) = out.executed {
+            st.executed.push(e);
+        }
+        if let Some(done) = out.done.filter(|_| st.generation == generation) {
+            if Self::paused(&st) {
+                st.held.push_back(done);
+            } else {
+                self.post(&mut st, done);
+            }
+        }
+        self.drive_irq(&st);
+        true
+    }
+
+    /// Tell the sequencer there may be work: wake the worker, or, with no
+    /// worker running (unit tests, the harness), do the work here.
+    fn kick(&self) {
+        if self.running.load(Ordering::Acquire) {
+            if let Some(w) = self.worker.lock().unwrap().as_ref() {
+                w.thread().unpark();
+            }
+            return;
+        }
+        while self.service_one() {}
+    }
+
+    /// The worker: run commands while there are any, sleep until kicked.
+    /// It holds only a weak reference between commands, so a controller
+    /// dropped without being stopped does not live on in its thread.
+    fn worker_loop(me: std::sync::Weak<Self>) {
+        loop {
+            let Some(c) = me.upgrade() else { return };
+            if !c.running.load(Ordering::Acquire) {
+                return;
+            }
+            let worked = c.service_one();
+            drop(c);
+            if !worked {
+                std::thread::park();
+            }
         }
     }
 
@@ -1183,8 +1424,7 @@ impl Aic7880 {
         (st.regs[reg::SCBPTR as usize] as usize) % SCB_COUNT
     }
 
-    fn read8(&self, off: u32) -> u8 {
-        let mut st = self.st.lock().unwrap();
+    fn read8_locked(st: &mut State, off: u32) -> u8 {
         match off {
             reg::INTSTAT => st.intstat,
             reg::SSTAT0 => st.sstat0,
@@ -1206,50 +1446,56 @@ impl Aic7880 {
             reg::SEQADDR0 => st.seqaddr as u8,
             reg::SEQADDR1 => (st.seqaddr >> 8) as u8,
             reg::SCBARRAY_FIRST..=reg::SCBARRAY_LAST => {
-                let i = Self::scb_index(&st);
+                let i = Self::scb_index(st);
                 st.scb[i][(off - reg::SCBARRAY_FIRST) as usize]
             }
             _ => st.regs[off as usize],
         }
     }
 
-    fn write8(&self, off: u32, val: u8) {
-        // SCSIRSTO: the controller drives a SCSI bus reset, and every device
-        // returns to its power-on state. What that is for a CD-ROM depends on
-        // whose drive it is: an SGI drive comes up in 512-byte blocks, which
-        // SGI's own driver (the HIM, in the PROM and in IRIX) relies on --
-        // IRIX resets the bus when it attaches and never sends MODE SELECT
-        // again, then reads 512-byte sectors. The BSDs' driver expects the
-        // common 2048 after its reset (the PROM had left 512 behind).
-        if off == reg::SCSISEQ && val & 0x01 != 0 {
-            let sgi = Self::him(&self.st.lock().unwrap());
-            for d in self.targets.lock().unwrap().iter_mut().flatten() {
-                if sgi && d.is_cdrom() {
-                    d.set_logical_block_size(512);
-                } else {
-                    d.power_on_block_size();
-                }
+    /// SCSIRSTO: the controller drives a SCSI bus reset, and every device
+    /// returns to its power-on state. What that is for a CD-ROM depends on
+    /// whose drive it is: an SGI drive comes up in 512-byte blocks, which
+    /// SGI's own driver (the HIM, in the PROM and in IRIX) relies on --
+    /// IRIX resets the bus when it attaches and never sends MODE SELECT
+    /// again, then reads 512-byte sectors. The BSDs' driver expects the
+    /// common 2048 after its reset (the PROM had left 512 behind).
+    fn reset_targets(&self) {
+        let sgi = Self::him(&self.st.lock());
+        for d in self.targets.lock().unwrap().iter_mut().flatten() {
+            if sgi && d.is_cdrom() {
+                d.set_logical_block_size(512);
+            } else {
+                d.power_on_block_size();
             }
         }
-        let mut st = self.st.lock().unwrap();
+    }
+
+    /// A register write with the state locked. Returns whether the
+    /// sequencer may now have work, which the caller hands on once the
+    /// lock is released.
+    fn write8_locked(&self, st: &mut SpinGuard<'_, State>, off: u32, val: u8) -> bool {
         match off {
             reg::HCNTRL => {
                 if val & hcntrl::CHIPRST != 0 {
                     // A chip reset clears everything except the program we
                     // were given, which the driver reloads anyway.
+                    // A command still running is dropped when it finishes.
                     let notes = std::mem::take(&mut st.notes);
                     let (c, i, o) = (st.total_cmds, st.total_in, st.total_out);
-                    *st = State {
+                    let generation = st.generation + 1;
+                    **st = State {
                         notes,
                         total_cmds: c,
                         total_in: i,
                         total_out: o,
+                        generation,
                         ..Default::default()
                     };
-                    Self::note(&mut st, "chip reset".into());
+                    Self::note(st, "chip reset".into());
                     // The reset bit reads back as an acknowledgement.
                     st.regs[reg::HCNTRL as usize] = hcntrl::CHIPRST;
-                    return;
+                    return false;
                 }
                 let was = st.regs[reg::HCNTRL as usize];
                 // An interrupt that stopped the sequencer keeps it stopped
@@ -1266,12 +1512,12 @@ impl Aic7880 {
                 if val & hcntrl::PAUSE == 0 {
                     // The HIM's sequencer goes back to its idle loop, where
                     // nothing is being selected and nothing is connected.
-                    if Self::him(&st) {
+                    if Self::him(st) {
                         st.regs[him::WAITING_SCB as usize] = 0xff;
                         st.regs[him::ACTIVE_SCB as usize] = 0xff;
                     }
                     // And picks up whatever was queued while it was stopped.
-                    self.run_queue(&mut st);
+                    return Self::has_work(st);
                 }
             }
             reg::SEQCTL => {
@@ -1289,11 +1535,11 @@ impl Aic7880 {
                     // second time to read the program back and check it, and
                     // clearing here would hand it zeros and fail the check.
                     st.seqaddr = 0;
-                    Self::note(&mut st, "sequencer RAM selected".into());
+                    Self::note(st, "sequencer RAM selected".into());
                 }
                 if was & seqctl::LOADRAM != 0 && val & seqctl::LOADRAM == 0 {
                     let n = st.seqram.len();
-                    Self::note(&mut st, format!("sequencer RAM deselected, {n} bytes held"));
+                    Self::note(st, format!("sequencer RAM deselected, {n} bytes held"));
                 }
             }
             reg::SEQADDR0 => st.seqaddr = (st.seqaddr & 0xff00) | val as u16,
@@ -1313,12 +1559,14 @@ impl Aic7880 {
                 // pointer standing in for NetBSD's rings: 127 commands from
                 // nowhere, and completions nobody had asked for. A doorbell
                 // is only one when the HIM is not driving and both rings
-                // are in memory.
+                // are in memory. The sequencer takes the new tags when it
+                // runs; the driver rings with it paused.
                 let rings = [nb::HSCB_ADDR, nb::SHARED_DATA_ADDR]
                     .iter()
-                    .all(|r| self.is_memory(Self::scratch_le32(&st, *r)));
-                if !Self::him(&st) && rings {
-                    self.drain_netbsd(&mut st, val);
+                    .all(|r| self.is_memory(Self::scratch_le32(st, *r)));
+                if !Self::him(st) && rings {
+                    st.nb_doorbell = true;
+                    return Self::has_work(st);
                 }
             }
             reg::ERROR_CLRINT => {
@@ -1343,10 +1591,10 @@ impl Aic7880 {
                 if st.qin.len() < SCB_COUNT {
                     st.qin.push_back(tag);
                 }
-                self.run_queue(&mut st);
+                return Self::has_work(st);
             }
             reg::SCBARRAY_FIRST..=reg::SCBARRAY_LAST => {
-                let i = Self::scb_index(&st);
+                let i = Self::scb_index(st);
                 st.scb[i][(off - reg::SCBARRAY_FIRST) as usize] = val;
                 // Remember that this SCB was filled in on the chip. Two
                 // drivers use two different submission paths: the PROM's
@@ -1358,27 +1606,39 @@ impl Aic7880 {
             }
             _ => st.regs[off as usize] = val,
         }
+        false
     }
 }
 
 impl Aic7880 {
-    /// A register access of `width` bytes at `off`.
+    /// A register access of `width` bytes at `off`, as one bus cycle: the
+    /// state is locked once for all of its bytes.
     pub fn read(&self, off: u32, width: usize) -> u32 {
         // Everything here is byte-wide; a wider access reads consecutive
         // registers, most significant first, the way the bus presents them.
+        let mut st = self.st.lock();
         let mut v = 0u32;
         for i in 0..width as u32 {
-            v = (v << 8) | self.read8(off + i) as u32;
+            v = (v << 8) | Self::read8_locked(&mut st, off + i) as u32;
         }
         v
     }
 
     pub fn write(&self, off: u32, val: u32, width: usize) {
-        for i in 0..width as u32 {
-            let shift = 8 * (width as u32 - 1 - i);
-            self.write8(off + i, (val >> shift) as u8);
+        let byte = |i: u32| (val >> (8 * (width as u32 - 1 - i))) as u8;
+        if (0..width as u32).any(|i| off + i == reg::SCSISEQ && byte(i) & 0x01 != 0) {
+            self.reset_targets();
         }
-        self.update_irq();
+        let mut st = self.st.lock();
+        let mut kick = false;
+        for i in 0..width as u32 {
+            kick |= self.write8_locked(&mut st, off + i, byte(i));
+        }
+        self.drive_irq(&st);
+        drop(st);
+        if kick {
+            self.kick();
+        }
     }
 }
 
@@ -1411,13 +1671,14 @@ impl Aic7880 {
 
 /// What the guest can see of the chip: registers, SCBs, the sequencer's
 /// program and address, both queues, the latched status, the host-ring
-/// positions and the controller's own sense; loading drives the interrupt
-/// again. The disks' contents go with the snapshot's overlays
+/// positions, the controller's own sense, and finished commands held for a
+/// paused sequencer; loading drives the interrupt again. Save with the
+/// worker stopped, so no command is part way through. The disks' contents go with the snapshot's overlays
 /// ([`Aic7880::export_overlays`]); the logs of queued and executed commands
 /// are evidence, not state.
 impl crate::traits::Saveable for Aic7880 {
     fn save_state(&self) -> toml::Value {
-        let st = self.st.lock().unwrap();
+        let st = self.st.lock();
         let mut t = toml::map::Map::new();
         t.insert("regs".into(), u8_slice_to_toml(&st.regs));
         t.insert("scb".into(), toml::Value::Array(st.scb.iter().map(|b| u8_slice_to_toml(b)).collect()));
@@ -1431,6 +1692,8 @@ impl crate::traits::Saveable for Aic7880 {
         t.insert("sstat1".into(), hex_u8(st.sstat1));
         t.insert("qoutpos".into(), hex_u32(st.qoutpos));
         t.insert("qinpos".into(), hex_u8(st.qinpos));
+        t.insert("nb_doorbell".into(), toml::Value::Boolean(st.nb_doorbell));
+        t.insert("held".into(), toml::Value::Array(st.held.iter().map(|d| d.to_toml()).collect()));
         t.insert("scb_onchip".into(),
             toml::Value::Array(st.scb_onchip.iter().map(|&b| toml::Value::Boolean(b)).collect()));
         t.insert("total_cmds".into(), hex_u64(st.total_cmds));
@@ -1444,8 +1707,10 @@ impl crate::traits::Saveable for Aic7880 {
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         {
-            let mut st = self.st.lock().unwrap();
-            *st = State::default();
+            let mut st = self.st.lock();
+            // Anything running when this was called belongs to the old state.
+            let generation = st.generation + 1;
+            *st = State { generation, ..Default::default() };
             let b = |k: &str| get_field(v, k).and_then(toml_u8).unwrap_or(0);
             if let Some(r) = get_field(v, "regs") {
                 load_u8_slice(r, &mut st.regs);
@@ -1470,6 +1735,10 @@ impl crate::traits::Saveable for Aic7880 {
             st.sstat1 = b("sstat1");
             st.qoutpos = get_field(v, "qoutpos").and_then(toml_u32).unwrap_or(0);
             st.qinpos = b("qinpos");
+            st.nb_doorbell = get_field(v, "nb_doorbell").and_then(|x| x.as_bool()).unwrap_or(false);
+            if let Some(toml::Value::Array(a)) = get_field(v, "held") {
+                st.held = a.iter().filter_map(Done::from_toml).collect();
+            }
             if let Some(toml::Value::Array(a)) = get_field(v, "scb_onchip") {
                 for (o, x) in st.scb_onchip.iter_mut().zip(a) {
                     *o = x.as_bool().unwrap_or(false);
@@ -1516,14 +1785,14 @@ impl crate::pci::PciBusDevice for Aic7880 {
 mod tests {
     use super::*;
 
-    fn chip() -> Aic7880 {
-        on(std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20))))
+    fn chip() -> Arc<Aic7880> {
+        on(std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20)))
     }
 
     /// A chip that masters host memory `ram` through the bridge.
-    fn on(ram: Ram) -> Aic7880 {
+    fn on(ram: Ram) -> Arc<Aic7880> {
         let c = Aic7880::new();
-        crate::pci::PciBusDevice::connect_dma(&c, std::sync::Arc::new(crate::dev::mace_pci::HostMemory::new(ram)));
+        crate::pci::PciBusDevice::connect_dma(&*c, std::sync::Arc::new(crate::dev::mace_pci::HostMemory::new(ram)));
         c
     }
 
@@ -1532,7 +1801,7 @@ mod tests {
         use crate::traits::Saveable;
         let src = chip();
         {
-            let mut st = src.st.lock().unwrap();
+            let mut st = src.st.lock();
             st.regs[0x20] = 0x5a;
             st.scb[3][0] = 0x12;
             st.scb[15][SCB_SIZE - 1] = 0xff;
@@ -1546,6 +1815,9 @@ mod tests {
             st.qoutpos = 9;
             st.qinpos = 4;
             st.scb_onchip[3] = true;
+            st.nb_doorbell = true;
+            st.held = [Done::Complete { tag: 2, target: 1 }, Done::NetBsd { tag: 5, shared: 0x1234_5600 },
+                Done::BadStatus { tag: 3, status: 2 }, Done::SelectionTimeout { tag: 4 }].into_iter().collect();
             st.total_cmds = 100;
             st.total_in = 1 << 20;
             st.total_out = 4096;
@@ -1622,7 +1894,7 @@ mod tests {
     /// driver rather than a datasheet, so it is worth pinning down.
     #[test]
     fn a_queued_tag_fetches_the_command_and_answers_it() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         let c = on(ram.clone());
 
         // A controller with nothing attached answers nothing, so the test
@@ -1635,25 +1907,25 @@ mod tests {
         let (array, scb_addr, cdb_addr, sg_addr, buf, qout) =
             (0x1000u32, 0x2000u32, 0x2100u32, 0x2200u32, 0x3000u32, 0x4000u32);
         {
-            let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
+            let m = &*ram;
+            let put32 = |m: &crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
                 m.write(at as usize, &v.to_be_bytes());
             };
             // array[1] = the SCB's bus address
-            put32(&mut m, array + 4, base + scb_addr);
+            put32(m, array + 4, base + scb_addr);
             // SCB: pointers to the scatter-gather list and the CDB
-            put32(&mut m, scb_addr + scb::SG_PTR as u32, base + sg_addr);
-            put32(&mut m, scb_addr + scb::CMD_PTR as u32, base + cdb_addr);
+            put32(m, scb_addr + scb::SG_PTR as u32, base + sg_addr);
+            put32(m, scb_addr + scb::CMD_PTR as u32, base + cdb_addr);
             // The driver's control flags: disconnect allowed.
-            m[(scb_addr + scb::CONTROL as u32) as usize] = 0x40;
+            m.write((scb_addr + scb::CONTROL as u32) as usize, &[0x40]);
             // Address the id the disk was attached at.
-            m[(scb_addr + scb::TCL as u32) as usize] = 1 << 4;
+            m.write((scb_addr + scb::TCL as u32) as usize, &[1 << 4]);
             // INQUIRY, 64 bytes
-            m[cdb_addr as usize] = 0x12;
-            m[cdb_addr as usize + 4] = 0x40;
+            m.write(cdb_addr as usize, &[0x12]);
+            m.write(cdb_addr as usize + 4, &[0x40]);
             // One scatter-gather entry
-            put32(&mut m, sg_addr, base + buf);
-            put32(&mut m, sg_addr + 4, 64);
+            put32(m, sg_addr, base + buf);
+            put32(m, sg_addr + 4, 64);
         }
         // Tell the chip where the array and the completion FIFO are, the way
         // the driver does: a scratch register at a time, little end first.
@@ -1666,14 +1938,13 @@ mod tests {
 
         c.write(reg::QINFIFO, 1, 1);
 
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert_eq!(m[buf as usize], 0x00, "a direct access device");
         assert_eq!(&m.bytes(buf as usize + 8, (buf as usize + 11) - (buf as usize + 8)), b"SGI",
                    "the inquiry data must land in the buffer the driver listed");
         assert_eq!(m[(scb_addr + scb::CONTROL as u32) as usize], 0x40,
                    "and the SCB is the driver's: nothing is written back into it");
         assert_eq!(m[qout as usize], 1, "the tag goes into the host completion FIFO");
-        drop(m);
         assert_eq!(c.read(reg::INTSTAT, 1) as u8 & intstat::CMDCMPLT, intstat::CMDCMPLT,
                    "and the driver is told to look");
     }
@@ -1682,7 +1953,7 @@ mod tests {
     /// must reach the image rather than growing it.
     #[test]
     fn a_write_reaches_the_disk_and_reads_back() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         let c = on(ram.clone());
         let img = std::env::temp_dir().join("iris-aic7880-write.img");
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
@@ -1693,21 +1964,21 @@ mod tests {
             (0x1000u32, 0x2000u32, 0x2100u32, 0x2200u32, 0x3000u32, 0x4000u32);
         let pattern: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
         {
-            let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
+            let m = &*ram;
+            let put32 = |m: &crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
                 m.write(at as usize, &v.to_be_bytes());
             };
-            put32(&mut m, array + 4, base + scb);
-            put32(&mut m, scb + scb::SG_PTR as u32, base + sg);
-            put32(&mut m, scb + scb::CMD_PTR as u32, base + cdb);
-            m[(scb + scb::CDB_LEN as u32) as usize] = 10;
-            m[(scb + scb::TCL as u32) as usize] = 1 << 4;
+            put32(m, array + 4, base + scb);
+            put32(m, scb + scb::SG_PTR as u32, base + sg);
+            put32(m, scb + scb::CMD_PTR as u32, base + cdb);
+            m.write((scb + scb::CDB_LEN as u32) as usize, &[10]);
+            m.write((scb + scb::TCL as u32) as usize, &[1 << 4]);
             // WRITE(10), one block at LBA 5.
-            m[cdb as usize] = 0x2a;
-            m[cdb as usize + 5] = 5;
-            m[cdb as usize + 8] = 1;
-            put32(&mut m, sg, base + buf);
-            put32(&mut m, sg + 4, BLOCK_SIZE as u32);
+            m.write(cdb as usize, &[0x2a]);
+            m.write(cdb as usize + 5, &[5]);
+            m.write(cdb as usize + 8, &[1]);
+            put32(m, sg, base + buf);
+            put32(m, sg + 4, BLOCK_SIZE as u32);
             m.write(buf as usize, &pattern);
         }
         for (i, b) in (base + array).to_le_bytes().iter().enumerate() {
@@ -1735,7 +2006,7 @@ mod tests {
     /// program.
     #[test]
     fn a_long_scatter_gather_list_is_followed_to_the_end() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(4 << 20)));
+        let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(4 << 20));
         let c = on(ram.clone());
         let img = std::env::temp_dir().join("iris-aic7880-sg.img");
         let pattern: Vec<u8> = (0..264 * BLOCK_SIZE).map(|i| (i % 253) as u8).collect();
@@ -1749,22 +2020,22 @@ mod tests {
         let pages = 264 * BLOCK_SIZE / 4096;
         assert!(pages > 32, "the test must cross the bound it is checking");
         {
-            let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
+            let m = &*ram;
+            let put32 = |m: &crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
                 m.write(at as usize, &v.to_be_bytes());
             };
-            put32(&mut m, array + 4, base + scb);
-            put32(&mut m, scb + scb::SG_PTR as u32, base + sg);
-            put32(&mut m, scb + scb::CMD_PTR as u32, base + cdb);
-            m[(scb + scb::CDB_LEN as u32) as usize] = 10;
-            m[(scb + scb::TCL as u32) as usize] = 1 << 4;
+            put32(m, array + 4, base + scb);
+            put32(m, scb + scb::SG_PTR as u32, base + sg);
+            put32(m, scb + scb::CMD_PTR as u32, base + cdb);
+            m.write((scb + scb::CDB_LEN as u32) as usize, &[10]);
+            m.write((scb + scb::TCL as u32) as usize, &[1 << 4]);
             // READ(10), 264 blocks from LBA 0.
-            m[cdb as usize] = 0x28;
-            m[cdb as usize + 7] = (264 >> 8) as u8;
-            m[cdb as usize + 8] = (264 & 0xff) as u8;
+            m.write(cdb as usize, &[0x28]);
+            m.write(cdb as usize + 7, &[(264 >> 8) as u8]);
+            m.write(cdb as usize + 8, &[(264 & 0xff) as u8]);
             for i in 0..pages as u32 {
-                put32(&mut m, sg + i * 8, base + buf + i * 4096);
-                put32(&mut m, sg + i * 8 + 4, 4096);
+                put32(m, sg + i * 8, base + buf + i * 4096);
+                put32(m, sg + i * 8 + 4, 4096);
             }
         }
         for (i, b) in (base + array).to_le_bytes().iter().enumerate() {
@@ -1775,7 +2046,7 @@ mod tests {
         }
         c.write(reg::QINFIFO, 1, 1);
 
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         let got = &m.bytes(buf as usize, (buf as usize + pattern.len()) - (buf as usize));
         assert_eq!(got, &pattern[..], "every page of the transfer must arrive");
     }
@@ -1797,8 +2068,8 @@ mod tests {
     /// an all-zero command.
     #[test]
     fn dma_resolves_the_low_memory_alias() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 16)));
-        ram.lock().unwrap().write(0x40, &[0xa5]);
+        let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 16));
+        ram.write(0x40, &[0xa5]);
         let c = on(ram);
         assert_eq!(c.dma_read8(0x40), 0xa5, "the low alias");
         assert_eq!(c.dma_read8(crate::ip32::RAM_BASE + 0x40), 0xa5, "and memory's own base");
@@ -1808,7 +2079,7 @@ mod tests {
     fn interrupts_are_cleared_by_writing_their_bits() {
         let c = chip();
         {
-            let mut st = c.st.lock().unwrap();
+            let mut st = c.st.lock();
             st.intstat = intstat::CMDCMPLT | intstat::SEQINT;
         }
         c.write(reg::ERROR_CLRINT, intstat::CMDCMPLT as u32, 1);
@@ -1816,7 +2087,7 @@ mod tests {
                    "clearing one interrupt must not clear the others");
     }
 
-    type Ram = std::sync::Arc<std::sync::Mutex<crate::dev::crime_mem::O2Memory>>;
+    type Ram = std::sync::Arc<crate::dev::crime_mem::O2Memory>;
 
     /// Where the HIM rig keeps things in host memory.
     const ARRAY: u32 = 0x1000;
@@ -1827,7 +2098,7 @@ mod tests {
     fn buf_at(tag: u8) -> u32 { 0x8000 + tag as u32 * 0x200 }
 
     fn put32(ram: &Ram, at: u32, v: u32) {
-        ram.lock().unwrap().write(at as usize, &v.to_be_bytes());
+        ram.write(at as usize, &v.to_be_bytes());
     }
 
     /// The HIM's signature, as it writes it: a byte at a time, little end
@@ -1844,8 +2115,8 @@ mod tests {
     /// both arrays configured, the signature in place, the next-SCB table
     /// full of 0x7f, the queue-out array full of 0xff, and its own id 0, as
     /// on an O2. One disk, at id 1.
-    fn him_rig(name: &str) -> (Aic7880, Ram) {
-        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+    fn him_rig(name: &str) -> (Arc<Aic7880>, Ram) {
+        let ram: Ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         let c = on(ram.clone());
         let img = std::env::temp_dir().join(format!("iris-aic7880-{name}.img"));
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
@@ -1863,7 +2134,7 @@ mod tests {
             c.write(off, 0x7f, 1);
         }
         c.write(reg::SCSIID, 0, 1);
-        ram.lock().unwrap().write(QOUT as usize, &vec![QOUTFIFO_EMPTY; (QOUT as usize + 256) - (QOUT as usize)]);
+        ram.write(QOUT as usize, &vec![QOUTFIFO_EMPTY; (QOUT as usize + 256) - (QOUT as usize)]);
         (c, ram)
     }
 
@@ -1874,12 +2145,12 @@ mod tests {
         let scb = scb_at(tag);
         put32(ram, ARRAY + tag as u32 * 4, base + scb);
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             m.write(scb as usize, &vec![0; (scb as usize + 32) - (scb as usize)]);
-            m[(scb + scb::SEG_COUNT as u32) as usize] = 1;
-            m[(scb + scb::CDB_LEN as u32) as usize] = cdb.len() as u8;
-            m[(scb + scb::CONTROL as u32) as usize] = 0x40;
-            m[(scb + scb::TCL as u32) as usize] = target << 4;
+            m.write((scb + scb::SEG_COUNT as u32) as usize, &[1]);
+            m.write((scb + scb::CDB_LEN as u32) as usize, &[cdb.len() as u8]);
+            m.write((scb + scb::CONTROL as u32) as usize, &[0x40]);
+            m.write((scb + scb::TCL as u32) as usize, &[target << 4]);
             m.write(cdb_at(tag) as usize, cdb);
         }
         put32(ram, scb + scb::SG_PTR as u32, base + sg_at(tag));
@@ -1890,7 +2161,7 @@ mod tests {
     }
 
     fn qout(ram: &Ram) -> Vec<u8> {
-        ram.lock().unwrap().bytes(QOUT as usize, (QOUT as usize + 256) - (QOUT as usize)).to_vec()
+        ram.bytes(QOUT as usize, (QOUT as usize + 256) - (QOUT as usize)).to_vec()
     }
 
     const TUR: [u8; 6] = [0x00, 0, 0, 0, 0, 0];
@@ -1915,7 +2186,7 @@ mod tests {
         assert_eq!(c.read(sram::QOUTFIFO, 1), 0xf8, "the cursor moved down by 4 twice, wrapping");
         assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
         assert_eq!(c.read(reg::QINCNT, 1), 0, "both were taken");
-        assert_eq!(ram.lock().unwrap()[(scb_at(0) + scb::CONTROL as u32) as usize], 0x40,
+        assert_eq!(ram[(scb_at(0) + scb::CONTROL as u32) as usize], 0x40,
                    "and the SCB's control flags are left alone");
     }
 
@@ -1938,7 +2209,7 @@ mod tests {
     /// a command.
     #[test]
     fn the_netbsd_doorbell_still_runs_commands() {
-        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let ram: Ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         let c = on(ram.clone());
         let img = std::env::temp_dir().join("iris-aic7880-nb.img");
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
@@ -1946,12 +2217,12 @@ mod tests {
         let (hscbs, shared) = (0x2000u32, 0x4000u32);
         let tag = 3u8;
         {
-            let mut m = ram.lock().unwrap();
-            m[(shared + nb::FIFO_LEN) as usize] = tag;
+            let m = &*ram;
+            m.write((shared + nb::FIFO_LEN) as usize, &[tag]);
             let h = (hscbs + tag as u32 * nb::HSCB_STRIDE) as usize;
-            m[h + nb::CDB_LEN as usize] = 6; // TEST UNIT READY
-            m[h + nb::SCSIID as usize] = 0x17;
-            m[h + nb::STATUS as usize] = 0xaa;
+            m.write(h + nb::CDB_LEN as usize, &[6]); // TEST UNIT READY
+            m.write(h + nb::SCSIID as usize, &[0x17]);
+            m.write(h + nb::STATUS as usize, &[0xaa]);
         }
         for (off, v) in [(nb::HSCB_ADDR, hscbs), (nb::SHARED_DATA_ADDR, shared)] {
             for (i, b) in v.to_le_bytes().iter().enumerate() {
@@ -1959,32 +2230,34 @@ mod tests {
             }
         }
         c.write(nb::KERNEL_QINPOS, 1, 1);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert_eq!(m[shared as usize], tag, "the tag comes back on the queue-out ring");
         assert_eq!(m[(hscbs + tag as u32 * nb::HSCB_STRIDE + nb::STATUS) as usize], 0, "with GOOD status");
-        drop(m);
         assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
     }
 
     /// One NetBSD command, tag 3, through the doorbell: `cdb` with its first
     /// segment (`dataptr`, `datacnt` with flags) in the SCB and SGPTR at
     /// `sgptr`. Returns the chip; the caller inspects `ram`.
-    fn netbsd_command(ram: &Ram, img_blocks: &[u8], cdb: &[u8], dataptr: u32, datacnt: u32, sgptr: u32) -> Aic7880 {
+    fn netbsd_command(ram: &Ram, img_blocks: &[u8], cdb: &[u8], dataptr: u32, datacnt: u32, sgptr: u32) -> Arc<Aic7880> {
         let c = on(ram.clone());
-        let img = std::env::temp_dir().join(format!("iris-aic7880-nb-{}.img", std::process::id()));
+        // One file per call: these tests run in parallel in one process.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let img = std::env::temp_dir().join(format!("iris-aic7880-nb-{}-{n}.img", std::process::id()));
         std::fs::write(&img, img_blocks).expect("test image");
         c.attach_disk_at(1, &img).expect("attach");
         let (hscbs, shared, tag) = (0x2000u32, 0x4000u32, 3u8);
         {
-            let mut m = ram.lock().unwrap();
-            m[(shared + nb::FIFO_LEN) as usize] = tag;
+            let m = &*ram;
+            m.write((shared + nb::FIFO_LEN) as usize, &[tag]);
             let h = (hscbs + tag as u32 * nb::HSCB_STRIDE) as usize;
             m.write(h + nb::CDB as usize, cdb);
-            m[h + nb::CDB_LEN as usize] = cdb.len() as u8;
+            m.write(h + nb::CDB_LEN as usize, &[cdb.len() as u8]);
             m.write(h + nb::DATAPTR as usize, &dataptr.to_le_bytes());
             m.write(h + nb::DATACNT as usize, &datacnt.to_le_bytes());
             m.write(h + nb::SGPTR as usize, &sgptr.to_le_bytes());
-            m[h + nb::SCSIID as usize] = 0x17;
+            m.write(h + nb::SCSIID as usize, &[0x17]);
         }
         for (off, v) in [(nb::HSCB_ADDR, hscbs), (nb::SHARED_DATA_ADDR, shared)] {
             for (i, b) in v.to_le_bytes().iter().enumerate() {
@@ -2002,9 +2275,9 @@ mod tests {
     /// NetBSD's file-system metadata.
     #[test]
     fn a_one_segment_netbsd_command_ends_at_its_segment() {
-        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let ram: Ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             // The stale entry 1: a 256-byte buffer at 0x8000, holding 0x5a.
             m.write(0x7000, &0x8000u32.to_le_bytes());
             m.write(0x7004, &(0x100u32 | nb::LAST_SEG).to_le_bytes());
@@ -2014,20 +2287,19 @@ mod tests {
         // INQUIRY for 36 bytes into an 8-byte segment marked last.
         let c = netbsd_command(&ram, &vec![0u8; 64 * BLOCK_SIZE], &[0x12, 0, 0, 0, 36, 0],
             0x6000, 8 | nb::LAST_SEG, 0x7000);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert!(m.bytes(0x8000, 0x100).iter().all(|&b| b == 0x5a), "nothing lands in the stale entry's buffer");
         assert_eq!(m.bytes(0x6008, 8), [0x77; 8], "nothing past the segment either");
         assert_ne!(m.bytes(0x6000, 8), [0x77; 8], "the segment itself is filled");
-        drop(m);
         assert!(c.notes().iter().any(|n| n.starts_with("nb overrun")), "the overrun is reported");
     }
 
     /// A real two-entry list still fills both buffers in order.
     #[test]
     fn a_two_segment_netbsd_read_fills_both_buffers() {
-        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let ram: Ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             m.write(0x7000, &0x9000u32.to_le_bytes());
             m.write(0x7004, &(BLOCK_SIZE as u32 | nb::LAST_SEG).to_le_bytes());
         }
@@ -2036,7 +2308,7 @@ mod tests {
         img[BLOCK_SIZE..2 * BLOCK_SIZE].fill(0x22);
         // READ(10) of blocks 0 and 1.
         netbsd_command(&ram, &img, &[0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0], 0x6000, BLOCK_SIZE as u32, 0x7000);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert!(m.bytes(0x6000, BLOCK_SIZE).iter().all(|&b| b == 0x11));
         assert!(m.bytes(0x9000, BLOCK_SIZE).iter().all(|&b| b == 0x22));
     }
@@ -2084,7 +2356,7 @@ mod tests {
         assert_ne!(c.read(reg::HCNTRL, 1) as u8 & hcntrl::PAUSE, 0, "and the sequencer has stopped");
         assert!(c.interrupting() && irq.level(), "the pin follows the chip");
         assert!(qout(&ram).iter().all(|b| *b == QOUTFIFO_EMPTY), "nothing completed");
-        assert!(ram.lock().unwrap().bytes(buf_at(2) as usize, (buf_at(2) as usize + 36) - (buf_at(2) as usize)).iter().all(|b| *b == 0),
+        assert!(ram.bytes(buf_at(2) as usize, (buf_at(2) as usize + 36) - (buf_at(2) as usize)).iter().all(|b| *b == 0),
                 "and no data moved");
 
         // A restart before the interrupt is cleared does not take.
@@ -2123,7 +2395,7 @@ mod tests {
         put32(&ram, sense_list, sense_buf);
         put32(&ram, sense_list + 4, 18 | SG_LAST);
         put32(&ram, scb_at(tag) + scb::SG_PTR as u32, crate::ip32::RAM_BASE + sense_list);
-        ram.lock().unwrap().write(cdb_at(tag) as usize, &[0x03, 0, 0, 0, 18, 0]);
+        ram.write(cdb_at(tag) as usize, &[0x03, 0, 0, 0, 18, 0]);
         c.write(reg::QINFIFO, tag as u32, 1);
         assert_eq!(c.read(reg::QINCNT, 1), 1, "held while the sequencer is stopped");
 
@@ -2131,10 +2403,9 @@ mod tests {
         assert_eq!(c.read(reg::INTSTAT, 1), 0, "clearing SEQINT clears its code too");
         c.write(reg::HCNTRL, hcntrl::INTEN as u32, 1);
 
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert_eq!(m[sense_buf as usize + 2], 0x05, "ILLEGAL REQUEST");
         assert_eq!(m[sense_buf as usize + 12], 0x20, "invalid command operation code");
-        drop(m);
         assert_eq!(qout(&ram)[7], tag, "and the tag completes through the queue-out");
         assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
         assert_eq!(c.read(reg::QINCNT, 1), 0);
@@ -2153,7 +2424,7 @@ mod tests {
         put_cmd(&ram, 1, 3, &[0x12, 0, 0, 0, 36, 0], 36);
         c.write(reg::QINFIFO, 1, 1);
         assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
-        assert_eq!(ram.lock().unwrap()[buf_at(1) as usize], 0x7f, "nothing here");
+        assert_eq!(ram[buf_at(1) as usize], 0x7f, "nothing here");
         assert_eq!(qout(&ram)[7], 1, "completed where the HIM looks");
     }
 
@@ -2168,7 +2439,7 @@ mod tests {
         c.write(reg::SSTAT0, 0xff, 1);
         assert_eq!(c.read(reg::SSTAT0, 1), 0);
         {
-            let mut st = c.st.lock().unwrap();
+            let mut st = c.st.lock();
             st.sstat0 = 0xff;
             st.sstat1 = 0xff;
         }
@@ -2216,5 +2487,75 @@ mod tests {
         assert_eq!(d[2], 0x05);
         *c.sense.lock().unwrap() = Some((0x05, 0x25, 0x00));
         assert_eq!(c.execute_on(&[0x03, 0, 0, 0, 14, 0], 1).0.len(), 14);
+    }
+
+    /// Wait up to five seconds for the worker to make `done` true.
+    fn eventually(done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        done()
+    }
+
+    /// With its own thread the controller runs what is queued without the
+    /// writer waiting for it, and posts results the way it does inline.
+    #[test]
+    fn the_worker_runs_queued_commands() {
+        use crate::traits::Device;
+        let (c, ram) = him_rig("worker");
+        let irq = std::sync::Arc::new(crate::irq::LevelProbe::default());
+        c.connect_irq(crate::irq::IrqLine::new(irq.clone(), 0));
+        put_cmd(&ram, 0, 1, &TUR, 0);
+        put_cmd(&ram, 1, 1, &TUR, 0);
+        c.start();
+        assert!(c.is_running());
+        c.write(reg::QINFIFO, 0, 1);
+        c.write(reg::QINFIFO, 1, 1);
+        assert!(eventually(|| c.totals().0 == 2 && qout(&ram)[3] == 1), "both commands complete");
+        assert_eq!(qout(&ram)[7], 0, "in the order queued");
+        assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
+        assert!(irq.level(), "the worker drives the pin");
+        c.write(reg::ERROR_CLRINT, intstat::CMDCMPLT as u32, 1);
+        assert!(!irq.level(), "and the host's clear drops it");
+        c.stop();
+        assert!(!c.is_running());
+    }
+
+    /// A paused sequencer takes nothing, worker or not; the host can count
+    /// and rotate what it queued until it lets the sequencer go.
+    #[test]
+    fn the_worker_waits_while_the_host_holds_the_sequencer() {
+        use crate::traits::Device;
+        let (c, ram) = him_rig("worker-paused");
+        put_cmd(&ram, 1, 1, &TUR, 0);
+        c.start();
+        c.write(reg::HCNTRL, hcntrl::PAUSE as u32, 1);
+        c.write(reg::QINFIFO, 1, 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(c.read(reg::QINCNT, 1), 1, "still queued");
+        assert_eq!(c.totals().0, 0, "nothing ran");
+        c.write(reg::HCNTRL, hcntrl::INTEN as u32, 1);
+        assert!(eventually(|| qout(&ram)[7] == 1), "it runs once unpaused");
+        c.stop();
+    }
+
+    /// A command that finishes while the host has the sequencer paused is
+    /// not posted under the host's feet: it waits for the unpause.
+    #[test]
+    fn a_result_that_finds_the_sequencer_paused_is_posted_on_unpause() {
+        let (c, ram) = him_rig("held");
+        c.write(reg::HCNTRL, hcntrl::PAUSE as u32, 1);
+        c.st.lock().held.push_back(Done::Complete { tag: 0, target: 1 });
+        c.write(reg::SCBPTR, 0, 1);
+        assert!(qout(&ram).iter().all(|b| *b == QOUTFIFO_EMPTY), "nothing posted while paused");
+        assert_eq!(c.read(reg::INTSTAT, 1), 0);
+        c.write(reg::HCNTRL, hcntrl::INTEN as u32, 1);
+        assert_eq!(qout(&ram)[7], 0, "posted where the HIM looks");
+        assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
+        assert!(c.st.lock().held.is_empty());
     }
 }

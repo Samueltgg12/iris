@@ -42,6 +42,7 @@ mod frame;
 mod ge11;
 mod gl;
 mod hq3;
+pub mod hq4;
 mod pixmem;
 mod pixpipe;
 mod plain;
@@ -77,6 +78,8 @@ use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_BU
 
 use ge11::Ge11;
 use hq3::{host, Hq3Engine, Hq3Regs, Hq3Sink};
+pub use gl::Gl;
+pub use hq3::Hq3Board;
 use rss::Rss;
 
 /// The graphics slot the board decodes.
@@ -138,6 +141,9 @@ struct Front {
     hq: Hq3Regs,
     ge: Ge11,
     dcb: dcb::Dcb,
+    /// The GE revision a started engine reports; 0 for the Indigo2
+    /// boards' 1.
+    ge_revision: u32,
 }
 
 /// `Front` borrowed under its lock.
@@ -228,8 +234,8 @@ impl Front {
             off if Ge11::is_diag_port(off) => {
                 if self.ge.write(off, val as u32) {
                     // Started: the version program's answer is waiting
-                    // (revision 1).
-                    self.hq.ge_readback = [0, 1];
+                    // (revision 1 on the Indigo2 boards).
+                    self.hq.ge_readback = [0, self.ge_revision.max(1)];
                     flags.fetch_or(host::FLAG_GE_DATA, Ordering::AcqRel);
                 }
                 false
@@ -256,6 +262,10 @@ pub enum Line {
     /// GIO interrupt 2: vertical retrace.
     Retrace,
 }
+
+/// How long `bound_busy_status` lets STATUS read busy: well inside the
+/// IP30 kernel's waits on its idle bits.
+const BUSY_STATUS_BOUND: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub struct Mgras {
     kind: GraphicsBoard,
@@ -328,6 +338,12 @@ pub struct Mgras {
     /// must not wait on `submit`: its holder may be waiting for idle).
     mem_rec: SpinLock<Option<record::RecHandle>>,
     engines: AtomicBool,
+    /// `bound_busy_status`: STATUS reads idle once the board has been busy
+    /// for `BUSY_STATUS_BOUND` without a break.
+    busy_bound: AtomicBool,
+    /// When the current busy stretch began, in ns since `epoch` plus one;
+    /// zero while idle (or before anyone looked).
+    busy_since: AtomicU64,
     threads: SpinLock<Vec<thread::JoinHandle<()>>>,
     hq_thread: SpinLock<Option<thread::Thread>>,
     rss_thread: [SpinLock<Option<thread::Thread>>; MAX_ENGINES],
@@ -566,6 +582,12 @@ impl Mgras {
     fn front_view(&self) -> &Front {
         // SAFETY: see above.
         unsafe { &*self.front.get() }
+    }
+
+    /// Whether a "not modelled yet" report containing `what` was made.
+    #[cfg(test)]
+    pub(crate) fn noted(&self, what: &str) -> bool {
+        self.unhandled.lock().iter().any(|n| n.contains(what))
     }
 
     fn note(&self, what: String) {
@@ -855,6 +877,43 @@ impl Mgras {
         disp::save_png(path, &out, f.width, f.height)
     }
 
+    /// Identity for a board outside the Indigo2 (the Octane's XIO boards):
+    /// the two board-version bytes, the colormaps' revision registers and
+    /// the GE revision, which the readback registers hold from now until
+    /// the first state query or engine start replaces it.
+    pub fn set_identity(&self, bdvers: [u32; 2], cmap_rev: [u32; 2], ge_revision: u32) {
+        let mut f = self.front();
+        f.dcb.init(bdvers, cmap_rev);
+        f.ge_revision = ge_revision;
+        f.hq.ge_readback = [0, ge_revision];
+    }
+
+    /// Start board-to-host DMA in the Octane's HQ4 order (see
+    /// `Hq3Engine::kick_starts_read`). Call before the engines start.
+    pub fn start_reads_at_kick(&self) {
+        assert!(!self.engines.load(Ordering::Acquire), "set before the engines start");
+        // SAFETY: the HQ3 thread is not running.
+        unsafe { &mut *self.eng.get() }.kick_starts_read = true;
+    }
+
+    /// Let STATUS's idle bits read set once the board has been busy for
+    /// `BUSY_STATUS_BOUND` without a break. The model draws far slower than
+    /// the board, and the IP30 kernel gives up waiting on those bits after
+    /// about 2 to 3 s and kills the X server over its idle wait. A
+    /// read that then goes ahead still waits for the work at its data
+    /// register. An approximation: the board would be idle by then.
+    pub fn bound_busy_status(&self) {
+        self.busy_bound.store(true, Ordering::Relaxed);
+    }
+
+    /// Give a board outside the Indigo2 its hooks into the command
+    /// handling. Call before the engines start.
+    pub fn set_board(&self, board: Box<dyn Hq3Board>) {
+        assert!(!self.engines.load(Ordering::Acquire), "set before the engines start");
+        // SAFETY: the HQ3 thread is not running.
+        unsafe { &mut *self.eng.get() }.board = Some(board);
+    }
+
     /// Give the board its path to system memory, for DMA.
     pub fn set_phys(&self, mem: Arc<dyn BusDevice>) {
         *self.mem.lock() = Some(mem);
@@ -912,6 +971,26 @@ impl Mgras {
         }
     }
 
+    /// With `bound_busy_status`, whether the board has been busy without a
+    /// break for longer than `BUSY_STATUS_BOUND`, timed from the store that
+    /// took it from idle to busy (or from the first STATUS read that saw it
+    /// busy, if none did).
+    fn busy_overdue(&self, idle: bool) -> bool {
+        if !self.busy_bound.load(Ordering::Relaxed) {
+            return false;
+        }
+        if idle {
+            self.busy_since.store(0, Ordering::Relaxed);
+            return false;
+        }
+        let now = self.epoch.elapsed().as_nanos() as u64 + 1;
+        let since = match self.busy_since.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => now,
+            Err(t) => t,
+        };
+        now.saturating_sub(since) > BUSY_STATUS_BOUND.as_nanos() as u64
+    }
+
     /// The HQ3 has run every command it was given.
     fn hq_idle(&self) -> bool {
         self.hq_fifo.is_empty() && !self.hq_busy.load(Ordering::Acquire)
@@ -948,11 +1027,15 @@ impl Mgras {
         match off {
             host::STATUS => {
                 let mut v = host::STATUS_FIXED | self.vblank();
+                let idle = self.idle();
                 if self.hq_idle() {
                     v |= host::STATUS_HQ_IDLE;
                 }
-                if self.idle() {
+                if idle {
                     v |= host::STATUS_BOARD_IDLE;
+                }
+                if self.busy_overdue(idle) {
+                    v |= host::STATUS_HQ_IDLE | host::STATUS_BOARD_IDLE;
                 }
                 if Self::cfifo_high(cfg, level) {
                     v |= host::STATUS_CFIFO_HIGH;
@@ -1181,6 +1264,11 @@ impl Mgras {
     fn do_write(&self, addr: u64, bits: u32, val: u64) -> u32 {
         let Some(off) = self.offset(addr) else { return BUS_OK };
         let sub = self.submit.lock();
+        // A store into an idle board may start a busy stretch: time the
+        // bound from here, not from some earlier stretch no STATUS read saw end.
+        if self.busy_bound.load(Ordering::Relaxed) && self.idle() {
+            self.busy_since.store(self.epoch.elapsed().as_nanos() as u64 + 1, Ordering::Relaxed);
+        }
         let ok = self.write_locked(off, bits, val);
         crate::pf_level!(self.pf_fifo_full, crate::perfetto::events::MGRAS_FIFO_FULL, !ok);
         if !ok {

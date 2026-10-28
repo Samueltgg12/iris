@@ -30,7 +30,7 @@ IRIS keeps the observable part and drops the timing.
 ```
                        ┌──────────────────── Machine ────────────────────┐
   CPU thread           │                                                 │
-  MipsExecutor ──SysAd──▶ Physical (64 KB address decode table)           │
+  MipsExecutor ──SysAd──▶ Physical (4 KB address decode table)            │
   (interp / jitv2)     │    ├── RAM banks (host-mapped, ppmem)           │
                        │    ├── MC: memory config, VDMA, GIO arbitration  │
                        │    ├── HPC3 ── IOC (interrupts, PIT, PS/2, SCC) │
@@ -145,12 +145,44 @@ screenshots), `CpuDevice` (what `Machine` holds for the CPU).
 
 ### The physical address map
 
-`Physical` (`src/physical.rs`) decodes physical addresses through a table of
-64 KB slots (one `*const dyn BusDevice` per `addr >> 16`), so finding the
+`Physical` (`src/physical.rs`) is the physical bus, and it belongs to no
+machine: a decode table, the RAM banks with ppmem's window over them, and the
+plain devices every machine needs (memory that reads zero, a black hole,
+aliases that re-dispatch a range elsewhere on the bus). A machine builds its
+devices and banks, creates a `Physical` over the banks and maps everything
+where its hardware decodes it. For the Indy and Indigo2 that is
+`src/ip22_bus.rs` (`Ip22Bus`): the address map, the MC's error reporting, and
+the MEMCFG remap that places the banks in the table and the window. For the
+O2 it is `src/ip32.rs` (`Ip32Bus`) with CRIME's bank logic in
+`src/dev/crime_mem.rs` (`O2Memory`), whose remap points the table at bank
+views (a bank counted from where CRIME placed it) and maps the window to
+match. The Octane is built the same way: `src/ip30.rs` (`Ip30Bus`) maps
+HEART, the Crossbow and the widget windows (switched as links come and go),
+and HEART's bank descriptors place the banks through `src/dev/heart_mem.rs`
+(`HeartRam`), 32 MB at a time, with the 16 KB low-memory window as a view
+of the same bank. The CPU and every DMA master reach memory through
+`Physical` as a `BusDevice` (on the Octane, masters get `HeartRam`'s DMA
+view of it); `physical::read_bytes`/`write_bytes` move byte ranges a page
+at a time with `read_block`/`write_block`, and both PCI host bridges'
+`PciDma` use them.
+
+PCI is shaped the same way on both machines that have it. A host bridge
+(the Octane's Bridge, the O2's MACE) works out which pages of its CPU
+windows one BAR decodes whole (`pci::bar_runs`) and hands them to the
+machine's bus through a callback (`on_bar_runs`); the bus maps each run on
+`Physical` as a `pci::PciBar` entry, which drives the function directly
+through the bridge's byte-lane rules (`pci::PciLanes`). The bridge
+recomputes the runs after a configuration write, a write to a window
+register and a reset. Everything else in a window (BARs smaller than a
+page, shared pages, unclaimed addresses and their master aborts) stays with
+the bridge's own decode.
+
+`Physical` decodes physical addresses through a table of
+4 KB slots (one `*const dyn BusDevice` per `addr >> 12`), so finding the
 device for an access is one indexed load. The table itself is sparse and
 host-mapped (`SparseDeviceMap`, `src/ppmem/devmap.rs`): it spans a 40-bit
-physical space as a 256 MB reservation, pages full of one pointer are views
-of one shared page, a change swaps a whole page in rather than storing into
+physical space as a 4 GB reservation, pages full of one pointer are views
+of one shared page mapped on first use, a change swaps a whole page in rather than storing into
 it (so threads dispatching through it never see a torn pointer), and a page
 nobody filled is faulted in as the bus-error device the first time the guest
 touches it. [docs/devmap-design.md](docs/devmap-design.md) has the details.
@@ -179,7 +211,13 @@ state may have changed; the controller decides what that means (a status bit
 behind a mask, an OR of several inputs, or a cascade further up). HPC3's
 interrupt status, the IOC's local and mappable interrupts and the Indigo2's
 INT2 cascade all work this way, and the IOC finally drives the CPU's
-interrupt pins.
+interrupt pins. The O2 is built the same way: its devices drive MACE's ISA
+status, the PCI bridge's pin router or CRIME directly, and CRIME drives
+IP2. Each controller updates its state and drives the next one up under
+its own lock, so two threads cannot deliver levels out of order. Nothing
+re-polls the lines: a device drives its line from the register access,
+the host event (a key, a frame, console input) or the timer tick that
+changed it.
 
 The CPU side is an `AtomicU64` bitmask in `MipsCore` that any thread may set
 or clear. The CPU polls it between instructions (jitv2 at region boundaries
@@ -205,6 +243,7 @@ Every device that has real work to do runs on its own thread:
 | `MIPS-CPU` | the interpreter or jitv2 dispatch loop |
 | jitv2 compile pool | Cranelift compiles of requested pages (`[jitv2] threads`) |
 | `WD33C93A` | SCSI command execution and DMA |
+| `AIC-7880-0`, `AIC-7880-1` | O2 SCSI: command execution, host-memory DMA and disk I/O; the CPU's register writes only queue and kick |
 | `seeq-enet`, `seeq-nat` | ethernet DMA pump; the NAT engine and its built-in services |
 | `MC-DMA` | VDMA (graphics DMA) |
 | `SCC-TX/RX-*` | serial ports |
@@ -214,6 +253,9 @@ Every device that has real work to do runs on its own thread:
 | `hptimer` | host timer callbacks (Compare, PIT ticks, HAL2 audio pacing) |
 | listeners | debug console, serial ports, CI socket, GDB stub |
 | `machine-events` | power-off and reset requests from devices |
+| `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
+| `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
+| `ip30-eth-rx`, `ip30-eth-nat` | Octane ethernet receive pump; the NAT engine |
 
 Threads that have nothing to do park instead of spinning: the graphics
 consumers when their FIFO is empty, and the CPU thread in `idle-pause` builds

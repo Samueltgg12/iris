@@ -30,6 +30,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [cp0-status-writes-must-resync-privilege-state.md](cpu/cp0-status-writes-must-resync-privilege-state.md) | rule | Every `cp0_status` write must call `resync_privilege_state()` |
 | [cpu-count-is-wallclock-derived.md](cpu/cpu-count-is-wallclock-derived.md) | rule | CP0 Count is wallclock-derived, so Count tests flake |
 | [cpu-model-is-runtime-not-compile-time.md](cpu/cpu-model-is-runtime-not-compile-time.md) | design | The emulated CPU is a runtime flag now, not a cargo feature |
+| [decode-cache-index-must-survive-page-colouring.md](cpu/decode-cache-index-must-survive-page-colouring.md) | rule | Decode cache indexed by `pfn % 64` thrashed on the O2's coloured text pages; hash the page number. Also: O2 shadow model ran with an empty RAM bitmap in interpreter builds |
 | [entryhi-region-falls-out-of-sign-extension.md](cpu/entryhi-region-falls-out-of-sign-extension.md) | rule | EntryHi.Region on a 32-bit TLB miss comes free from sign extension |
 | [fpu-exception-model-vs-r4400.md](cpu/fpu-exception-model-vs-r4400.md) | open | What IRIS's FPU does that an R4400's does not |
 | [instr_stats_insmap_generalization.md](cpu/instr_stats_insmap_generalization.md) | design | instr_stats generalized into a decode+exec instruction map (insmap) |
@@ -106,7 +107,11 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [o2-readback-transfer-registers.md](devices/o2-readback-transfer-registers.md) | rule | O2 glReadPixels: the frame-buffer-to-linear transfer, GL vertices, edge type, src steps and linStride as IRIX uses them |
 | [ip32-o2-bringup-log.md](devices/ip32-o2-bringup-log.md) | history | The O2 (IP32) bring-up log: PROM, POST, CRIME/MACE/GBE, SCSI, PCI, the OSes |
 | [ip32-headless-irix-panics.md](devices/ip32-headless-irix-panics.md) | rule | O2 TLBMISS at 0xff800000 in early boot was `crmFifoWait` timing out on our host-thread RE; status polls now wait for the engine (fixed) |
-| [ip30-octane-bringup.md](devices/ip30-octane-bringup.md) | open | The Octane (IP30) bring-up: PROM 4.17 to its menu on the serial console; what it insists on (memory sizing, the Bridge status bit, empty slots, IOC3 bits, the NIC parts' formats, its device tree) |
+| [ip30-octane-bringup.md](devices/ip30-octane-bringup.md) | open | The Octane (IP30) bring-up: PROM 4.17 to its menu on the serial console; what it insists on (memory sizing, the Bridge status bit, empty slots, IOC3 bits, the NIC parts' formats, its device tree); the full machine's findings (cached flash lines, low-memory JIT counters, the ISP stall, HQ4 before a context switch) |
+| [ip30-low-memory-aliases-sdram.md](devices/ip30-low-memory-aliases-sdram.md) | rule | Octane: the 16 KiB at physical 0 is the first 16 KiB of SDRAM, which the processor reaches only there (0x2000_0000..+16 KiB bus-errors, as the stock IDE memory diagnostics expect); shares its JIT page generations; the guard holds on the table path only (the ppmem window maps whole units); DMA reach unknown |
+| [ip30-prom-stores-into-flash-stay-in-cache.md](devices/ip30-prom-stores-into-flash-stay-in-cache.md) | rule | Octane: the PROM's cached stores into its own flash never reach the Bridge; `CachedFlashLines` holds them (approximation: no write-back) |
+| [ip30-device-timing-on-hptimer.md](devices/ip30-device-timing-on-hptimer.md) | design | Octane: IOC3, RAD1 and ISP1040 pace themselves on `hptimer` one-shots, with threads only where something blocks (the ISP1040 ring, serial receive, NVRAM writer) |
+| [ip30-ps2-keyboard-runs-set-3.md](devices/ip30-ps2-keyboard-runs-set-3.md) | rule | Octane: PROM 4.17 and IRIX's `ioc3_pckm` put the PS/2 keyboard in scan code set 3 (Linux/OpenBSD use 2); K_RD slot order, CLAMP_THREE, role by F2 answer; how the PROM's keyboard sequence was traced |
 | [aic7880-emulation-vs-spec.md](devices/aic7880-emulation-vs-spec.md) | open | AIC-7880: where the O2 SCSI model departs from `docs/o2/aic7880.md` (HLE above the sequencer, reset values, wide strap, residuals, interrupt gating, config space) |
 | [aic7880-seqdis.py](devices/aic7880-seqdis.py) | howto | Disassembler for an AIC-7xxx sequencer image in a C byte array (the HIM's image the O2 downloads) |
 | [aic7880-patchsim.py](devices/aic7880-patchsim.py) | howto | Reproduces the Linux aic7xxx firmware patch selection and critical sections for a 7880 |
@@ -372,6 +377,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [jitv2_performance_analysis.md](plans/jitv2_performance_analysis.md) | plan | jitv2 performance — where to spend effort next |
 | [net-stack.md](plans/net-stack.md) | plan | The NAT network stack: analysis and redesign plan |
 | [pci-dma-port.md](plans/pci-dma-port.md) | plan | PCI bus masters: one `PciDma` trait, shared on the O2, per device on the Octane's Bridge; Bridge/Xbridge DMA, PIO, interrupt and swap facts; step 1 done |
+| [o2-memory-and-locks.md](plans/o2-memory-and-locks.md) | plan | O2 disk I/O gap vs Indy: interrupt re-drive on every access (~205 locks), PCI BAR decode locks, debug logs on hot paths, RAM onto Physical/SparseDeviceMap/PpMemory like the Indy, remaining locks; hardware facts on memory masters |
 | [networking-tab-redesign.md](plans/networking-tab-redesign.md) | plan | Networking tab redesign — design & plan |
 | [nfsudp-plan.md](plans/nfsudp-plan.md) | plan | Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`) |
 | [pcap-release-plan.md](plans/pcap-release-plan.md) | plan | PCAP release + elevation plan |

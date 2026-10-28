@@ -320,6 +320,17 @@ fn fetch_dl_segment(mem: &dyn BusDevice, table: u32, offset: u32, words: u32) ->
 /// starts a board-to-host transfer.
 const RSS_XFRCONTROL: u32 = 0x102;
 const XFRCONTROL_READ_START: u32 = 9;
+const XFRCONTROL_READ: u32 = 8;
+
+/// What a board other than the Indigo2's changes in the engine's command
+/// handling.
+pub trait Hq3Board: Send + Sync {
+    /// The GE state word a readback at `addr` answers.
+    fn ge_state(&self, gl: &mut super::gl::Gl, addr: u32) -> Option<u32>;
+    /// Whether the raster command `cmd` is dropped instead of executed; the
+    /// reason is reported.
+    fn drop_raster_write(&self, cmd: u32) -> Option<String>;
+}
 
 /// CPU-side HQ3 registers (the flags are atomic, in `Mgras`). Plain data,
 /// valid zeroed.
@@ -512,6 +523,17 @@ pub struct Hq3Engine {
     /// A board-to-host DMA started on the host side, waiting for the raster
     /// engine to be started (xfrcontrol = 9).
     dma_read_pending: Option<u32>,
+    /// A board-to-host start runs at once when the raster engine already
+    /// has a read armed, and an XFRCONTROL with the read bit starts a
+    /// waiting one: the Octane's HQ4 order, where the X server arms the
+    /// read with XFRCONTROL 8 and kicks the DMA last. The Indigo2's order
+    /// is the host side first, then XFRCONTROL 9. The armed read stays
+    /// armed until the next block or XFRCONTROL 0, so a later read kick
+    /// meant for something else (a kernel GE context read-out) would take
+    /// those pixels instead; nothing captured shows that order yet.
+    pub kick_starts_read: bool,
+    /// Hooks for a board outside the Indigo2.
+    pub board: Option<Box<dyn Hq3Board>>,
     /// DMA transfers logged so far (bring-up).
     dma_logged: u32,
     /// The GE11s' OpenGL state (HLE) for the current context, the context
@@ -576,6 +598,8 @@ impl Hq3Engine {
             raster_if_regs: [0; 0x10],
             formatter: 0,
             dma_read_pending: None,
+            kick_starts_read: false,
+            board: None,
             dma_logged: 0,
             ge_return: None,
             last_token: None,
@@ -919,7 +943,11 @@ impl Hq3Engine {
             0x089 => Some(cmd),
             _ => None,
         };
-        if cmd >= cmd::RASTER_BASE {
+        let dropped = if cmd >= cmd::RASTER_BASE { self.board.as_ref().and_then(|b| b.drop_raster_write(cmd)) } else { None };
+        if let Some(why) = dropped {
+            self.stats.raster_writes += 1;
+            sink.note(why);
+        } else if cmd >= cmd::RASTER_BASE {
             let r = cmd & 0x3FF;
             let exec = cmd & cmd::RASTER_EXECUTE != 0;
             self.stats.raster_writes += 1;
@@ -932,8 +960,11 @@ impl Hq3Engine {
                     sink.rss_write(r + 1, *lo, exec);
                 }
             }
-            if r == RSS_XFRCONTROL && data.first() == Some(&XFRCONTROL_READ_START) {
+            let xfr = data.first().copied().filter(|_| r == RSS_XFRCONTROL);
+            if xfr == Some(XFRCONTROL_READ_START) {
                 self.start_read_dma(sink);
+            } else if self.kick_starts_read && xfr.is_some_and(|v| v & XFRCONTROL_READ != 0) {
+                self.start_armed_read(sink);
             }
         } else if cmd == cmd::SET_DONE_FLAG {
             self.stats.set_done += 1;
@@ -1002,7 +1033,7 @@ impl Hq3Engine {
             self.stats.cp_tokens[cmd as usize] += 1;
             self.gl.end_raster(sink);
             let addr = data.first().copied().unwrap_or(0);
-            let v = sink.readback_probe(addr).or_else(|| self.gl.state_word(addr)).unwrap_or(addr);
+            let v = sink.readback_probe(addr).or_else(|| self.ge_state(addr)).unwrap_or(addr);
             self.ge_return = Some([0, v]);
             sink.set_flags(host::FLAG_GE_DATA);
         } else if cmd == cmd::CP_RETURN_MODE {
@@ -1010,7 +1041,7 @@ impl Hq3Engine {
             // Addresses the GE HLE knows answer from its state; others read
             // 0 and are reported once each, so the layout can be mapped.
             let addr = data.first().copied().unwrap_or(0);
-            let v = sink.readback_probe(addr).or_else(|| self.gl.state_word(addr)).unwrap_or_else(|| {
+            let v = sink.readback_probe(addr).or_else(|| self.ge_state(addr)).unwrap_or_else(|| {
                 sink.note(format!("GE state readback at {addr:#x} ({:x?}) answered 0", data.get(1..).unwrap_or(&[])));
                 0
             });
@@ -1044,15 +1075,28 @@ impl Hq3Engine {
         }
     }
 
+    /// The GE state word a readback at `addr` answers, in the layout of the
+    /// board's microcode.
+    fn ge_state(&mut self, addr: u32) -> Option<u32> {
+        match &self.board {
+            Some(b) => b.ge_state(&mut self.gl, addr),
+            None => self.gl.state_word(addr),
+        }
+    }
+
     /// The host DMA engine's start word. Host to board runs now: the raster
-    /// engine was armed by commands queued ahead. Board to host waits for
-    /// the raster engine.
+    /// engine was armed by commands queued ahead. Board to host is held
+    /// until the raster engine arms the transfer, or, with
+    /// `kick_starts_read`, until the start word itself starts it.
     fn dma_start(&mut self, word: u32, sink: &mut dyn Hq3Sink) {
         if word & 1 == 0 {
             return;
         }
         if word & 8 != 0 {
             self.dma_read_pending = Some(word);
+            if self.kick_starts_read {
+                self.start_armed_read(sink);
+            }
             return;
         }
         if self.eram_in.is_some() {
@@ -1124,6 +1168,14 @@ impl Hq3Engine {
                 let words: Vec<u32> = self.eram.words[ge][addr..addr + n].to_vec();
                 self.dma(word, DmaPeer::EramOut(&words, 0), sink);
             }
+        }
+    }
+
+    /// The HQ4 order: a waiting host side starts once the raster engine
+    /// has a read armed; until then both wait.
+    fn start_armed_read(&mut self, sink: &mut dyn Hq3Sink) {
+        if self.dma_read_pending.is_some() && matches!(sink.transfer(), Some((true, _))) {
+            self.start_read_dma(sink);
         }
     }
 
