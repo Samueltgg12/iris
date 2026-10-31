@@ -516,10 +516,11 @@ impl O2Machine {
                     return;
                 }
                 running.store(false, Ordering::SeqCst);
-                if let Err(e) = bus.flush_disks() {
-                    eprintln!("iris: disk flush at power-off failed: {e} (guest writes may be lost)");
-                }
-                std::process::exit(0);
+                crate::workstation::exit_process("power-off", 0, || {
+                    if let Err(e) = bus.flush_disks() {
+                        eprintln!("iris: disk flush at power-off failed: {e} (guest writes may be lost)");
+                    }
+                });
             }
             std::thread::sleep(poll);
         }
@@ -782,6 +783,7 @@ impl Drop for O2Machine {
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
+        crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
     }
 }
