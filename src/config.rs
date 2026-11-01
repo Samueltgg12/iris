@@ -1703,6 +1703,15 @@ pub fn banks_from4(four: [u32; 4]) -> [u32; MAX_BANKS] {
     banks
 }
 
+/// The first four banks of a full `banks` array. Every machine today has
+/// four banks or fewer, so the rest of the array is always zeros; the
+/// front-ends' per-bank pickers work on a `[u32; 4]`.
+pub fn banks_to4(banks: [u32; MAX_BANKS]) -> [u32; 4] {
+    let mut four = [0u32; 4];
+    four.copy_from_slice(&banks[..4]);
+    four
+}
+
 /// `banks` as TOML: any length from 1 to [`MAX_BANKS`] is read and padded
 /// with zeros; it is written with at least four entries and no trailing
 /// zeros beyond them, so a four-bank machine's config looks as it always has.

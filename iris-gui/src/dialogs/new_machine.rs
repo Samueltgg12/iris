@@ -144,7 +144,7 @@ impl NewMachineDialog {
                             self.use_embedded_prom = false;
                             self.prom_path = "ip32prom.bin".into();
                             self.ram_total_mb = 128;
-                            self.ram_banks = crate::ram::o2_kits_for(128);
+                            self.ram_banks = iris::config::banks_to4(crate::ram::o2_kits_for(128));
                             self.resolution = NewportResolution::Guest;
                         } else if profile_before == MachineProfile::Indigo2Ip28 {
                             self.cpu = CpuModel::default();
@@ -158,7 +158,8 @@ impl NewMachineDialog {
                             // banks the Indy/Indigo2 can actually express.
                             self.cpu = CpuModel::default();
                             self.ram_total_mb = self.ram_total_mb.min(512);
-                            self.ram_banks = distribute_ram(self.ram_total_mb, self.profile);
+                            self.ram_banks = iris::config::banks_to4(
+                                distribute_ram(self.ram_total_mb, self.profile));
                         }
                     }
                     ui.end_row();
