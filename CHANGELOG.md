@@ -13,6 +13,21 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### `IRIS_GUI_GL` works in iris-gui
+
+- The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
+  ran: it always printed "headless GL init failed" and fell back to the CPU
+  compositor, whatever the host's GLX/EGL supported. `HeadlessGl` created its
+  hidden window through `glutin_winit::DisplayBuilder`, which needs a
+  `winit::EventLoop` — and winit allows exactly one per process, which eframe
+  takes for the GUI's own window. So the second `EventLoop::new()` failed before
+  GL was ever touched.
+- It now asks for the platform's default display directly and renders into a
+  pbuffer, with no event loop and no window: the compositor draws into its own
+  framebuffer object and reads that back, so it never needed a window. Verified
+  with a GL 4.6 core context on Mesa; the CPU compositor remains the fallback
+  where no GL is available.
+
 ### Two processors on the Octane
 
 - **`[machine] cpus = 2`** runs an Octane with two R10000s on two host threads.

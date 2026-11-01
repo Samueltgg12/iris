@@ -273,6 +273,7 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [egui-default-font-glyph-coverage-avoid-tofu.md](gui/egui-default-font-glyph-coverage-avoid-tofu.md) | rule | egui default fonts: which glyphs render, which are tofu |
 | [gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md](gui/gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md) | design | A new graphics board needs no `iris-gui` capture wiring |
 | [gui-frame-sink-carries-only-the-damaged-band.md](gui/gui-frame-sink-carries-only-the-damaged-band.md) | rule | iris-gui's frame sink carries only the damaged band — screenshots and VNC read `screen.rgba`, never the sink |
+| [gui-owns-the-winit-event-loop.md](gui/gui-owns-the-winit-event-loop.md) | rule | iris-gui must not create a `winit::EventLoop` — eframe owns the process's one, which is why `IRIS_GUI_GL` always fell back |
 | [gl-teardown-must-run-on-the-refresh-thread.md](gui/gl-teardown-must-run-on-the-refresh-thread.md) | rule | GL teardown must run on the REX3-Refresh thread |
 | [gui_mouse_integration.md](gui/gui_mouse_integration.md) | design | GUI mouse integration — current approach, and the classic-Mac absolute-mouse pattern |
 | [i18n-catalog-gotchas.md](gui/i18n-catalog-gotchas.md) | rule | GUI text catalogs (i18n) gotchas |
