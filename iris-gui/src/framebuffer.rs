@@ -487,6 +487,362 @@ impl RowDamage {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iris::disp::{FB_MAX_H, MORE_CPUS};
+
+    /// `screen.rgba` words are `0xAABBGGRR`, so R sits in the low byte — the
+    /// opposite of the `0x00RRGGBB` a reader might expect.
+    const RED:   u32 = 0x0000_00FF;
+    const GREEN: u32 = 0x0000_FF00;
+    const BLUE:  u32 = 0x00FF_0000;
+
+    /// A screen whose composed frame is whatever the test writes into `fb_rgb`:
+    /// `prebuilt` makes `compose_pixels` copy the rows straight through, so a
+    /// test drives the picture without depending on mode decoding.
+    fn prebuilt_screen(w: usize, h: usize) -> Rex3Screen {
+        let mut s = Rex3Screen::new();
+        s.width = w;
+        s.height = h;
+        s.prebuilt = true;
+        s
+    }
+
+    fn fill_row(screen: &mut Rex3Screen, y: usize, word: u32) {
+        let row = y * FB_STRIDE;
+        for x in 0..screen.width {
+            screen.fb_rgb[row + x] = word;
+        }
+    }
+
+    fn fill_pixels_row(pixels: &mut [u32], y: usize, w: usize, word: u32) {
+        let row = y * FB_STRIDE;
+        for x in 0..w {
+            pixels[row + x] = word;
+        }
+    }
+
+    fn bar_stats() -> BarStats {
+        BarStats {
+            now:            std::time::Instant::now(),
+            cycles:         0,
+            fasttick:       0,
+            more_cpus:      [None; MORE_CPUS],
+            decoded_delta:  0,
+            l1i_hits:       0,
+            l1i_fetches:    0,
+            uncached:       0,
+            hb:             0,
+            count_hz:       0,
+            gfifo_pending:  0,
+        }
+    }
+
+    /// `present` ignores the overlay, status bar and stats, but it wants them.
+    struct Dummies {
+        overlay: DebugOverlay,
+        status:  StatusBar,
+        sbtex:   StatusBarTexture,
+        stats:   BarStats,
+    }
+
+    impl Dummies {
+        fn new() -> Self {
+            Self {
+                overlay: DebugOverlay::new(),
+                status:  StatusBar::new(),
+                sbtex:   StatusBarTexture::new(),
+                stats:   bar_stats(),
+            }
+        }
+    }
+
+    fn present(r: &mut CaptureRenderer, screen: &mut Rex3Screen, d: &mut Dummies) {
+        r.present(screen, &mut d.overlay, &mut d.status, &mut d.sbtex, &d.stats, false, None, None);
+    }
+
+    /// Copy `w`×`h` of a strided picture, as the GUI's texture would end up
+    /// holding after uploading a frame.
+    fn copy_pic(dst: &mut [u32], src: &[u32], w: usize, h: usize) {
+        for y in 0..h {
+            let row = y * FB_STRIDE;
+            dst[row..row + w].copy_from_slice(&src[row..row + w]);
+        }
+    }
+
+    /// An independent row diff, so the assertions below are an oracle rather
+    /// than a restatement of `RowDamage`.
+    fn band_between(prev: &[u32], cur: &[u32], w: usize, h: usize) -> Option<(u32, u32)> {
+        let mut first = None;
+        let mut last = 0;
+        for y in 0..h {
+            let a = &cur[y * FB_STRIDE..y * FB_STRIDE + w];
+            let b = &prev[y * FB_STRIDE..y * FB_STRIDE + w];
+            if a != b {
+                if first.is_none() { first = Some(y); }
+                last = y;
+            }
+        }
+        first.map(|f| (f as u32, (last - f + 1) as u32))
+    }
+
+    #[test]
+    fn first_frame_is_full_then_a_band_then_nothing() {
+        let sink = FrameSink::new();
+        let mut r = CaptureRenderer::new(sink.clone());
+        let mut d = Dummies::new();
+        let mut screen = prebuilt_screen(64, 32);
+        fill_row(&mut screen, 0, RED);
+
+        present(&mut r, &mut screen, &mut d);
+        let f = sink.take().expect("the first frame must publish");
+        assert_eq!((f.width, f.height), (64, 32));
+        // Nothing to diff against yet, so the whole picture has to go up.
+        assert_eq!((f.dirty_y, f.dirty_h), (0, 32));
+        assert_eq!(f.rgba.len(), 64 * 32 * 4);
+        assert_eq!(&f.rgba[0..4], &[0xFF, 0x00, 0x00, 0xFF], "R in the low byte, A forced on");
+        sink.recycle(f);
+
+        // Two rows apart: one band covering both, not two uploads.
+        fill_row(&mut screen, 3, GREEN);
+        fill_row(&mut screen, 20, GREEN);
+        present(&mut r, &mut screen, &mut d);
+        let f = sink.take().expect("a changed row must publish");
+        assert_eq!((f.dirty_y, f.dirty_h), (3, 18));
+        sink.recycle(f);
+
+        // Nothing moved: no pack, no publish, and the GUI goes back to sleep.
+        present(&mut r, &mut screen, &mut d);
+        assert!(sink.take().is_none(), "an unchanged frame must not publish");
+        assert_eq!(sink.seq(), 2);
+    }
+
+    /// The invariant the whole band path rests on: a dropped frame must not
+    /// move the damage baseline, or the rows it carried would never reach the
+    /// GUI's texture.
+    #[test]
+    fn a_dropped_frame_does_not_move_the_baseline() {
+        let sink = FrameSink::new();
+        let mut r = CaptureRenderer::new(sink.clone());
+        let mut d = Dummies::new();
+        let mut screen = prebuilt_screen(64, 32);
+        fill_row(&mut screen, 0, RED);
+
+        present(&mut r, &mut screen, &mut d);
+
+        // A second frame arrives before the GUI looks. The display always wants
+        // the newest, so this one is dropped rather than queued — which leaves
+        // the first frame waiting, not the second.
+        fill_row(&mut screen, 5, GREEN);
+        present(&mut r, &mut screen, &mut d);
+        let held = sink.take().expect("the dropped frame leaves the previous one waiting");
+        assert_eq!((held.dirty_y, held.dirty_h), (0, 32), "it is still the first, full frame");
+        sink.recycle(held);
+
+        // Row 7 changes too. The band has to cover both, because the GUI's
+        // texture still holds the frame from before row 5 turned green: had the
+        // dropped frame moved the baseline, row 5 would never be uploaded.
+        fill_row(&mut screen, 7, BLUE);
+        present(&mut r, &mut screen, &mut d);
+        let f = sink.take().expect("the third frame must publish");
+        assert_eq!((f.dirty_y, f.dirty_h), (5, 3));
+    }
+
+    #[test]
+    fn a_resolution_change_forces_a_full_frame() {
+        let sink = FrameSink::new();
+        let mut r = CaptureRenderer::new(sink.clone());
+        let mut d = Dummies::new();
+        let mut screen = prebuilt_screen(64, 32);
+        fill_row(&mut screen, 0, RED);
+
+        present(&mut r, &mut screen, &mut d);
+        assert_eq!(sink.take().map(|f| (f.dirty_y, f.dirty_h)), Some((0, 32)));
+
+        // A band is only valid against a texture of the same size, so a resize
+        // starts over rather than trying to patch rows that moved.
+        screen.width = 128;
+        screen.height = 64;
+        present(&mut r, &mut screen, &mut d);
+        let f = sink.take().expect("the first frame at the new size must publish");
+        assert_eq!((f.dirty_y, f.dirty_h), (0, 64));
+        assert_eq!(f.rgba.len(), 128 * 64 * 4);
+    }
+
+    #[test]
+    fn a_heartbeat_refresh_publishes_nothing() {
+        let sink = FrameSink::new();
+        let mut r = CaptureRenderer::new(sink.clone());
+        let mut d = Dummies::new();
+        let mut screen = prebuilt_screen(64, 32);
+        fill_row(&mut screen, 0, RED);
+
+        present(&mut r, &mut screen, &mut d);
+        assert!(sink.take().is_some());
+
+        // The compositor says only its own status bar would change. iris-gui
+        // draws its own chrome and never bakes that bar into a frame, so there
+        // is nothing to push — even though the guest framebuffer did move.
+        screen.status_bar_only = true;
+        fill_row(&mut screen, 9, GREEN);
+        present(&mut r, &mut screen, &mut d);
+        assert!(sink.take().is_none(), "a heartbeat must not publish");
+        assert_eq!(sink.seq(), 1);
+    }
+
+    /// Drives the renderer through a scripted mix of idle frames, damage and a
+    /// publish the GUI is too slow to take, and checks every band against an
+    /// independent diff of what the GUI's texture holds.
+    #[test]
+    fn every_band_covers_exactly_what_the_gui_still_needs() {
+        let sink = FrameSink::new();
+        let mut r = CaptureRenderer::new(sink.clone());
+        let mut d = Dummies::new();
+        let mut screen = prebuilt_screen(64, 32);
+        let (w, h) = (64, 32);
+
+        // `baseline` is the picture the renderer last published — the frame its
+        // damage tracker diffs against. `shown` is the picture the GUI's texture
+        // holds. They are equal whenever the GUI has taken everything published,
+        // which is the only state in which a band means anything.
+        let mut baseline = vec![0u32; FB_STRIDE * FB_MAX_H];
+        let mut shown    = vec![0u32; FB_STRIDE * FB_MAX_H];
+        let mut gui_primed = false;
+        let mut dropped = 0;
+
+        // The GUI takes nothing on this step, so the publish that follows it is
+        // dropped rather than queued. The last entry re-fills a row with the
+        // colour it already has: a step with nothing to do, so the GUI gets to
+        // take the final frame without a new one overtaking it.
+        let slow = 2usize;
+        let edits: &[(usize, u32)] =
+            &[(0, RED), (5, GREEN), (6, GREEN), (20, BLUE), (9, RED), (0, RED)];
+
+        for (i, &(row, word)) in edits.iter().enumerate() {
+            // The GUI takes the frame the renderer published, unless it is behind.
+            if i != slow {
+                if let Some(f) = sink.take() {
+                    let want = if gui_primed {
+                        band_between(&shown, &baseline, w, h)
+                    } else {
+                        Some((0, h as u32))
+                    };
+                    assert_eq!(
+                        Some((f.dirty_y, f.dirty_h)), want,
+                        "step {i}: the frame the GUI takes must cover what its texture still needs"
+                    );
+                    copy_pic(&mut shown, &baseline, w, h);
+                    gui_primed = true;
+                    sink.recycle(f);
+                }
+            }
+
+            fill_row(&mut screen, row, word);
+            let before = sink.seq();
+            present(&mut r, &mut screen, &mut d);
+
+            if sink.seq() != before {
+                // Published, so this is now what every band is diffed against.
+                copy_pic(&mut baseline, &screen.fb_rgb, w, h);
+            } else if i == slow {
+                // The GUI took nothing last step, so the sink still holds that
+                // frame and this one had to be dropped — and the baseline must
+                // not have moved with it.
+                dropped += 1;
+            }
+        }
+
+        assert!(dropped > 0, "the drop path must have been exercised");
+
+        // Row 6 went green on a frame the GUI never took, and row 20 went blue
+        // on a frame that was dropped outright. Both must have arrived.
+        assert_eq!(
+            band_between(&shown, &screen.fb_rgb, w, h), None,
+            "the GUI's texture must end up holding the whole picture"
+        );
+        assert_eq!(
+            band_between(&baseline, &screen.fb_rgb, w, h), None,
+            "the renderer's baseline must end up matching the picture"
+        );
+    }
+
+    #[test]
+    fn pack_frame_writes_only_the_band() {
+        let mut frame = Frame::default();
+        // A recycled buffer still holds the previous picture.
+        frame.rgba = vec![0xAA; 64 * 32 * 4];
+        let mut pixels = vec![0u32; FB_STRIDE * FB_MAX_H];
+        fill_pixels_row(&mut pixels, 4, 64, RED);
+        fill_pixels_row(&mut pixels, 5, 64, RED);
+
+        pack_frame(&mut frame, &pixels, 64, 32, 4, 2);
+
+        assert_eq!((frame.dirty_y, frame.dirty_h), (4, 2));
+        assert_eq!(frame.rgba.len(), 64 * 32 * 4, "the buffer is reused, not reallocated");
+        assert!(frame.rgba[..4 * 64 * 4].iter().all(|&b| b == 0xAA), "rows above the band are left alone");
+        assert!(frame.rgba[6 * 64 * 4..].iter().all(|&b| b == 0xAA), "rows below the band are left alone");
+        assert_eq!(&frame.rgba[4 * 64 * 4..4 * 64 * 4 + 4], &[0xFF, 0x00, 0x00, 0xFF]);
+    }
+
+    #[test]
+    fn mirror_band_writes_only_the_band() {
+        let mut screen = Rex3Screen::new();
+        screen.width = 64;
+        screen.height = 32;
+        let mut pixels = vec![0u32; FB_STRIDE * FB_MAX_H];
+        fill_pixels_row(&mut pixels, 1, 64, RED);
+        fill_pixels_row(&mut pixels, 2, 64, RED);
+
+        // VNC reads `screen.rgba`, which the GUI never touches, so only the
+        // published band may be rewritten.
+        mirror_band(&mut screen, &pixels, 64, 32, 2, 1);
+        assert_eq!(screen.rgba[2 * FB_STRIDE], RED);
+        assert_eq!(screen.rgba[1 * FB_STRIDE], 0, "row 1 was not in the band");
+
+        // The dropped-frame path mirrors the whole frame instead: a band would
+        // be diffed against a screen the GUI never received.
+        mirror_band(&mut screen, &pixels, 64, 32, 0, 32);
+        assert_eq!(screen.rgba[1 * FB_STRIDE], RED, "a full mirror brings row 1 too");
+        assert_eq!(screen.rgba[3 * FB_STRIDE], 0, "rows the frame does not carry stay as they were");
+    }
+
+    #[test]
+    fn the_sink_drops_a_frame_rather_than_queueing_it() {
+        let sink = FrameSink::new();
+        assert!(sink.publish(Frame { seq: 1, ..Frame::default() }));
+        assert!(!sink.publish(Frame { seq: 2, ..Frame::default() }),
+                "the display wants the newest, so the older of two is dropped");
+        assert_eq!(sink.seq(), 1, "a dropped frame does not bump the sequence");
+        assert_eq!(sink.take().map(|f| f.seq), Some(1));
+        assert!(sink.take().is_none());
+    }
+
+    #[test]
+    fn reset_rewinds_the_sequence_and_forgets_the_frame() {
+        let sink = FrameSink::new();
+        assert!(sink.publish(Frame { seq: 7, ..Frame::default() }));
+        assert_eq!(sink.seq(), 7);
+
+        sink.reset();
+
+        assert_eq!(sink.seq(), 0, "the GUI's \"have I seen this yet?\" check must fail again");
+        assert!(sink.take().is_none(), "the old run's last screen must not survive a Start");
+    }
+
+    #[test]
+    fn a_recycled_buffer_is_reused_rather_than_reallocated() {
+        let sink = FrameSink::new();
+        let mut f = Frame::default();
+        f.rgba = vec![0u8; 4096];
+        sink.recycle(f);
+
+        // What the renderer calls to get a buffer to fill: it must be the one
+        // that came back, or every frame would cost a fresh allocation.
+        assert_eq!(sink.take_free().rgba.len(), 4096);
+    }
+}
+
 /// Pick CPU or GL capture renderer based on `IRIS_GUI_GL=1`.
 pub fn new_capture_renderer(sink: FrameSink) -> Box<dyn Renderer> {
     if std::env::var("IRIS_GUI_GL").map(|v| v == "1").unwrap_or(false) {
