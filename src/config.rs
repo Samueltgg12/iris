@@ -499,18 +499,25 @@ pub enum MachineProfile {
 }
 
 impl MachineProfile {
-    /// All selectable profiles, in display order. (Not the O2 yet: iris-gui's
-    /// machine editor has no `[o2]` section.) Single source of truth for the
+    /// All selectable profiles, in display order. Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
-    pub const ALL: [Self; 4] = [Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::OctaneIp30];
+    ///
+    /// The O2 has no embedded PROM: it needs an IP32 PROM image, the same way
+    /// the Octane does, and iris-gui says so in the New-machine dialog.
+    pub const ALL: [Self; 5] = [
+        Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::O2Ip32, Self::OctaneIp30,
+    ];
 
     /// The bank sizes in MB (0 is an empty bank) that `validate()` accepts
     /// for this profile. The Octane's banks are matched DIMM pairs of 64 MB
-    /// to 2 GB; the IP22/IP24 MC stops at 128 MB.
+    /// to 2 GB; the IP22/IP24 MC stops at 128 MB. An O2's banks are DIMM-pair
+    /// kits, so they are the four kit sizes and nothing the MC could express
+    /// (see `dev::crime_mem::check_kits`).
     pub fn bank_sizes(self) -> &'static [u32] {
         match self {
             Self::OctaneIp30 => &[0, 64, 128, 256, 512, 1024, 2048],
-            Self::Indigo2Ip28 | Self::O2Ip32 => MC_BANK_SIZES,
+            Self::O2Ip32 => &[0, 32, 64, 128, 256],
+            Self::Indigo2Ip28 => MC_BANK_SIZES,
             _ => &[0, 8, 16, 32, 64, 128],
         }
     }
@@ -556,6 +563,21 @@ impl MachineProfile {
 
     pub fn guinness(self) -> bool {
         matches!(self, Self::IndyIp24)
+    }
+
+    /// The CPU models this machine can be built with. The O2 has an R5000 or
+    /// an R10000 (an R4400 is refused when the machine is built, not by
+    /// `validate()`); the Octane shipped only with the 195 MHz R10000; the
+    /// Indy and the Indigo2 take any of the three.
+    ///
+    /// Single source of truth for the front-ends' Processor pickers, so they
+    /// cannot offer a CPU the machine will refuse.
+    pub fn cpus(self) -> &'static [CpuModel] {
+        match self {
+            Self::OctaneIp30 => &[CpuModel::R10000],
+            Self::O2Ip32 => &[CpuModel::R5000, CpuModel::R10000],
+            _ => &CpuModel::ALL,
+        }
     }
 
     /// The R10000 Indigo2. Selects the IP28 decodes inside the shared

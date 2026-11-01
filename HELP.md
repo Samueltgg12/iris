@@ -521,8 +521,12 @@ max_fps = 30                 # most updates a second per viewer
 It works on every machine and graphics board (Newport, XZ/Extreme, IMPACT,
 the O2), with the normal window open or under `--ci` with no window. Not with
 `--headless`, which has no screen to serve. The window, the monitor and any
-number of viewers can type and click at the same time. iris-gui has no VNC
-server.
+number of viewers can type and click at the same time.
+
+**iris-gui** serves the screen too: set **Serve on** in the Performance tab
+(a port for `127.0.0.1`, or `host:port`), which is the same `vnc.listen` key
+the machine's TOML carries. The server starts with the machine and stops with
+it, and a port already in use is reported rather than failing the start.
 
 What you see is the guest's screen, without the window's status bar. Only
 the parts of the screen that change are sent, so an idle desktop costs next

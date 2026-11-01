@@ -272,6 +272,7 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [cycles-ptr-must-be-cleared-before-dropping-the-machine.md](gui/cycles-ptr-must-be-cleared-before-dropping-the-machine.md) | rule | iris-gui: clear the cached `CyclesPtr` before dropping the Machine |
 | [egui-default-font-glyph-coverage-avoid-tofu.md](gui/egui-default-font-glyph-coverage-avoid-tofu.md) | rule | egui default fonts: which glyphs render, which are tofu |
 | [gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md](gui/gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md) | design | A new graphics board needs no `iris-gui` capture wiring |
+| [gui-frame-sink-carries-only-the-damaged-band.md](gui/gui-frame-sink-carries-only-the-damaged-band.md) | rule | iris-gui's frame sink carries only the damaged band — screenshots and VNC read `screen.rgba`, never the sink |
 | [gl-teardown-must-run-on-the-refresh-thread.md](gui/gl-teardown-must-run-on-the-refresh-thread.md) | rule | GL teardown must run on the REX3-Refresh thread |
 | [gui_mouse_integration.md](gui/gui_mouse_integration.md) | design | GUI mouse integration — current approach, and the classic-Mac absolute-mouse pattern |
 | [i18n-catalog-gotchas.md](gui/i18n-catalog-gotchas.md) | rule | GUI text catalogs (i18n) gotchas |
@@ -288,7 +289,7 @@ The VNC server, the host input layer (`screen`/`ptr`/`key`) and pointer steering
 | Note | Kind | Title |
 |---|---|---|
 | [pointer-steering-and-hotspots.md](vnc/pointer-steering-and-hotspots.md) | design | Steering the relative mouse by the hardware cursor: X's acceleration curve, hotspots from corner pinning, busy guests |
-| [frame-capture-and-damage.md](vnc/frame-capture-and-damage.md) | design | What VNC reads (rgba + frame_seq), Newport capture and forced SW compositor, tile damage |
+| [frame-capture-and-damage.md](vnc/frame-capture-and-damage.md) | design | What VNC reads (rgba + frame_seq), which boards keep rgba current themselves, Newport capture and forced SW compositor, tile damage |
 
 ## macos/
 
@@ -324,7 +325,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 |---|---|---|
 | [bench-first-numbers.md](perf/bench-first-numbers.md) | history | First benchmark matrix — 2026-08-21 |
 | [gfifo-backend-experiment.md](perf/gfifo-backend-experiment.md) | history | GFIFO backend: swappable ring for benchmarking — 2026-09-14 |
-| [gui-idle-refresh.md](perf/gui-idle-refresh.md) | rule | Status-bar-only heartbeat refresh skips full 16 MB FB copy and (in iris-gui) |
+| [gui-idle-refresh.md](perf/gui-idle-refresh.md) | rule | Status-bar-only heartbeat refresh skips the compose and (in iris-gui) publishes nothing; iris-gui uploads only the damaged scanlines |
 | [hal2-pump-thread.md](perf/hal2-pump-thread.md) | rule | HAL2 dedicated pump thread — reverted, do not reintroduce as-is |
 | [hardware-profiles.md](perf/hardware-profiles.md) | design | Hardware profiles vs MAME (Phase 3) |
 | [hot-path-inlining-must-be-explicit.md](perf/hot-path-inlining-must-be-explicit.md) | rule | Hot-path inlining must be stated, not left to the inliner |
