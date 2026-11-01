@@ -335,6 +335,10 @@ fn worker_loop(
     abandoned_machine: Arc<AtomicBool>,
 ) {
     let mut machine: Option<Box<dyn Workstation>> = None;
+    // The built-in VNC server, when `[vnc] listen` is set. Lives exactly as
+    // long as the machine it serves: dropped on Stop, disk sync and Quit, so a
+    // restarted machine never leaves the old port bound.
+    let mut vnc_server: Option<iris::vnc::VncServer> = None;
     // Live MIPS estimate: read REX3's free-running cycle counter and divide
     // the delta by wall-clock between ticks. Mirrors the status-bar math in
     // src/disp.rs, but driven here since the GUI never runs REX3's own
@@ -418,6 +422,9 @@ fn worker_loop(
                 let sink_for_machine = frame_sink.clone();
                 let sink_for_head1 = frame_sink_head1.clone();
                 let heads = cfg_owned.graphics.heads;
+                // Read before the closure moves the config into it.
+                let vnc_listen = cfg_owned.vnc.listen.clone();
+                let vnc_max_fps = cfg_owned.vnc.max_fps;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // A machine that cannot be built panics here, so the
                     // catch_unwind below reports why.
@@ -454,6 +461,25 @@ fn worker_loop(
                         prev_fasttick = ft.load(std::sync::atomic::Ordering::Relaxed);
                         fasttick = Some(ft);
                         prev_tick = std::time::Instant::now();
+                        // The built-in VNC server, if `[vnc] listen` is set.
+                        // The GUI builds its own machine, so without this the
+                        // Performance tab's VNC settings would be config the
+                        // GUI silently ignores. A bind failure is a toast, not
+                        // an exit: the machine itself is fine without it.
+                        if let Some(listen) = vnc_listen {
+                            match iris::vnc::VncServer::start(
+                                iris::hostinput::HostInput::attach(&*m),
+                                &listen,
+                                vnc_max_fps,
+                                "IRIS",
+                            ) {
+                                Ok(s) => vnc_server = Some(s),
+                                Err(e) => {
+                                    let _ = evt_tx.send(Evt::Error(
+                                        t!("emu-vnc-failed", listen = &listen, error = e)));
+                                }
+                            }
+                        }
                         machine = Some(m);
                         let _ = evt_tx.send(Evt::Started);
                     }
@@ -489,6 +515,9 @@ fn worker_loop(
                     *ps2_slot.lock() = None;
                     cycles = None;
                     fasttick = None;
+                    // Drop the VNC server with the machine it serves: it holds
+                    // the display and the port, and a restart rebinds both.
+                    drop(vnc_server.take());
                     // Always report the machine as stopped so the user regains
                     // control, even if the stop failed or had to be abandoned.
                     if let Err(msg) = stop_machine_timed(m) {
@@ -510,6 +539,8 @@ fn worker_loop(
                     *ps2_slot.lock() = None;
                     cycles = None;
                     fasttick = None;
+                    // Its grab loop reads the display, so it goes first.
+                    drop(vnc_server.take());
                     m.stop();
                     synced = match m.sync_chd_disks(
                         None,
@@ -640,15 +671,38 @@ fn worker_loop(
                 }
             }
             Ok(Cmd::Screenshot(path)) => {
-                // Pull the most recently rendered frame from the sink and
-                // encode as PNG. We do this in the worker (rather than the
-                // GUI thread) because PNG encoding is non-trivial CPU.
-                let frame = frame_sink.snapshot();
-                if frame.width == 0 || frame.height == 0 {
+                // Pull a whole composed frame from the board and encode it as
+                // PNG. We do this in the worker (rather than the GUI thread)
+                // because PNG encoding is non-trivial CPU.
+                //
+                // Not `frame_sink.snapshot()`: the sink carries only the
+                // damaged band of the newest frame (see `framebuffer`), so it
+                // cannot serve a whole picture. `screen.rgba` can, and the
+                // board keeps it current the moment something asks — a
+                // `request_frame` makes REX3's refresh loop compose and copy,
+                // which costs nothing until a screenshot is taken.
+                let Some(m) = machine.as_ref() else {
+                    let _ = evt_tx.send(Evt::Error(t!("emu-not-running")));
+                    continue;
+                };
+                let Some(display) = m.get_display() else {
                     let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-no-frame")));
                     continue;
+                };
+                let mut px: Vec<u32> = Vec::new();
+                let Some((w, h, _)) = iris::gfx_display::fresh_frame(
+                    &*display, &mut px, std::time::Duration::from_secs(2),
+                ) else {
+                    let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-no-frame")));
+                    continue;
+                };
+                // Tight RGBA bytes from the tightly-packed words `copy_frame`
+                // hands over (`w` a row, 0xAABBGGRR, R in the low byte).
+                let mut rgba = Vec::with_capacity(w * h * 4);
+                for &word in &px[..w * h] {
+                    rgba.extend_from_slice(&(word | 0xFF00_0000).to_le_bytes());
                 }
-                match write_png(&path, frame.width as u32, frame.height as u32, &frame.rgba) {
+                match write_png(&path, w as u32, h as u32, &rgba) {
                     Ok(()) => { let _ = evt_tx.send(Evt::Screenshot(path)); }
                     Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-failed", error = e))); }
                 }
@@ -704,6 +758,9 @@ fn worker_loop(
             }
             Ok(Cmd::Quit) | Err(_) => {
                 *ps2_slot.lock() = None;
+                // Drop the VNC server first: its grab loop reads the display,
+                // and it must not outlive the machine it serves.
+                drop(vnc_server.take());
                 if let Some(m) = machine.take() {
                     // Bounded so a wedged guest can't hang app exit (Drop joins
                     // this thread). If the stop is abandoned, the process is

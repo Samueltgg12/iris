@@ -370,8 +370,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   rendering engine, MACE (PCI with two Adaptec 7880 SCSI controllers,
   Ethernet on the NAT gateway, serial ports, PS/2, audio, clocks), GBE
   display. Runs IRIX 6.5.22 to the desktop with OpenGL through the rendering
-  engine, and NetBSD 11 to multi-user and X. Needs the O2 PROM image; not in
-  iris-gui yet.
+  engine, and NetBSD 11 to multi-user and X. Needs the O2 PROM image; iris-gui
+  can run it.
 - **A headless O2 is still an O2.** CRIME reads as revision 0xa1 and MACE
   as revision 2 whether or not a keyboard is plugged in; `headless` now only
   leaves the PS/2 ports empty, so the PROM and IRIX take the serial console.
@@ -471,6 +471,47 @@ hashes are given where a change is easiest to understand by reading the commit.
   opened, and `/dev/mem` and `/dev/kmem` returned 0xffffffff for about one
   page in six. IRIX on an R5000 O2 panicked with "init died" for the same
   reason; it now boots to the desktop.
+
+### iris-gui on small hosts, and the O2
+
+- **A new Performance tab** collects the knobs that decide how much of the host
+  the emulator costs: thread affinity and per-thread core pinning (moved from
+  Debug), processor count, and the jitv2 compile pool and persistent code cache
+  (moved from General). It says when a setting is the wrong trade for a
+  two-core machine — pinning three threads onto two cores costs more than it
+  saves — rather than leaving that to be discovered.
+  ([iris-gui-README.md](iris-gui-README.md#performance))
+- **The frame path no longer copies a frame per frame.** The renderer publishes
+  only the band of scanlines that changed since the frame on screen, the GUI
+  takes that buffer (a move, not a copy), uploads just the band, and hands the
+  buffer straight back. Publishing wakes the GUI, so it sleeps until a frame
+  exists and keeps only an idle repaint floor (250 ms) in between. A settled
+  desktop costs no texture upload at all; a blinking cursor costs one row.
+  (`iris-gui/src/framebuffer.rs`, `iris-gui/src/main.rs`)
+- **Screenshots come from the board again, not from the frame sink.** The sink
+  carries only a damaged band, so it cannot serve a whole picture: a PNG would
+  have had stale rows. `Cmd::Screenshot` asks the board for a composed frame
+  (`gfx_display::fresh_frame`) exactly as the CLI and `iris-ci` do, which costs
+  nothing until a screenshot is taken. (`iris-gui/src/handle.rs`)
+- **iris-gui starts its own VNC server.** `[vnc] listen` was config the GUI
+  ignored, because the server was started only by the CLI's path. Setting
+  **Serve on** in the Performance tab now serves the guest's screen, keyboard
+  and mouse for as long as the machine runs; a port already in use is reported
+  as a notification rather than failing the start.
+  ([iris-gui-README.md](iris-gui-README.md#vnc))
+- **The O2 is in iris-gui.** The New machine dialog and the General tab offer
+  `o2_ip32` with its R5000/R10000, its DIMM-pair kits (32, 64, 128 or 256 MB,
+  filled from pair A) and its CP0 Count clock. It has no embedded PROM, so both
+  say an IP32 image is needed rather than letting Start fail. Switching a saved
+  machine to the O2 re-fits RAM that is not a valid kit layout and drops an
+  R4400 the machine would refuse.
+- **Processor pickers offer only CPUs the machine takes.** An O2 refuses an
+  R4400 when it is built and the Octane is R10000 only, so `MachineProfile`
+  now names the CPUs each profile accepts and the pickers filter by it.
+  (`src/config.rs`)
+- **An O2's bank sizes are its kits.** `MachineProfile::O2Ip32.bank_sizes()`
+  returned the generic MC list, so the GUI offered 8, 16 and 512 MB banks that
+  `validate()` then refused. (`src/config.rs`)
 
 ### Physical address decoding
 
