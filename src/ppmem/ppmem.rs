@@ -66,6 +66,9 @@ pub fn bitmap_maps(bitmap: u64, phys: u64) -> bool {
     bitmap_maps_at(bitmap, BITMAP_SHIFT, phys)
 }
 
+/// Size of a fine region: [`PpMemSpace::fine_table`] has a bit for each.
+pub const FINE_SHIFT: u32 = 26;
+
 /// [`bitmap_maps`] for a window of any size: `shift` is its [`window_shift`].
 #[inline(always)]
 pub fn bitmap_maps_at(bitmap: u64, shift: u32, phys: u64) -> bool {
@@ -637,16 +640,38 @@ impl BusDevice for Arc<PpMemory> {
 // The window
 // ---------------------------------------------------------------------------
 
+/// Store a word a CPU reads while it runs: its inline region bitmap and, on a
+/// cached view, the key. The reader is that CPU's own thread, which takes no
+/// lock; the writer can be another node's processor re-laying this window. An
+/// atomic store at `Relaxed` is the same instruction as a plain one on the
+/// hosts this runs on, and keeps the race defined.
+///
+/// `p` must be a live, 8-byte-aligned `u64` that is only otherwise accessed
+/// atomically (every consumer declares its word `AtomicU64`).
+#[inline]
+fn publish_word(p: *mut u64, v: u64) {
+    // SAFETY: the callers' sinks are `AtomicU64::as_ptr` of a live field, or
+    // the space's own boxed word.
+    unsafe { AtomicU64::from_ptr(p) }.store(v, Ordering::Relaxed);
+}
+
+/// [`publish_word`]'s load.
+#[inline]
+pub(crate) fn read_word(p: *const u64) -> u64 {
+    // SAFETY: as in `publish_word`.
+    unsafe { AtomicU64::from_ptr(p as *mut u64) }.load(Ordering::Relaxed)
+}
+
 /// One live mapping inside the window, tracked so `clear_mappings` can undo it
 /// and `mapped_bitmap` can be recomputed. It also says where its bytes come
 /// from, so a cached view can lay part of it again when a held page leaves:
-/// `bank`'s object from `src`, or repeating every `period` bytes from `src`
+/// an object from `src`, or repeating every `period` bytes from `src`
 /// into the period (0: no repeat).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 struct Mapping {
     at: u64,
     len: u64,
-    bank: usize,
+    obj: Arc<SharedMem>,
     src: u64,
     period: u64,
 }
@@ -679,16 +704,27 @@ pub struct PpMemSpace {
     /// Default publication target — see [`OwnBitmap`]. Read through
     /// `mapped_bitmap()`; written only via `state.sink`.
     own_bitmap: OwnBitmap,
-    /// No lock: every path that touches this — `map_bank`, `map_alias`,
-    /// `clear_mappings`, `set_bitmap_sink2` — runs on the CPU thread, reached
-    /// as CPU store → MC register write → `remap_banks`. No device thread ever
-    /// enters this type. (`unsafe impl Sync` below records that contract.)
+    /// Read and written only with `guard` held, except `window` and `shift`,
+    /// which never change, and the setup calls that run before any CPU does.
+    /// (`unsafe impl Sync` below records that contract.)
     state: UnsafeCell<SpaceState>,
+    /// Serializes the paths that change `state`: a remap (`map_bank`,
+    /// `map_alias`, `map_range`, `unmap_range`, `clear_mappings`) and a CPU's
+    /// held-line changes (`add_cached_view`, `hold_line_page`,
+    /// `release_line_page`). On the SN0 boards one CPU's store to a Hub's
+    /// number re-lays another node's window while that node's CPU issues
+    /// CACHE instructions, so two threads reach one space. Taken by none of
+    /// the paths a load, store or fetch takes: those read the window through
+    /// the CPU's own base pointer and inline bitmap.
+    guard: parking_lot::Mutex<()>,
 }
 
 struct SpaceState {
     /// The window's size in bytes. Never changes.
     window: u64,
+    /// The region bitmap's region size: the window's [`window_shift`] unless
+    /// the space was made with another. Never changes.
+    shift: u32,
     mappings: Vec<Mapping>,
     /// Where the bitmap is published. Points at `own_bitmap` until a consumer
     /// hands over its own inline field, so it is never null and publication is
@@ -701,6 +737,12 @@ struct SpaceState {
     sink2: *mut u64,
     /// The bitmap last published to the sinks above.
     bits: u64,
+    /// One bit per [`FINE_SHIFT`] region of the whole window, set when the
+    /// region is wholly mapped: [`PpMemSpace::fine_table`].
+    fine: Box<[AtomicU64]>,
+    /// Bumped whenever the fine table changes, so that a view can tell it
+    /// moved: [`PpMemSpace::add_key_sink`].
+    fine_epoch: u64,
     /// Each CPU's cached view of memory: see [`PpMemSpace::add_cached_view`].
     views: Vec<View>,
     /// Ranges where a held page may stand with no memory mapped behind it:
@@ -719,6 +761,12 @@ struct View {
     /// holds. Only its CPU changes them, at CACHE instructions, under the
     /// contract below.
     held: std::collections::BTreeMap<u64, u32>,
+    /// Where this view's key is published: [`PpMemSpace::add_key_sink`].
+    key_sinks: Vec<*mut u64>,
+    /// Moves whenever the bitmap this view publishes or the fine table does.
+    key: u64,
+    /// The bitmap and fine epoch `key` was last moved for.
+    seen: (u64, u64),
 }
 
 /// The bitmap `PpMemSpace` publishes into before a CPU claims it.
@@ -729,27 +777,52 @@ struct OwnBitmap(Box<u64>);
 
 // Safety: `PpMemSpace` lives inside `Physical`, which is shared across threads
 // via `Arc`, so it must be `Sync` to compile. The `UnsafeCell<SpaceState>` it
-// contains is **not** synchronised, so this is a real contract rather than a
-// formality:
+// contains is synchronised by `guard` on the paths that change it while a CPU
+// runs, and by order of use on the rest. That is a real contract rather than
+// a formality:
 //
-//   * Every mutating entry point — `map_bank`, `map_alias`, `clear_mappings`,
-//     `set_bitmap_sink2` — is reached only from `Physical::remap_banks`, which
-//     the MC invokes synchronously inside the CPU's store to MEMCFG. That is
-//     always a CPU thread, and with several CPUs the others are parked for it
-//     (`smp::World::stop_others`, wired where HEART's descriptors reach memory
-//     and where Bedrock's MD takes a bank configuration write).
+//   * Taking `guard` for the whole call: the remaps (`map_bank`, `map_alias`,
+//     `map_range`, `map_range_of`, `unmap_range`, through `remapping`, and
+//     `clear_mappings` directly), `set_bitmap_sink2`, `add_key_sink`, `add_cached_view`,
+//     `hold_line_page`, `release_line_page` and `held_line_pages`. Two threads
+//     can reach one space: the SN0 boards re-lay every node's window from the
+//     thread that stored a Hub's node number (`ip27::Windows`), while the
+//     node's own CPU holds and releases lines at CACHE instructions. No
+//     locking call nests inside another. They never read another view, which
+//     its CPU changes meanwhile: each view puts its own mark on a page's
+//     atomic counter (`mark`).
+//   * Not taking it, and why that is sound: `window_size` and `region_shift`
+//     read fields that never change; `bitmap_ptr` and `mapped_bitmap` read
+//     the sink pointer, which is fixed once the CPU is wired, and the word
+//     through an atomic load; `view_base` reads a view's base, which never
+//     moves after `add_cached_view`; `fine_table` hands out words that only
+//     ever change in place. The setters take the guard too, and run before
+//     the CPUs do, bar a stopped world.
+//   * The guard is never on a hit path. A load, store or fetch goes through
+//     the CPU's inline `MipsCore::ppmem_bitmap` word (an `AtomicU64`, read
+//     `Relaxed`), its decode-cache key (the same) and its view's base pointer, neither of which goes through
+//     here. The words a remap publishes to a running CPU (bitmap and key) are
+//     atomics, stored `Relaxed` by `publish_word`: the CPU needs no ordering between the
+//     bitmap and the window it covers, because the window is never unmapped.
 //   * Device threads (MC-DMA, seeq, VINO) reach RAM through `BusDevice` on the
-//     individual `PpMemory` banks. They never touch `PpMemSpace`.
-//   * `hold_line_page`/`release_line_page` run on a CPU thread at a CACHE
-//     instruction and change only that CPU's own view. They read the mapping
-//     list and the bitmap, which only a remap changes, with the others parked.
-//     They never read another view, which its CPU changes meanwhile: each
-//     view puts its own mark on the page's atomic counter (`mark`).
-//   * `mapped_bitmap()` reads the sink and is likewise CPU-thread-only; the
-//     hot-path reader is the CPU's own inline `MipsCore::ppmem_bitmap` field,
-//     which is a plain `u64` and never goes through here.
+//     individual `PpMemory` banks. They read the bitmap through
+//     `Physical::bitmap`, an atomic load.
+//   * The mappings are replaced in one host call each, and a range that goes
+//     is scrubbed to zero pages, never unmapped, so a CPU holding a pointer
+//     into the window always lands on mapped memory. A page a CPU holds is
+//     never remapped or scrubbed (`free_runs`), so a store to it cannot be
+//     lost to a re-lay.
 //
-// If a device thread ever needs to remap, this must become a real lock.
+// Limit: an access that races the instant a range changes meaning can see the
+// old memory, the new, or zeros, and a store that reads the bitmap just before
+// a bit drops can land in a page about to be scrubbed and be lost. That is the
+// hardware's own contract for an access to an address while its node number
+// is being rewritten: the routing registers are not ordered against another
+// processor's accesses, and software renumbers a node before it uses the new
+// number (the PROM does, then the kernel). Neither sequence is known to touch
+// the old range during the change, and a booted two-node Onyx2 runs correctly
+// on both processors. A guest that did would lose a store on the hardware too.
+//
 unsafe impl Send for PpMemSpace {}
 unsafe impl Sync for PpMemSpace {}
 
@@ -764,6 +837,13 @@ impl PpMemSpace {
 
     /// [`Self::over`] with a window of `window` bytes.
     pub fn over_window(banks: &[PpMemory], window: u64) -> io::Result<Self> {
+        Self::over_window_regions(banks, window, window_shift(window))
+    }
+
+    /// [`Self::over_window`] whose region bitmap counts regions of
+    /// `1 << shift` bytes, covering the window's first 64 of them. The rest of
+    /// the window is reached through [`Self::fine_table`].
+    pub fn over_window_regions(banks: &[PpMemory], window: u64, shift: u32) -> io::Result<Self> {
         let space = AddrSpace::reserve(window as usize)?;
         let own_bitmap = OwnBitmap(Box::new(0u64));
         let sink = &*own_bitmap.0 as *const u64 as *mut u64;
@@ -776,12 +856,16 @@ impl PpMemSpace {
             #[cfg(feature = "jitv2")]
             gen_banks: banks.iter().map(|b| b.gen_shared().clone()).collect(),
             own_bitmap,
+            guard: parking_lot::Mutex::new(()),
             state: UnsafeCell::new(SpaceState {
                 window,
+                shift,
                 mappings: Vec::new(),
                 sink,
                 sink2,
                 bits: 0,
+                fine: (0..(window >> FINE_SHIFT).div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+                fine_epoch: 0,
                 views: Vec::new(),
                 unbacked: Vec::new(),
             }),
@@ -791,6 +875,39 @@ impl PpMemSpace {
     /// The window's size in bytes.
     pub fn window_size(&self) -> u64 {
         unsafe { (*self.state.get()).window }
+    }
+
+    /// The region bitmap's region size, as a shift.
+    pub fn region_shift(&self) -> u32 {
+        unsafe { (*self.state.get()).shift }
+    }
+
+    /// The fine table and how many regions it has: bit `r % 64` of word
+    /// `r / 64` is set when region `r`, the [`FINE_SHIFT`] bytes from
+    /// `r << FINE_SHIFT`, is wholly mapped. It spans the whole window, where
+    /// the region bitmap spans 64 regions, so a consumer that misses the
+    /// bitmap tests it before taking the bus. Its words never move.
+    pub fn fine_table(&self) -> (*const AtomicU64, u64) {
+        let st = unsafe { &*self.state.get() };
+        (st.fine.as_ptr(), st.window >> FINE_SHIFT)
+    }
+
+    /// Publish a key to `ptr` for view `v` that changes whenever the region
+    /// bitmap the view publishes or the fine table does, starting with the
+    /// current one: a consumer that keeps window pointers keys them on it, and
+    /// drops them when it moves. Null is skipped.
+    ///
+    /// # Safety
+    /// `ptr` must stay valid for the space's life, and must be an
+    /// `AtomicU64` the view's CPU thread reads atomically (`Relaxed`).
+    pub unsafe fn add_key_sink(&self, v: usize, ptr: *mut u64) {
+        if ptr.is_null() {
+            return;
+        }
+        let _held = self.guard.lock();
+        let st = unsafe { &mut *self.state.get() };
+        publish_word(ptr, st.views[v].key);
+        st.views[v].key_sinks.push(ptr);
     }
 
     /// Test/bench helper: allocate fresh banks of the given sizes in MB and
@@ -809,8 +926,7 @@ impl PpMemSpace {
     /// Never null: this space's own `u64`. A CPU reads its cached view's
     /// copy instead (`add_cached_view`).
     pub fn bitmap_ptr(&self) -> *const u64 {
-        let st = unsafe { &*self.state.get() };
-        st.sink as *const u64
+        unsafe { (*self.state.get()).sink as *const u64 }
     }
 
     pub fn bank_count(&self) -> usize {
@@ -822,8 +938,45 @@ impl PpMemSpace {
     /// The O2 maps its memory this way: one 32 MB slot of the window at a
     /// time from wherever the slot's bank lies in one packed object.
     pub fn map_range(&self, bank: usize, src: u64, offset: u64, size: u64) -> io::Result<()> {
-        let b = &self.banks[bank];
-        assert!(src + size <= b.len() as u64, "ppmem: range [{src:#x}, +{size:#x}) escapes bank {bank}");
+        #[cfg(feature = "jitv2")]
+        let gen = &self.gen_banks[bank];
+        #[cfg(not(feature = "jitv2"))]
+        let gen = ();
+        self.map_object(&self.banks[bank], gen, src, offset, size)
+    }
+
+    /// [`Self::map_range`] for any bank, this window's or another's: the
+    /// window then shows memory another bus owns, sharing its storage and
+    /// its generation counters. Over a range already mapped, the new mapping
+    /// replaces the old in one host mapping call, without unmapping first.
+    pub fn map_range_of(&self, bank: &PpMemory, src: u64, offset: u64, size: u64) -> io::Result<()> {
+        #[cfg(feature = "jitv2")]
+        let gen = bank.gen_shared();
+        #[cfg(not(feature = "jitv2"))]
+        let gen = ();
+        self.map_object(bank.shared(), gen, src, offset, size)
+    }
+
+    /// Whether [`Self::map_range_of`] can place `size` bytes from `src` at
+    /// `offset`: inside the window, at the host's mapping granule, and under
+    /// jitv2 with whole granules of generation counters too.
+    pub fn can_map(&self, src: u64, offset: u64, size: u64) -> bool {
+        let gran = granularity() as u64;
+        #[cfg(feature = "jitv2")]
+        let gran = gran * GEN_RATIO;
+        size > 0 && offset + size <= self.window_size() && (src | offset | size) % gran == 0
+    }
+
+    fn map_object(
+        &self,
+        b: &Arc<SharedMem>,
+        #[cfg(feature = "jitv2")] gen: &SharedMem,
+        #[cfg(not(feature = "jitv2"))] _gen: (),
+        src: u64,
+        offset: u64,
+        size: u64,
+    ) -> io::Result<()> {
+        assert!(src + size <= b.len() as u64, "ppmem: range [{src:#x}, +{size:#x}) escapes its bank");
         assert!(offset + size <= self.window_size(), "ppmem: [{offset:#x}, +{size:#x}) escapes the window");
         self.remapping(|| {
             unsafe {
@@ -836,16 +989,65 @@ impl PpMemSpace {
                 let gran = super::map::granularity() as u64;
                 if gen_len >= gran && gen_off % gran == 0 && gen_len % gran == 0 && gen_src % gran == 0 {
                     unsafe {
-                        self.gen_space.map(gen_off as usize, gen_len as usize, &self.gen_banks[bank], gen_src, Prot::ReadWrite)?;
+                        self.gen_space.map(gen_off as usize, gen_len as usize, gen, gen_src, Prot::ReadWrite)?;
                     }
                 } else {
                     debug_assert!(false, "ppmem: range gen [{gen_off:#x}, +{gen_len:#x}) not mappable at granularity {gran:#x}");
                 }
             }
             let st = unsafe { &mut *self.state.get() };
-            Self::record(st, Mapping { at: offset, len: size, bank, src, period: 0 });
+            Self::record(st, Mapping { at: offset, len: size, obj: b.clone(), src, period: 0 });
             Ok(())
         })
+    }
+
+    /// Take `[offset, offset + size)` out of the window: the bitmap stops
+    /// naming its regions before the pages go, so a CPU that tests it from
+    /// then on takes the bus path. Mappings that only overlap the range keep
+    /// the rest.
+    pub fn unmap_range(&self, offset: u64, size: u64) {
+        let _ = self.remapping(|| {
+            let st = unsafe { &mut *self.state.get() };
+            Self::cut(st, offset, size);
+            Self::recompute_bitmap(st);
+            let _ = unsafe { self.space.scrub(offset as usize, size as usize) };
+            // Views keep the pages they hold, as `clear_mappings` leaves them.
+            for view in &st.views {
+                for (at, len) in Self::free_runs(view, offset, size) {
+                    let _ = unsafe { view.space.scrub(at as usize, len as usize) };
+                }
+            }
+            #[cfg(feature = "jitv2")]
+            {
+                let (gen_off, gen_len) = (offset / GEN_RATIO, size / GEN_RATIO);
+                let gran = super::map::granularity() as u64;
+                if gen_len >= gran && gen_off % gran == 0 && gen_len % gran == 0 {
+                    let _ = unsafe { self.gen_space.scrub(gen_off as usize, gen_len as usize) };
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// Remove `[at, at + len)` from the mapping list, trimming or splitting
+    /// any mapping that crosses its ends, so the list stays disjoint.
+    fn cut(state: &mut SpaceState, at: u64, len: u64) {
+        let end = at + len;
+        let mut kept = Vec::with_capacity(state.mappings.len() + 1);
+        for m in state.mappings.drain(..) {
+            let m_end = m.at + m.len;
+            if m_end <= at || m.at >= end {
+                kept.push(m);
+                continue;
+            }
+            if m.at < at {
+                kept.push(Mapping { len: at - m.at, ..m.clone() });
+            }
+            if m_end > end {
+                kept.push(Mapping { at: end, len: m_end - end, src: m.src + (end - m.at), ..m });
+            }
+        }
+        state.mappings = kept;
     }
 
     /// Recompute the bitmap from the live mapping list.
@@ -854,7 +1056,7 @@ impl PpMemSpace {
     /// is partially mapped — or mapped alongside MMIO — reads as unmapped and
     /// keeps taking the bus path.
     fn recompute_bitmap(state: &mut SpaceState) {
-        let region = 1u64 << window_shift(state.window);
+        let region = 1u64 << state.shift;
         let mut bits = 0u64;
         for bit in 0..64u32 {
             let start = (bit as u64) * region;
@@ -881,11 +1083,10 @@ impl PpMemSpace {
         // Publish to every sink unconditionally — each is always a live `u64`,
         // either a consumer's inline field or the one this space owns. Only
         // ever reached from the MEMCFG path on the CPU thread.
-        unsafe {
-            *state.sink = bits;
-            *state.sink2 = bits;
-        }
+        publish_word(state.sink, bits);
+        publish_word(state.sink2, bits);
         state.bits = bits;
+        Self::recompute_fine(state);
         for v in 0..state.views.len() {
             Self::publish_view(state, v);
         }
@@ -893,21 +1094,54 @@ impl PpMemSpace {
 
     /// Publish view `v`'s bitmap: the shared one, plus every region the view
     /// holds a page in, which `hold_line_page` made safe to touch whole.
-    fn publish_view(state: &SpaceState, v: usize) {
-        let shift = window_shift(state.window);
-        let view = &state.views[v];
-        let bits = view.held.keys().fold(state.bits, |b, &page| b | 1u64 << (page >> shift));
+    fn publish_view(state: &mut SpaceState, v: usize) {
+        let shift = state.shift;
+        let (base, epoch) = (state.bits, state.fine_epoch);
+        let view = &mut state.views[v];
+        let bits = view.held.keys().fold(base, |b, &page| b | 1u64 << (page >> shift));
         for &s in &view.sinks {
-            unsafe { *s = bits };
+            publish_word(s, bits);
+        }
+        if view.seen != (bits, epoch) {
+            view.seen = (bits, epoch);
+            view.key += 1;
+            for &s in &view.key_sinks {
+                publish_word(s, view.key);
+            }
+        }
+    }
+
+    /// Recompute the fine table from the live mapping list, and move the fine
+    /// epoch if it changed.
+    fn recompute_fine(state: &mut SpaceState) {
+        let mut spans: Vec<(u64, u64)> = state.mappings.iter().map(|m| (m.at, m.at + m.len)).collect();
+        spans.sort_unstable();
+        let mut fine = vec![0u64; state.fine.len()];
+        let mut i = 0;
+        while i < spans.len() {
+            let (start, mut end) = spans[i];
+            i += 1;
+            while i < spans.len() && spans[i].0 <= end {
+                end = end.max(spans[i].1);
+                i += 1;
+            }
+            let first = start.div_ceil(1 << FINE_SHIFT);
+            for r in first..end >> FINE_SHIFT {
+                fine[(r / 64) as usize] |= 1 << (r % 64);
+            }
+        }
+        let mut changed = false;
+        for (word, new) in state.fine.iter().zip(fine) {
+            changed |= word.swap(new, Ordering::Release) != new;
+        }
+        if changed {
+            state.fine_epoch += 1;
         }
     }
 
     fn record(state: &mut SpaceState, m: Mapping) {
-        // Drop anything this mapping fully replaces, then record it.
-        let (at, len) = (m.at, m.len);
-        state
-            .mappings
-            .retain(|m| !(m.at >= at && m.at + m.len <= at + len));
+        // Drop or trim what this mapping replaces, then record it.
+        Self::cut(state, m.at, m.len);
         state.mappings.push(m);
         Self::recompute_bitmap(state);
     }
@@ -935,10 +1169,11 @@ impl PpMemSpace {
     /// (the CPU's inline copies; null entries are skipped) instead of this
     /// window's. Returns the view's number. Set up before the CPU runs.
     pub fn add_cached_view(&self, sinks: &[*mut u64]) -> io::Result<usize> {
+        let _held = self.guard.lock();
         let st = unsafe { &mut *self.state.get() };
         let space = AddrSpace::reserve(st.window as usize)?;
         let sinks = sinks.iter().copied().filter(|p| !p.is_null()).collect();
-        st.views.push(View { space, sinks, held: Default::default() });
+        st.views.push(View { space, sinks, held: Default::default(), key_sinks: Vec::new(), key: 0, seen: (0, 0) });
         let v = st.views.len() - 1;
         for m in st.mappings.clone() {
             self.lay(st, v, &m, m.at, m.at + m.len)?;
@@ -954,6 +1189,7 @@ impl PpMemSpace {
 
     /// The pages view `v` holds, in address order.
     pub fn held_line_pages(&self, v: usize) -> Vec<u64> {
+        let _held = self.guard.lock();
         unsafe { (&(*self.state.get()).views)[v].held.keys().copied().collect() }
     }
 
@@ -963,18 +1199,32 @@ impl PpMemSpace {
     /// it back. Returns whether the page is newly held, or `None` when no
     /// memory is mapped behind it.
     ///
+    /// It also returns `None` for a page past the region bitmap's 64
+    /// regions: the bitmap is all a CPU tests for a private page, and memory
+    /// beyond it is reached through the fine table with nothing held. On an
+    /// SN0 board with 128 MiB regions that is node numbers 2 and 3 of a
+    /// three- or four-node board; numbers 0 and 1 are unaffected. Lines
+    /// there are not modelled as the CPU's alone: a store reaches every
+    /// other CPU at once, as it does without views.
+    ///
     /// The region bitmap is all a CPU tests, so the page's whole region is
     /// the view's while it stands, reading zeros where nothing is mapped. The
     /// O2's POST holds lines for page 0 before CRIME maps the rest of its
     /// region.
     pub fn hold_line_page(&self, v: usize, pa: u64) -> Option<bool> {
+        let _held = self.guard.lock();
         let st = unsafe { &mut *self.state.get() };
         let gran = granularity() as u64;
         let page = pa & !(gran - 1);
         if !self.backs(page) && !st.unbacked.iter().any(|&(a, b)| page >= a && page + gran <= b) {
             return None;
         }
-        let shift = window_shift(st.window);
+        let shift = st.shift;
+        // The bitmap names the window's first 64 regions; a page past them is
+        // reached through the fine table, with nothing held.
+        if page >> shift >= 64 {
+            return None;
+        }
         if let Some(n) = st.views[v].held.get_mut(&page) {
             *n += 1;
             return Some(false);
@@ -1018,6 +1268,7 @@ impl PpMemSpace {
     /// again, and what the page held is dropped, as a line invalidated
     /// without writeback is.
     pub fn release_line_page(&self, v: usize, pa: u64) -> bool {
+        let _held = self.guard.lock();
         let st = unsafe { &mut *self.state.get() };
         let gran = granularity() as u64;
         let page = pa & !(gran - 1);
@@ -1059,6 +1310,7 @@ impl PpMemSpace {
     /// Run a mapping change with every held page's mark off, and put the
     /// marks back after, whether or not the change succeeded.
     fn remapping(&self, change: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let _held = self.guard.lock();
         self.marks(false);
         let result = change();
         self.marks(true);
@@ -1106,9 +1358,9 @@ impl PpMemSpace {
     fn map_views(&self, at: u64, len: u64, b: &SharedMem, src: u64) -> io::Result<()> {
         let st = unsafe { &*self.state.get() };
         for view in &st.views {
-            let saved = Self::save_held(view, at, len);
-            unsafe { view.space.map(at as usize, len as usize, b, src, Prot::ReadWrite)? };
-            Self::put_held(view, saved);
+            for (run, n) in Self::free_runs(view, at, len) {
+                unsafe { view.space.map(run as usize, n as usize, b, src + (run - at), Prot::ReadWrite)? };
+            }
         }
         Ok(())
     }
@@ -1116,7 +1368,7 @@ impl PpMemSpace {
     /// Lay `[from, to)` of mapping `m` in view `v`. Data only: the views
     /// share the window's generation counters.
     fn lay(&self, st: &SpaceState, v: usize, m: &Mapping, from: u64, to: u64) -> io::Result<()> {
-        let b = &self.banks[m.bank];
+        let b = &m.obj;
         let mut at = from;
         while at < to {
             let rel = at - m.at;
@@ -1132,45 +1384,52 @@ impl PpMemSpace {
         Ok(())
     }
 
-    /// The bytes of each page `view` holds inside `[at, at + len)`, before
-    /// a mapping change replaces them.
-    fn save_held(view: &View, at: u64, len: u64) -> Vec<(u64, Vec<u8>)> {
-        let gran = granularity();
-        let base = view.space.base();
-        view.held.keys()
-            .filter(|&&p| p < at + len && p + gran as u64 > at)
-            .map(|&p| {
-                let mut b = vec![0u8; gran];
-                unsafe { std::ptr::copy_nonoverlapping(base.add(p as usize), b.as_mut_ptr(), gran) };
-                (p, b)
-            })
-            .collect()
-    }
-
-    /// Put [`Self::save_held`]'s pages back, private again.
-    fn put_held(view: &View, saved: Vec<(u64, Vec<u8>)>) {
-        let base = view.space.base();
-        for (page, bytes) in saved {
-            let _ = unsafe { view.space.scrub(page as usize, bytes.len()) };
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(page as usize), bytes.len()) };
+    /// The parts of `[at, at + len)` in `view` that no held page lies in, as
+    /// `(start, length)` runs. A remap changes only these. A page a CPU holds
+    /// is that CPU's own bytes, which it stores to without a lock, so a remap
+    /// must not copy it out and back (a store in between would be lost) or
+    /// replace it: it is left as it is, and the shared window shows what the
+    /// remap laid there.
+    fn free_runs(view: &View, at: u64, len: u64) -> Vec<(u64, u64)> {
+        let gran = granularity() as u64;
+        let end = at + len;
+        let mut runs = Vec::new();
+        let mut from = at;
+        for (&p, _) in view.held.range(at.saturating_sub(gran - 1)..end) {
+            let (lo, hi) = (p.max(at), (p + gran).min(end));
+            if lo >= hi {
+                continue;
+            }
+            if from < lo {
+                runs.push((from, lo - from));
+            }
+            from = from.max(hi);
         }
+        if from < end {
+            runs.push((from, end - from));
+        }
+        runs
     }
 }
 
 impl MappedMemory for PpMemSpace {
     fn clear_mappings(&self) {
+        let _held = self.guard.lock();
         self.marks(false);
         let st = unsafe { &mut *self.state.get() };
         // Views keep the pages they hold. Scrubbed, not left mapped, so a
         // view never shows memory the shared window no longer maps.
         for view in &st.views {
-            let saved = Self::save_held(view, 0, st.window);
             for m in &st.mappings {
-                let _ = unsafe { view.space.scrub(m.at as usize, m.len as usize) };
+                for (at, len) in Self::free_runs(view, m.at, m.len) {
+                    let _ = unsafe { view.space.scrub(at as usize, len as usize) };
+                }
             }
-            Self::put_held(view, saved);
         }
-        for m in std::mem::take(&mut st.mappings) {
+        let mappings = std::mem::take(&mut st.mappings);
+        // The fine table goes before the pages do.
+        Self::recompute_fine(st);
+        for m in mappings {
             // Best-effort: a failure here leaves the range mapped, which is
             // still safe — it just isn't reverted.
             // `scrub`, not `unmap`: see `AddrSpace::scrub`.
@@ -1243,7 +1502,7 @@ impl MappedMemory for PpMemSpace {
             }
 
             let st = unsafe { &mut *self.state.get() };
-            Self::record(st, Mapping { at: offset, len: size, bank, src: 0, period });
+            Self::record(st, Mapping { at: offset, len: size, obj: self.banks[bank].clone(), src: 0, period });
             Ok(())
         })
     }
@@ -1316,7 +1575,7 @@ impl MappedMemory for PpMemSpace {
                 }
             }
             let st = unsafe { &mut *self.state.get() };
-            Self::record(st, Mapping { at: offset, len: size, bank, src: 0, period: 0 });
+            Self::record(st, Mapping { at: offset, len: size, obj: self.banks[bank].clone(), src: 0, period: 0 });
             Ok(())
         })
     }
@@ -1331,17 +1590,18 @@ impl MappedMemory for PpMemSpace {
     }
 
     unsafe fn set_bitmap_sink2(&self, ptr: *mut u64) {
+        let _held = self.guard.lock();
         let st = unsafe { &mut *self.state.get() };
-        let current = unsafe { *st.sink };
+        let current = read_word(st.sink);
         st.sink2 = ptr;
-        unsafe { *ptr = current };
+        publish_word(ptr, current);
     }
 
     fn mapped_bitmap(&self) -> u64 {
         // Read the live sink rather than a cached copy, so this agrees with
         // whatever the CPU is testing against.
-        let st = unsafe { &*self.state.get() };
-        unsafe { *st.sink }
+        let sink = unsafe { (*self.state.get()).sink };
+        read_word(sink)
     }
 }
 

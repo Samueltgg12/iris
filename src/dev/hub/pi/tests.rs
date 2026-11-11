@@ -8,66 +8,57 @@
 // processor-error status cases.
 
 use super::*;
-use std::sync::atomic::AtomicU8;
+use std::cell::RefCell;
 
 struct Fixture {
-    pi: Arc<HubPi>,
+    pi: Arc<Pi>,
     now: Arc<AtomicU64>,
     lines: Arc<Lines>,
-    hooks: Arc<Hooks>,
+    /// What the writes so far asked the Hub to do, as text.
+    effects: Mutex<Vec<String>>,
 }
+/// The processors' interrupt words, as a plain word each: line 0 to 2 are
+/// slice A's Cause bits 10 to 12 and 3 to 5 slice B's.
 #[derive(Default)]
-struct Lines([AtomicU8; 6]);
+struct Lines([AtomicU64; 2]);
 impl Lines {
     fn get(&self, line: usize) -> bool {
-        self.0[line].load(Ordering::SeqCst) == 1
-    }
-}
-impl InterruptController for Lines {
-    fn set_line(&self, line: u32, level: bool) {
-        self.0[line as usize].store(u8::from(level), Ordering::SeqCst);
-    }
-}
-#[derive(Default)]
-struct Hooks(Mutex<Vec<String>>);
-impl HubHooks for Hooks {
-    fn cpu_enable(&self, slice: usize, on: bool) {
-        self.0.lock().push(format!("enable {slice} {on}"));
-    }
-    fn nmi(&self, slice: usize) {
-        self.0.lock().push(format!("nmi {slice}"));
-    }
-    fn soft_reset(&self, slice: usize) {
-        self.0.lock().push(format!("soft {slice}"));
-    }
-    fn cached_alias_changed(&self, bytes: u64) {
-        self.0.lock().push(format!("calias {bytes:#x}"));
+        self.0[line / LINES_PER_CPU].load(Ordering::SeqCst) >> (CAUSE_SHIFT as usize + line % LINES_PER_CPU) & 1 == 1
     }
 }
 impl Fixture {
     fn new(cpus: u8) -> Self {
         let now = Arc::new(AtomicU64::new(1_000_000));
         let clock = now.clone();
-        let pi = HubPi::new(cpus, 0, Arc::new(move || clock.load(Ordering::SeqCst)));
+        let pi = Pi::new(cpus, 0, Arc::new(move || clock.load(Ordering::SeqCst)), Routing::new());
         let lines = Arc::new(Lines::default());
-        let hooks = Arc::new(Hooks::default());
-        pi.set_interrupt_controller(lines.clone());
-        pi.set_hooks(hooks.clone());
-        Self { pi, now, lines, hooks }
+        for (slice, word) in lines.0.iter().enumerate() {
+            pi.set_cpu_interrupts(slice, word);
+        }
+        Self { pi, now, lines, effects: Mutex::default() }
     }
     fn r(&self, off: u64) -> u64 {
         self.pi.read64(off).data
     }
     fn w(&self, off: u64, value: u64) {
-        assert_eq!(self.pi.write64(off, value), BUS_OK);
+        let text = match self.pi.write(off, value) {
+            Effect::None => return,
+            Effect::CachedAlias => vec![format!("calias {:#x}", self.pi.calias_bytes())],
+            other => panic!("the processor interface does not return {other:?}"),
+        };
+        self.effects.lock().extend(text);
     }
     /// Let `ticks` counter ticks pass and bring the comparators up to date.
     fn advance(&self, ticks: u64) {
         self.now.fetch_add(ticks * TICK_NS, Ordering::SeqCst);
         self.pi.poll();
     }
-    fn take_hooks(&self) -> Vec<String> {
-        std::mem::take(&mut *self.hooks.0.lock())
+    /// Whether slice `slice`'s word carries the soft-reset request.
+    fn reset_requested(&self, slice: usize) -> bool {
+        self.lines.0[slice].load(Ordering::SeqCst) >> 63 == 1
+    }
+    fn take_effects(&self) -> Vec<String> {
+        std::mem::take(&mut *self.effects.lock())
     }
 }
 
@@ -112,7 +103,7 @@ fn the_processor_number_names_the_reading_processor() {
     t.w(reg::CPU_NUM, 1);
     assert_eq!(t.r(reg::CPU_NUM), 0);
     // A node whose slice A is global CPU 2.
-    let node = HubPi::new(2, 2, Arc::new(|| 0));
+    let node = Pi::new(2, 2, Arc::new(|| 0), Routing::new());
     std::thread::spawn(move || {
         crate::cpu::smp::set_current_cpu(3);
         assert_eq!(node.read64(reg::CPU_NUM).data, 1);
@@ -124,23 +115,27 @@ fn the_processor_number_names_the_reading_processor() {
 }
 
 #[test]
-fn processor_presence_enable_nmi_and_soft_reset_reach_the_machine() {
+fn processor_presence_enable_nmi_and_soft_reset() {
     let t = Fixture::new(2);
     assert_eq!((t.r(reg::CPU_PRESENT_A), t.r(reg::CPU_PRESENT_B)), (1, 1));
     assert_eq!((t.r(reg::CPU_ENABLE_A), t.r(reg::CPU_ENABLE_B)), (0, 0));
     t.w(reg::CPU_ENABLE_B, 0xff);
     assert_eq!(t.r(reg::CPU_ENABLE_B), 1);
-    assert_eq!(t.take_hooks(), ["enable 1 true"]);
-    // The soft reset reaches only the enabled processors.
+    // The enable and the NMI are logged and ask nothing of the machine.
+    assert!(t.take_effects().is_empty());
+    assert_eq!((t.reset_requested(0), t.reset_requested(1)), (false, false));
+    // The soft reset reaches only the enabled processors, as bit 63 of the
+    // processor's word, and asks nothing else.
     t.w(reg::SOFTRESET, 1);
-    assert_eq!(t.take_hooks(), ["soft 1"]);
+    assert_eq!((t.reset_requested(0), t.reset_requested(1)), (false, true));
+    assert!(t.take_effects().is_empty());
     t.w(reg::NMI_A, 1);
     t.w(reg::NMI_B, 0);
-    assert_eq!(t.take_hooks(), ["nmi 0", "nmi 1"]);
+    assert!(t.take_effects().is_empty());
+    assert_eq!(t.lines.0[0].load(Ordering::SeqCst), 0, "NMI does not reach the processor");
     // Reset halts both processors again; the enables read zero.
     t.pi.power_on();
     assert_eq!(t.r(reg::CPU_ENABLE_B), 0);
-    assert_eq!(t.take_hooks(), ["enable 0 false", "enable 1 false"]);
 }
 
 #[test]
@@ -151,10 +146,11 @@ fn an_absent_processors_enable_stores_and_reaches_nothing() {
     assert_eq!(t.r(reg::CPU_ENABLE_B), 1);
     t.w(reg::NMI_B, 1);
     t.w(reg::SOFTRESET, 1);
-    assert!(t.take_hooks().is_empty());
+    assert!(t.take_effects().is_empty());
+    assert_eq!((t.reset_requested(0), t.reset_requested(1)), (false, false));
     t.w(reg::CPU_ENABLE_A, 1);
     t.w(reg::SOFTRESET, 1);
-    assert_eq!(t.take_hooks(), ["enable 0 true", "soft 0"]);
+    assert_eq!((t.reset_requested(0), t.reset_requested(1)), (true, false));
     // Nor does the absent slot get an interrupt line.
     t.w(reg::INT_MASK0_B, !0);
     t.w(reg::INT_PEND_MOD, MODIFY_SET | 3);
@@ -166,7 +162,7 @@ fn the_cached_alias_size_codes_double_from_4_kib() {
     let t = Fixture::new(2);
     for (code, bytes) in [(0, 0), (1, 4 << 10), (2, 8 << 10), (15, 64 << 20)] {
         t.w(reg::CALIAS_SIZE, code);
-        assert_eq!(t.take_hooks(), [format!("calias {bytes:#x}")]);
+        assert_eq!(t.take_effects(), [format!("calias {bytes:#x}")]);
         assert_eq!(t.pi.calias_bytes(), bytes);
     }
     // Four bits store; a wider value wraps into them.
@@ -493,4 +489,180 @@ fn unimplemented_offsets_read_zero() {
     assert_eq!(t.r(0x1f8), 0);
     t.w(0x1f8, 0x5555);
     assert_eq!(t.r(0x1f8), 0);
+}
+
+/// A write that changes no line writes no edge: the lines are driven only on a
+/// change.
+#[test]
+fn a_write_that_changes_no_line_makes_no_edge() {
+    let t = Fixture::new(1);
+    t.w(reg::INT_MASK0_A, !0);
+    t.pi.int_modify(MODIFY_SET | 5);
+    assert!(t.lines.get(0));
+    let edges = |t: &Fixture| (t.pi.rises[0].load(Ordering::SeqCst), t.pi.falls[0].load(Ordering::SeqCst));
+    assert_eq!(edges(&t), (1, 0));
+    // The bit again, the mask again, a drive: the line stays up.
+    t.pi.int_modify(MODIFY_SET | 5);
+    t.pi.int_modify(MODIFY_SET | 6);
+    t.w(reg::INT_MASK0_A, !0);
+    t.pi.drive();
+    t.pi.poll();
+    assert_eq!(edges(&t), (1, 0));
+    // One bit clears and the other holds the line.
+    t.pi.int_modify(5);
+    assert_eq!(edges(&t), (1, 0));
+    t.pi.int_modify(6);
+    assert!(!t.lines.get(0));
+    assert_eq!(edges(&t), (1, 1));
+}
+
+/// Four threads change three inputs and two others write the same values and
+/// drive the lines over and over. A line rises exactly once for each pulse of
+/// its input and falls once, and a line nobody pulsed never moves: no stale
+/// sample writes an edge the registers did not make.
+#[test]
+fn threads_pulsing_and_driving_make_one_rise_and_one_fall_per_pulse() {
+    const PULSES: u64 = 4000;
+    let t = Arc::new(Fixture::new(1));
+    t.w(reg::INT_MASK0_A, !0);
+    t.w(reg::RT_EN_A, 1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let noisy: Vec<_> = (0..2)
+        .map(|n| {
+            let (t, stop) = (t.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    t.pi.drive();
+                    // The same values the registers hold.
+                    t.pi.write(reg::INT_MASK0_A, !0);
+                    t.pi.write(reg::RT_EN_A, 1);
+                    if n == 0 {
+                        t.pi.write(reg::INT_MASK1_A, 0);
+                    }
+                }
+            })
+        })
+        .collect();
+    let bank = {
+        let t = t.clone();
+        std::thread::spawn(move || {
+            for _ in 0..PULSES {
+                t.pi.int_modify(MODIFY_SET | 5);
+                t.pi.int_modify(5);
+            }
+        })
+    };
+    let comparator = {
+        let t = t.clone();
+        std::thread::spawn(move || {
+            for _ in 0..PULSES {
+                t.pi.write(reg::RT_PEND_A, 1);
+                t.pi.write(reg::RT_PEND_A, 0);
+            }
+        })
+    };
+    bank.join().unwrap();
+    comparator.join().unwrap();
+    stop.store(true, Ordering::SeqCst);
+    for n in noisy {
+        n.join().unwrap();
+    }
+    let count = |a: &[AtomicU64; 6]| [0, 1, 2].map(|l| a[l].load(Ordering::SeqCst));
+    assert_eq!(count(&t.pi.rises), [PULSES, 0, PULSES]);
+    assert_eq!(count(&t.pi.falls), [PULSES, 0, PULSES]);
+    assert_eq!((t.lines.get(0), t.lines.get(1), t.lines.get(2)), (false, false, false));
+}
+
+/// Writers that race an input against a mask and an enable leave the word as
+/// the registers say, whatever the interleaving.
+#[test]
+fn racing_writers_leave_the_word_matching_the_registers() {
+    for round in 0..40 {
+        let t = Arc::new(Fixture::new(1));
+        let (a, b, c) = (t.clone(), t.clone(), t.clone());
+        let setter = std::thread::spawn(move || {
+            for _ in 0..2000 {
+                a.pi.int_modify(MODIFY_SET | 5);
+                a.pi.int_modify(5);
+            }
+        });
+        let masker = std::thread::spawn(move || {
+            for i in 0..2000u64 {
+                b.pi.write(reg::INT_MASK0_A, if i % 2 == 0 { !0 } else { 0 });
+            }
+        });
+        let enabler = std::thread::spawn(move || {
+            for i in 0..2000u64 {
+                c.pi.write(reg::RT_PEND_A, 1);
+                c.pi.write(reg::RT_EN_A, i & 1);
+            }
+        });
+        for h in [setter, masker, enabler] {
+            h.join().unwrap();
+        }
+        let bank0 = t.r(reg::INT_PEND0) & t.r(reg::INT_MASK0_A) != 0;
+        let rt = t.r(reg::RT_PEND_A) != 0 && t.r(reg::RT_EN_A) != 0;
+        assert_eq!((t.lines.get(0), t.lines.get(1), t.lines.get(2)), (bank0, false, rt), "round {round}");
+    }
+}
+
+/// A writer that stalls in the middle of writing the lines holds off every
+/// change of their inputs: the input changes under the same hold of `lines`
+/// as the write. Were an input changed before the lock, the second thread
+/// would clear and set the bit while the first still held the stale sample,
+/// and the first's rise would land after the second's fall and rise, one
+/// edge where the registers made two.
+#[test]
+fn a_stalled_line_write_holds_off_changes_to_its_input() {
+    use std::sync::Barrier;
+    let t = Arc::new(Fixture::new(1));
+    t.w(reg::INT_MASK0_A, !0);
+    let (entered, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    {
+        let (entered, release) = (entered.clone(), release.clone());
+        *t.pi.stall.lock() = Some(Arc::new(move || {
+            entered.wait();
+            release.wait();
+        }));
+    }
+    let first = {
+        let t = t.clone();
+        std::thread::spawn(move || t.pi.int_modify(MODIFY_SET | 5))
+    };
+    // The first writer has set the bit and is stalled before writing the line.
+    entered.wait();
+    assert_eq!(t.pi.pending(0), 1 << 5);
+    assert!(!t.lines.get(0), "the stalled writer has not written the line");
+    let second = {
+        let t = t.clone();
+        std::thread::spawn(move || {
+            t.pi.int_modify(5);
+            t.pi.int_modify(MODIFY_SET | 5);
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(t.pi.pending(0), 1 << 5, "the input changed while another writer held the lines");
+    assert!(!second.is_finished());
+    release.wait();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert!(t.lines.get(0));
+    // The bit rose, fell and rose: three edges in the order the registers made them.
+    assert_eq!((t.pi.rises[0].load(Ordering::SeqCst), t.pi.falls[0].load(Ordering::SeqCst)), (2, 1));
+}
+
+/// A reset writes the lines with the registers it clears: a line that was up
+/// falls, once, with the reset and not at the next change of an input.
+#[test]
+fn a_reset_drops_the_lines_that_were_up() {
+    let t = Fixture::new(1);
+    t.w(reg::INT_MASK0_A, !0);
+    t.w(reg::RT_EN_A, 1);
+    t.pi.int_modify(MODIFY_SET | 5);
+    t.w(reg::RT_PEND_A, 1);
+    assert!(t.lines.get(0) && t.lines.get(2));
+    Resettable::power_on(&*t.pi);
+    assert!(!t.lines.get(0) && !t.lines.get(2), "the lines stayed up through the reset");
+    let falls = |l: usize| t.pi.falls[l].load(Ordering::SeqCst);
+    assert_eq!((falls(0), falls(2)), (1, 1));
 }

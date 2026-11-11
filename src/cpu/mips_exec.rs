@@ -548,8 +548,8 @@ const EXT_INT_MASK: u32 = crate::cpu::mips_core::CAUSE_IP7 |
                           crate::cpu::mips_core::CAUSE_IP3 |
                           crate::cpu::mips_core::CAUSE_IP2;
 
-// Bit 63 of the interrupts word = soft-reset request
-const SOFT_RESET_BIT: u64 = 1u64 << 63;
+// Bit 63 of the interrupts word = soft-reset request. The Hub sets it too.
+pub(crate) const SOFT_RESET_BIT: u64 = 1u64 << 63;
 
 /// CP0 `Index` slot field, bits [5:0] — the only bits that select a TLB entry.
 ///
@@ -3012,7 +3012,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// (CPU store → MC register write → `remap_banks` → ppmem), and no device
     /// ever reads or writes it.
     pub fn ppmem_bitmap_ptr(&self) -> *mut u64 {
-        &self.core.ppmem_bitmap as *const u64 as *mut u64
+        self.core.ppmem_bitmap.as_ptr()
     }
 
     /// tcache: hand the cache ppmem's window base and mapped-region bitmap, so
@@ -3044,6 +3044,19 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.cache.tcache_bitmap_ptr()
     }
 
+    /// tcache: see `MipsCache::set_tcache_fine`.
+    ///
+    /// # Safety
+    /// As `MipsCache::set_tcache_fine`.
+    pub unsafe fn set_tcache_fine(&self, table: *const AtomicU64, regions: u64) {
+        unsafe { self.cache.set_tcache_fine(table, regions) };
+    }
+
+    /// tcache: see `MipsCache::tcache_key_ptr`.
+    pub fn tcache_key_ptr(&self) -> *mut u64 {
+        self.cache.tcache_key_ptr()
+    }
+
     /// tcache + jitv2: see `CpuCache::set_tcache_gen_window`.
     ///
     /// # Safety
@@ -3067,8 +3080,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// `MipsExecutor` being moved into its owning `Arc<Mutex<...>>`). Callers
     /// should call this once the executor is at its final, stable address
     /// (inside that `Arc`) and treat the result as valid only from then on —
-    /// which holds for the rest of the process, since the executor never
-    /// moves again once there.
+    /// the executor never moves again once there. It is valid until the
+    /// executor is dropped, which for a machine that is dropped is before the
+    /// process ends: whoever holds the pointer (a device, a Hub) must have
+    /// stopped writing through it before then.
     pub fn interrupts_ptr(&self) -> *const AtomicU64 {
         &self.core.hot.interrupts as *const AtomicU64
     }
@@ -10772,6 +10787,19 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         self.executor.lock().tcache_bitmap_ptr()
     }
 
+    /// tcache: see `MipsCache::set_tcache_fine`.
+    ///
+    /// # Safety
+    /// As `MipsCache::set_tcache_fine`.
+    pub unsafe fn set_tcache_fine(&self, table: *const AtomicU64, regions: u64) {
+        unsafe { self.executor.lock().set_tcache_fine(table, regions) };
+    }
+
+    /// tcache: see `MipsCache::tcache_key_ptr`.
+    pub fn tcache_key_ptr(&self) -> *mut u64 {
+        self.executor.lock().tcache_key_ptr()
+    }
+
     /// tcache + jitv2: see `MipsExecutor::set_tcache_gen_window`.
     ///
     /// # Safety
@@ -11504,6 +11532,13 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn set_tcache_shift(&self, shift: u32);
     /// tcache: pointer to the cache's inline mapped-region bitmap.
     fn tcache_bitmap_ptr(&self) -> *mut u64;
+    /// tcache: see `MipsCache::set_tcache_fine`.
+    ///
+    /// # Safety
+    /// As `MipsCache::set_tcache_fine`.
+    unsafe fn set_tcache_fine(&self, table: *const AtomicU64, regions: u64);
+    /// tcache: see `MipsCache::tcache_key_ptr`.
+    fn tcache_key_ptr(&self) -> *mut u64;
     /// tcache + jitv2: hand the cache ppmem's generation-window base.
     ///
     /// # Safety
@@ -11571,6 +11606,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
         unsafe { MipsCpu::set_cached_view(self, sp, view) }
     }
     fn tcache_bitmap_ptr(&self) -> *mut u64 { MipsCpu::tcache_bitmap_ptr(self) }
+    unsafe fn set_tcache_fine(&self, table: *const AtomicU64, regions: u64) {
+        unsafe { MipsCpu::set_tcache_fine(self, table, regions) }
+    }
+    fn tcache_key_ptr(&self) -> *mut u64 { MipsCpu::tcache_key_ptr(self) }
     #[cfg(feature = "jitv2")]
     unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
         unsafe { MipsCpu::set_tcache_gen_window(self, gen_base) }

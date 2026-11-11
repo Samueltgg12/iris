@@ -11,55 +11,30 @@
 use super::*;
 use std::sync::atomic::AtomicU32;
 
-#[derive(Default)]
-struct Calls(Mutex<Vec<String>>);
-impl HubHooks for Calls {
-    fn node_number_changed(&self, number: u16) {
-        self.0.lock().push(format!("number {number}"));
-    }
-    fn machine_restart(&self) {
-        self.0.lock().push("restart".into());
-    }
-}
-#[derive(Default)]
-struct Moves(AtomicU32);
-impl NiEvents for Moves {
-    fn changed(&self) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
 struct Node {
-    ni: Arc<HubNi>,
-    calls: Arc<Calls>,
-    moves: Arc<Moves>,
+    ni: Arc<Ni>,
 }
-fn node(revision: u8, nasid: u16) -> Node {
-    let ni = Arc::new(HubNi::new(revision, nasid));
-    let calls = Arc::new(Calls::default());
-    let moves = Arc::new(Moves::default());
-    ni.set_hooks(calls.clone());
-    ni.set_events(moves.clone());
-    Node { ni, calls, moves }
+fn node(revision: u8) -> Node {
+    Node { ni: Arc::new(Ni::new(revision, Routing::new())) }
 }
 /// Two Hubs on a direct cable, the two-module Origin 200.
 fn pair() -> (Node, Node) {
-    let (a, b) = (node(3, 0), node(3, 0));
+    let (a, b) = (node(3), node(3));
     let (wa, wb): (Weak<dyn NetPeer>, Weak<dyn NetPeer>) = (Arc::downgrade(&a.ni) as _, Arc::downgrade(&b.ni) as _);
     a.ni.connect_peer(Some(wb));
     b.ni.connect_peer(Some(wa));
     (a, b)
 }
-fn r(ni: &HubNi, off: u64) -> u64 {
+fn r(ni: &Ni, off: u64) -> u64 {
     ni.read64(off).data
 }
-fn w(ni: &HubNi, off: u64, value: u64) {
-    assert_eq!(ni.write64(off, value), BUS_OK);
+fn w(ni: &Ni, off: u64, value: u64) -> Effect {
+    ni.write(off, value)
 }
 
 /// Run a vector operation from `ni` to the Hub across the cable and return
 /// the completion status.
-fn vector(ni: &HubNi, route: u64, off: u64, ty: u64, data: u64) -> u64 {
+fn vector(ni: &Ni, route: u64, off: u64, ty: u64, data: u64) -> u64 {
     w(ni, reg::VECTOR, route);
     w(ni, reg::VECTOR_DATA, data);
     w(ni, reg::VECTOR_PARMS, (off - reg::STATUS) | ty);
@@ -69,7 +44,7 @@ const VALID: u64 = 1 << 63;
 
 #[test]
 fn the_status_register_names_the_node_the_mode_and_the_chip_revision() {
-    let n = node(3, 0);
+    let n = node(3);
     let status = r(&n.ni, reg::STATUS);
     // Region size set, M mode (bit 18 clear), never out of reset, revision 3.
     assert_eq!(status, STATUS_REGION_SIZE | STATUS_NEVER_OUT_OF_RESET | (3 << 4));
@@ -84,31 +59,22 @@ fn the_status_register_names_the_node_the_mode_and_the_chip_revision() {
     // Mode: bit 18 writes (N mode), region size writes.
     w(&n.ni, reg::STATUS, 0);
     assert_eq!(r(&n.ni, reg::STATUS) & (STATUS_MORE_NODES | STATUS_REGION_SIZE), 0);
-    // A preprogrammed node number survives reset.
-    let preset = node(5, 7);
-    assert_eq!(r(&preset.ni, reg::STATUS), STATUS_RESET | (5 << 4) | (7 << 8));
-    w(&preset.ni, reg::STATUS, 0);
-    preset.ni.power_on();
-    assert_eq!(preset.ni.number(), 7);
 }
 
 #[test]
-fn a_new_node_number_tells_the_machine_and_the_claim_map() {
-    let n = node(3, 0);
-    let moved = n.moves.0.load(Ordering::SeqCst);
-    w(&n.ni, reg::STATUS, 5 << 8);
-    assert_eq!(n.calls.0.lock().as_slice(), ["number 5"]);
-    assert!(n.moves.0.load(Ordering::SeqCst) > moved);
+fn a_new_node_number_is_returned_for_the_machine_and_mirrored_for_the_decode() {
+    let n = node(3);
+    assert!(matches!(w(&n.ni, reg::STATUS, 5 << 8), Effect::NodeNumber));
+    assert_eq!(n.ni.number(), 5);
     // Writing the number it already has is not a change.
-    w(&n.ni, reg::STATUS, 5 << 8);
-    assert_eq!(n.calls.0.lock().len(), 1);
+    assert!(matches!(w(&n.ni, reg::STATUS, 5 << 8), Effect::None));
 }
 
 #[test]
 fn a_node_with_no_link_never_came_out_of_reset() {
     // The guest kernel treats down with the never-out-of-reset reason clear as a lost
     // CrayLink on every bus error, so the reason must read one.
-    let n = node(3, 0);
+    let n = node(3);
     let down = |n: &Node| r(&n.ni, reg::STATUS) & (STATUS_LINK_UP | STATUS_NEVER_OUT_OF_RESET);
     assert_eq!(down(&n), STATUS_NEVER_OUT_OF_RESET);
     n.ni.power_on();
@@ -120,7 +86,7 @@ fn a_node_with_no_link_never_came_out_of_reset() {
 
 #[test]
 fn a_link_reset_with_no_peer_latches_the_event_and_leaves_the_link_down() {
-    let n = node(3, 0);
+    let n = node(3);
     w(&n.ni, reg::STATUS, 9 << 8);
     w(&n.ni, reg::SCRATCH_0, 0x55);
     assert_eq!(r(&n.ni, reg::PORT_ERROR), 0);
@@ -133,23 +99,20 @@ fn a_link_reset_with_no_peer_latches_the_event_and_leaves_the_link_down() {
     // single clearing read sees it set once and then clear.
     assert_eq!(r(&n.ni, reg::PORT_ERROR_CLEAR), PORT_ERROR_LINK_RESET);
     assert_eq!(r(&n.ni, reg::PORT_ERROR_CLEAR), 0);
-    // None of that restarted the machine.
-    assert!(n.calls.0.lock().iter().all(|c| c.starts_with("number")));
+
 }
 
 #[test]
 fn the_local_bit_of_the_port_reset_restarts_the_machine_with_either_companion() {
     for value in [0x81, 0x03, 0x01] {
-        let n = node(3, 0);
-        w(&n.ni, reg::PORT_RESET, value);
-        assert_eq!(n.calls.0.lock().as_slice(), ["restart"], "{value:#x}");
+        let n = node(3);
+        assert!(matches!(w(&n.ni, reg::PORT_RESET, value), Effect::Restart), "{value:#x}");
         // Nothing is stored and the link reset is superseded.
         assert_eq!(r(&n.ni, reg::PORT_ERROR), 0);
     }
     // Bit 7 alone is logged and does nothing.
-    let n = node(3, 0);
-    w(&n.ni, reg::PORT_RESET, PORT_RESET_WARM);
-    assert!(n.calls.0.lock().is_empty());
+    let n = node(3);
+    assert!(matches!(w(&n.ni, reg::PORT_RESET, PORT_RESET_WARM), Effect::None));
 }
 
 #[test]
@@ -258,7 +221,7 @@ fn a_vector_that_the_cable_cannot_carry_or_the_target_does_not_decode_errors_out
 
 #[test]
 fn a_vector_launch_with_no_peer_latches_nothing() {
-    let n = node(3, 0);
+    let n = node(3);
     w(&n.ni, reg::VECTOR_DATA, 0x0123_4567_89ab_cdef);
     assert_eq!(vector(&n.ni, 0, reg::SCRATCH_0, VECTOR_READ, 0), 0);
     assert_eq!(vector(&n.ni, 0, reg::SCRATCH_1, VECTOR_WRITE, 5), 0);
@@ -277,11 +240,15 @@ fn vector_writes_land_only_on_rows_that_store() {
     b.ni.latch_port_error(0x5);
     vector(&a.ni, 0, reg::PORT_ERROR_CLEAR, VECTOR_READ, 0);
     assert_eq!((r(&a.ni, reg::VECTOR_READ_DATA), r(&b.ni, reg::PORT_ERROR)), (5, 0));
-    // The remote vector write of the node number moves the claim map there.
-    let before = b.moves.0.load(Ordering::SeqCst);
-    vector(&a.ni, 0, reg::STATUS, VECTOR_WRITE, 3 << 8);
+    // The remote vector write of the node number renumbers the neighbour,
+    // which the launching Hub reports for the neighbour's machine, and the
+    // number each end mirrors for the decode follows.
+    w(&a.ni, reg::VECTOR, 0);
+    w(&a.ni, reg::VECTOR_DATA, 3 << 8);
+    let effect = w(&a.ni, reg::VECTOR_PARMS, (reg::STATUS - reg::STATUS) | VECTOR_WRITE);
+    assert!(matches!(effect, Effect::PeerNodeNumber), "{effect:?}");
     assert_eq!(b.ni.number(), 3);
-    assert!(b.moves.0.load(Ordering::SeqCst) > before);
+    assert_eq!(a.ni.neighbour_number(), Some(3));
 }
 
 #[test]
@@ -319,7 +286,7 @@ fn the_protection_and_diagnostic_registers_store_and_answer_the_vector_decode() 
 
 #[test]
 fn the_port_registers_reset_to_the_models_values() {
-    let n = node(3, 0);
+    let n = node(3);
     // The null-packet timeout in bits 15:10 and the maximum burst in 9:0.
     assert_eq!(r(&n.ni, reg::PORT_PARMS), 0x1bf0);
     assert_eq!((r(&n.ni, reg::PORT_PARMS) >> 10) & 0x3f, 6);
@@ -343,7 +310,7 @@ fn the_port_registers_reset_to_the_models_values() {
 
 #[test]
 fn a_check_bit_error_count_saturates_at_255() {
-    let n = node(3, 0);
+    let n = node(3);
     assert!(!n.ni.sends_data_error());
     w(&n.ni, reg::DIAG_PARMS, DIAG_SEND_DATA_ERROR);
     assert!(n.ni.sends_data_error());
@@ -357,7 +324,7 @@ fn a_check_bit_error_count_saturates_at_255() {
 
 #[test]
 fn the_routing_tables_hold_four_bits_and_a_fresh_entry_routes_nothing() {
-    let n = node(3, 0);
+    let n = node(3);
     w(&n.ni, reg::STATUS, 0x23 << 8);
     for i in 0..32 {
         assert_eq!(r(&n.ni, reg::META_TABLE + i * 8), 0);
@@ -377,17 +344,14 @@ fn the_routing_tables_hold_four_bits_and_a_fresh_entry_routes_nothing() {
     assert_eq!(n.ni.first_turn(0x41), Some(7));
     assert_eq!(n.ni.first_turn(0x26), None);
     assert_eq!(n.ni.first_turn(256), None);
-    // A written route tells the machine; reset forgets it.
-    let moved = n.moves.0.load(Ordering::SeqCst);
-    w(&n.ni, reg::META_TABLE, 1);
-    assert!(n.moves.0.load(Ordering::SeqCst) > moved);
+    // Reset forgets a route.
     n.ni.power_on();
     assert_eq!(n.ni.first_turn(0x41), None);
 }
 
 #[test]
 fn the_scratch_ageing_and_vector_registers_store_what_is_written() {
-    let n = node(3, 0);
+    let n = node(3);
     w(&n.ni, reg::SCRATCH_0, 0x1111_2222_3333_4444);
     w(&n.ni, reg::SCRATCH_1, !0);
     assert_eq!((r(&n.ni, reg::SCRATCH_0), r(&n.ni, reg::SCRATCH_1)), (0x1111_2222_3333_4444, !0));

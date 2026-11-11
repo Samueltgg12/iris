@@ -16,6 +16,9 @@ Copy [`origin2000.toml.example`](../origin2000.toml.example) to
 
 - `[origin2000] nodes` is 1 or 2. The memory in `banks` is fitted to every
   node.
+- `[origin2000] io_prom` names the I/O PROM image (`io6prom.img`, beside the
+  node PROM on the IRIX 6.5.30 media) to fit in the BaseIO's boot flash;
+  without it the node PROM runs its own internal copy.
 - `machine.cpu` is `r10000` or `r12000`. Each node has one processor.
 - `[origin2000] flash` and `controller_store` keep the boot flash (the second
   node's at the same name with `.1` added) and the module controller's store
@@ -32,17 +35,17 @@ through an I2C adapter per node.
 - One node boots the stock PROM to the System Maintenance Menu and IRIX
   6.5.30 to a serial login.
 - Two nodes: the PROM finds both Hubs, numbers them, chooses the first as the
-  global master, passes its diagnostics with both processors and 256 MB and
-  reaches the menu. IRIX then stops with "Processor #1 did not start": the
-  second node's processor takes a TLB exception in the PROM (the master
-  reports "has taken an exception"), so it never waits to be launched.
-- The BaseIO's boot flash is not fitted; the PROM falls back to its own copy
-  of the I/O PROM.
+  global master, passes its diagnostics with both processors and 256 MB, and
+  IRIX 6.5.30 boots to a root login with both processors.
+- The BaseIO's boot flash is fitted only when `[origin2000] io_prom` names an
+  I/O PROM image; without one the PROM falls back to its own copy of the I/O
+  PROM.
 - The BaseIO is the only board; the second Crossbow has no widgets but its
   node.
 - The module's midplane one-wire part is not fitted.
 - A node that holds a nonzero number sends cached references to node zero's
   window beyond its cached alias to the Hub that holds zero, and its own RAM
-  is then reached through its own number only. The second node gives up the
-  direct memory window for it, so its cached references are slower.
+  is then reached through its own number. Each processor's ppmem window shows
+  both nodes' memory at the same addresses, whatever their bank sizes and
+  numbers, so both nodes run at the same speed.
 - Snapshots are not supported.

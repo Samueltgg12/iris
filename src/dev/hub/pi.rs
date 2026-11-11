@@ -7,8 +7,30 @@
 //! Offsets are from the base of the Hub window. Pending banks, masks, the
 //! counter origin and the comparator pending and enable bits are atomics, so
 //! the registers a waiting processor polls take no lock. The remaining
-//! register state sits behind one mutex that is never held across a hook or an
-//! interrupt-line call.
+//! register state sits behind one mutex that is never held across an
+//! interrupt-line call. A store that the machine must hear of is returned as
+//! an [`Effect`] for the Hub to act on.
+//!
+//! # Interrupt lines
+//!
+//! The three lines of each processor are one function of the pending banks,
+//! the masks and the comparator. Every writer of those inputs takes `lines`,
+//! changes its input, computes the lines and writes the processor's interrupt
+//! word under it, and writes only the lines that changed. The lock orders the
+//! edges, so every edge in a word is a change of the registers and no input
+//! moves while the lines are computed. `lines` is a leaf: the word is an
+//! atomic nobody calls out of, and the lock is taken inside the state mutex,
+//! never the other way round, so nothing in the Hub is called while it is
+//! held. Readers stay lock-free.
+//!
+//! The lines are written inside the hold. That is an exception to HACKING.md's
+//! Locks rule 2, which raises interrupts outside a state lock: a writer that
+//! sampled the inputs and was then descheduled would write a level the
+//! registers no longer held, after another writer's fall and rise. The
+//! Interrupts section's order (a controller drives the next one up under its
+//! own lock) is the one kept, and it holds only while nothing calls down into
+//! the Hub with `lines` held. (A parked processor's wake, with `idle-pause`,
+//! takes only the parker's own leaf lock.)
 //!
 //! # What is approximated here
 //!
@@ -36,16 +58,16 @@
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
+use crate::cpu::mips_exec::SOFT_RESET_BIT;
 use crate::cpu::smp::on_cpu_thread;
 use crate::dev::heart::Clock;
-use crate::dev::hub::{HubHooks, HubObserver, Store, PENDING_BANKS};
+use super::{Effect, Routing, PENDING_BANKS};
 use crate::dev::odyssey::{PiGfx, PI_GFX_REGS};
 use crate::devlog::LogModule;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
-use crate::irq::InterruptController;
 use crate::traits::{BusDevice, BusRead64, Resettable, BUS_OK};
-use parking_lot::{Mutex, ReentrantMutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -109,7 +131,7 @@ const RT_MASK: u64 = (1 << 52) - 1;
 const RT_LOCAL_CTRL_MASK: u64 = 0x1_00ff;
 const RT_LOCAL_CTRL_RESET: u64 = 0x1_0000;
 const CALIAS_MASK: u64 = 0xf;
-const CALIAS_RESET: u64 = 15;
+pub(super) const CALIAS_RESET: u64 = 15;
 const ERR_MASK: u64 = 0x01ff_ffff;
 const ERR_STACK_ADDR_MASK: u64 = 0xffff_fff8;
 const ERR_STACK_SIZE_MASK: u64 = 0xf;
@@ -120,6 +142,11 @@ const STATUS0_ADDR_MASK: u64 = 0x3fff_ffff_fe00_0000;
 const PHYSICAL_BITS: u32 = 40;
 /// Interrupt lines per processor: bank 0, bank 1, the comparator.
 pub const LINES_PER_CPU: usize = 3;
+/// The first Cause bit a processor's lines drive: line 0 is hardware interrupt
+/// 0 (IP2), Cause bit 10, and the three lines follow it. The Hub touches no
+/// other bit of the word.
+const CAUSE_SHIFT: u32 = 10;
+const LINE_MASK: u64 = (1 << LINES_PER_CPU) - 1;
 
 /// Bytes the cached alias spans for a PI_CALIAS_SIZE code: zero disables it,
 /// one is 4 KiB and each further code doubles it, to 64 MiB at 15.
@@ -169,13 +196,15 @@ impl State {
     }
 }
 
-pub struct HubPi {
+pub struct Pi {
     cpus: u8,
     cpu_base: usize,
     clock: Clock,
-    /// Pending banks. Only `modify` changes them while the machine runs;
-    /// other processors poll them as mailboxes, so a bank is published with
-    /// release order and read with acquire.
+    /// Where the cached-alias size is published, stored under the state lock
+    /// as the register changes.
+    routing: Arc<Routing>,
+    /// Pending banks. Only `modify` changes them while the machine runs, under
+    /// `lines`; other processors poll them as mailboxes without it.
     pend: [AtomicU64; PENDING_BANKS],
     mask: [AtomicU64; 4],
     /// The clock reading at which the counter read zero, modulo 2^64.
@@ -184,13 +213,22 @@ pub struct HubPi {
     rt_pending: [AtomicBool; 2],
     rt_enable: [AtomicBool; 2],
     state: Mutex<State>,
-    hooks: OnceLock<Arc<dyn HubHooks>>,
-    observer: OnceLock<Arc<dyn HubObserver>>,
-    irq: Mutex<Option<Arc<dyn InterruptController>>>,
-    /// Serialises line publication, so two writers cannot publish a stale
-    /// level after a fresh one. Reentrant: a controller may read a register.
-    dispatch: ReentrantMutex<()>,
-    driven: Mutex<[Option<bool>; 2 * LINES_PER_CPU]>,
+    /// Each processor's interrupt word (`MipsCpu::interrupts_ptr`), where its
+    /// three lines are published; null until the machine gives it. The word
+    /// must outlive every thread that can publish; see `write_lines`.
+    words: [AtomicPtr<AtomicU64>; 2],
+    /// Taken by every writer of the inputs of the lines and by the write of the
+    /// lines to the words: see the module comment.
+    lines: Mutex<()>,
+    /// Edges written to the words, per line, counted for the tests.
+    #[cfg(test)]
+    rises: [AtomicU64; 6],
+    #[cfg(test)]
+    falls: [AtomicU64; 6],
+    /// Run once, in the middle of the next write of the lines to a word, for
+    /// a test that stalls the writer there.
+    #[cfg(test)]
+    stall: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Held weakly: the manager's callbacks reach the processor, whose bus
     /// reaches this Hub, so a strong handle here would keep all three alive.
     timers: OnceLock<Weak<TimerManager>>,
@@ -198,47 +236,36 @@ pub struct HubPi {
     weak: Weak<Self>,
 }
 
-impl HubPi {
+impl Pi {
     /// `cpus` is how many processor sockets the node populates (1 or 2) and
     /// `cpu_base` the global index of its slice A, which PI_CPU_NUM subtracts
     /// from the reading processor's.
-    pub fn new(cpus: u8, cpu_base: usize, clock: Clock) -> Arc<Self> {
+    pub fn new(cpus: u8, cpu_base: usize, clock: Clock, routing: Arc<Routing>) -> Arc<Self> {
         assert!((1..=2).contains(&cpus));
         let now = clock();
         Arc::new_cyclic(|weak| Self {
             cpus,
             cpu_base,
             clock,
+            routing,
             pend: Default::default(),
             mask: Default::default(),
             rt_origin: AtomicU64::new(now),
             rt_pending: Default::default(),
             rt_enable: Default::default(),
             state: Mutex::new(State::new()),
-            hooks: OnceLock::new(),
-            observer: OnceLock::new(),
-            irq: Mutex::new(None),
-            dispatch: ReentrantMutex::new(()),
-            driven: Mutex::new([None; 2 * LINES_PER_CPU]),
+            words: Default::default(),
+            lines: Mutex::new(()),
+            #[cfg(test)]
+            rises: Default::default(),
+            #[cfg(test)]
+            falls: Default::default(),
+            #[cfg(test)]
+            stall: Mutex::new(None),
             timers: OnceLock::new(),
             timer: Mutex::new(None),
             weak: weak.clone(),
         })
-    }
-
-    pub fn set_hooks(&self, hooks: Arc<dyn HubHooks>) {
-        let _ = self.hooks.set(hooks);
-    }
-
-    /// Report the stores a processor rendezvous depends on (see [`Store`]).
-    pub fn set_observer(&self, observer: Arc<dyn HubObserver>) {
-        let _ = self.observer.set(observer);
-    }
-
-    fn observe(&self, store: Store) {
-        if let Some(observer) = self.observer.get() {
-            observer.stored(store);
-        }
     }
 
     /// The machine owns the manager; the interface only keeps a weak handle to
@@ -248,14 +275,27 @@ impl HubPi {
         self.schedule();
     }
 
-    /// Lines 0..2 are processor A's hardware interrupts 0 to 2 (bank 0,
-    /// bank 1, the comparator) and lines 3..5 are processor B's. All are
-    /// levels, recomputed on every change.
-    pub fn set_interrupt_controller(&self, irq: Arc<dyn InterruptController>) {
-        let _dispatch = self.dispatch.lock();
-        *self.irq.lock() = Some(irq);
-        *self.driven.lock() = [None; 2 * LINES_PER_CPU];
-        self.drive();
+    /// Where processor `slice`'s lines go: its interrupt word. Line 0 to 2 are
+    /// bank 0, bank 1 and the comparator, the processor's hardware interrupts
+    /// 0 to 2. The levels as they stand are published into the word now. The
+    /// word must outlive every thread that can publish to it: stop them, call
+    /// [`Self::clear_cpu_interrupts`], then free the word.
+    pub fn set_cpu_interrupts(&self, slice: usize, word: *const AtomicU64) {
+        let _lines = self.lines.lock();
+        self.words[slice].store(word as *mut AtomicU64, Ordering::SeqCst);
+        self.write_lines(slice);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publishes_to(&self, slice: usize) -> bool {
+        !self.words[slice].load(Ordering::SeqCst).is_null()
+    }
+
+    /// Let go of the processors' words: nothing is published to them again.
+    pub fn clear_cpu_interrupts(&self) {
+        for word in &self.words {
+            word.store(std::ptr::null_mut(), Ordering::SeqCst);
+        }
     }
 
     pub fn cpus(&self) -> u8 {
@@ -269,16 +309,12 @@ impl HubPi {
 
     /// The cached-alias window size the register currently names.
     pub fn calias_bytes(&self) -> u64 {
-        calias_bytes(self.state.lock().calias)
+        self.routing.calias()
     }
 
     /// The two pending banks, as a processor reads them.
     pub fn pending(&self, bank: usize) -> u64 {
         self.pend[bank].load(Ordering::Acquire)
-    }
-
-    fn hooks(&self) -> Option<&Arc<dyn HubHooks>> {
-        self.hooks.get()
     }
 
     fn count_at(&self, now: u64) -> u64 {
@@ -312,7 +348,7 @@ impl HubPi {
         for slot in 0..2 {
             if s.due[slot].is_some_and(|due| now >= due) {
                 s.due[slot] = None;
-                self.rt_pending[slot].store(true, Ordering::Release);
+                self.change(|| self.rt_pending[slot].store(true, Ordering::Release));
             }
         }
     }
@@ -324,35 +360,97 @@ impl HubPi {
         self.drive();
     }
 
-    fn lines(&self) -> [bool; 2 * LINES_PER_CPU] {
-        let mut out = [false; 2 * LINES_PER_CPU];
-        for slot in 0..usize::from(self.cpus) {
-            let (m0, m1) = (self.mask[slot * 2].load(Ordering::Acquire), self.mask[slot * 2 + 1].load(Ordering::Acquire));
-            out[slot * LINES_PER_CPU] = self.pend[0].load(Ordering::Acquire) & m0 != 0;
-            out[slot * LINES_PER_CPU + 1] = self.pend[1].load(Ordering::Acquire) & m1 != 0;
-            out[slot * LINES_PER_CPU + 2] =
-                self.rt_pending[slot].load(Ordering::Acquire) && self.rt_enable[slot].load(Ordering::Acquire);
-        }
-        out
+    /// What slice `slot`'s three lines say: bit 0 bank 0 through its mask, bit
+    /// 1 bank 1 through its mask, bit 2 the comparator when enabled. Called
+    /// with `lines` held, so no input moves while they are read.
+    fn outputs(&self, slot: usize) -> u64 {
+        let (m0, m1) = (self.mask[slot * 2].load(Ordering::Acquire), self.mask[slot * 2 + 1].load(Ordering::Acquire));
+        u64::from(self.pend[0].load(Ordering::Acquire) & m0 != 0)
+            | u64::from(self.pend[1].load(Ordering::Acquire) & m1 != 0) << 1
+            | u64::from(self.rt_pending[slot].load(Ordering::Acquire) && self.rt_enable[slot].load(Ordering::Acquire)) << 2
     }
 
-    /// Publish each line that changed. The sample is taken under the dispatch
-    /// lock, so the last publication is the freshest level.
-    fn drive(&self) {
-        let _dispatch = self.dispatch.lock();
-        let Some(irq) = self.irq.lock().clone() else { return };
-        let levels = self.lines();
-        for (line, &level) in levels.iter().enumerate() {
-            let changed = {
-                let mut driven = self.driven.lock();
-                let changed = driven[line] != Some(level);
-                driven[line] = Some(level);
-                changed
-            };
-            if changed {
-                irq.set_line(line as u32, level);
+    /// Reset processor `slice`: raise bit 63 of its interrupt word, which the
+    /// processor takes ahead of every interrupt and answers by fetching the
+    /// reset vector. The word is the one the three lines are published into,
+    /// so this needs no lock and no machine; a slice with no word wired
+    /// resets nothing. What the store does beyond that is not established.
+    fn soft_reset(&self, slice: usize) {
+        let p = self.words[slice].load(Ordering::SeqCst);
+        if p.is_null() {
+            return;
+        }
+        // SAFETY: as in `write_lines`: sound while no thread can reach here
+        // after the word is freed, which a machine ensures by stopping its
+        // threads before it clears the words.
+        unsafe { &*p }.fetch_or(SOFT_RESET_BIT, Ordering::SeqCst);
+        #[cfg(feature = "idle-pause")]
+        crate::cpu::idle_park::wake();
+    }
+
+    /// Change an input of the lines and bring every slice's lines to what
+    /// the registers say, as one step under `lines`.
+    fn change(&self, input: impl FnOnce()) {
+        let _lines = self.lines.lock();
+        input();
+        self.write_all();
+    }
+
+    /// Write the lines of slice `s` that differ from the registers, which
+    /// are not moving: the caller holds `lines`.
+    fn write_lines(&self, s: usize) {
+        let p = self.words[s].load(Ordering::SeqCst);
+        if p.is_null() {
+            return;
+        }
+        // SAFETY: `set_cpu_interrupts`'s contract. The pointer was loaded just
+        // above, and nothing here keeps `clear_cpu_interrupts` from running
+        // before the write, so this is sound only while no thread can reach
+        // here after the word is freed. A machine guarantees that by stopping
+        // every thread that publishes (processors, devices, the Hub's timers)
+        // before it clears the words and frees the processors; the clear then
+        // guards a publisher that arrives later, it does not wait for one that
+        // is running.
+        let word = unsafe { &*p };
+        let want = self.outputs(s);
+        let have = (word.load(Ordering::SeqCst) >> CAUSE_SHIFT) & LINE_MASK;
+        #[cfg(test)]
+        {
+            let stall = self.stall.lock().take();
+            if let Some(stall) = stall {
+                stall();
             }
         }
+        if want & !have != 0 {
+            word.fetch_or((want & !have) << CAUSE_SHIFT, Ordering::SeqCst);
+            #[cfg(test)]
+            for line in (0..3).filter(|l| (want & !have) >> l & 1 != 0) {
+                self.rises[s * 3 + line].fetch_add(1, Ordering::SeqCst);
+            }
+            #[cfg(feature = "idle-pause")]
+            crate::cpu::idle_park::wake();
+        }
+        if have & !want != 0 {
+            word.fetch_and(!((have & !want) << CAUSE_SHIFT), Ordering::SeqCst);
+            #[cfg(test)]
+            for line in (0..3).filter(|l| (have & !want) >> l & 1 != 0) {
+                self.falls[s * 3 + line].fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// [`Self::write_lines`] for every slice the node populates. The caller
+    /// holds `lines`.
+    fn write_all(&self) {
+        for s in 0..usize::from(self.cpus) {
+            self.write_lines(s);
+        }
+    }
+
+    /// Bring the lines to the registers with no input changed.
+    fn drive(&self) {
+        let _lines = self.lines.lock();
+        self.write_all();
     }
 
     fn schedule(&self) {
@@ -382,13 +480,13 @@ impl HubPi {
     pub fn int_modify(&self, value: u64) {
         let number = value & MODIFY_NUMBER;
         let (bank, bit) = ((number / 64) as usize, 1u64 << (number % 64));
-        let before = if value & MODIFY_SET != 0 {
-            self.pend[bank].fetch_or(bit, Ordering::AcqRel)
-        } else {
-            self.pend[bank].fetch_and(!bit, Ordering::AcqRel)
-        };
-        self.drive();
-        self.observe(Store::IntPendMod { value, changed: (before & bit != 0) != (value & MODIFY_SET != 0) });
+        self.change(|| {
+            if value & MODIFY_SET != 0 {
+                self.pend[bank].fetch_or(bit, Ordering::AcqRel);
+            } else {
+                self.pend[bank].fetch_and(!bit, Ordering::AcqRel);
+            }
+        });
     }
 
     /// A processor read failed: record it in that slice's error status 0.
@@ -493,15 +591,16 @@ impl HubPi {
         }
     }
 
-    pub fn write(&self, off: u64, value: u64) {
-        self.write_sized(off, value, 8);
+    pub fn write(&self, off: u64, value: u64) -> Effect {
+        self.write_sized(off, value, 8)
     }
 
     /// `size` is the guest's access width: only a full-width zero store ends
     /// a processor's error record through a clearing alias.
-    pub fn write_sized(&self, off: u64, value: u64, size: u32) {
+    /// What the store changed beyond the register is returned for the Hub to
+    /// act on, after this unit's lock is released.
+    pub fn write_sized(&self, off: u64, value: u64, size: u32) -> Effect {
         let now = || (self.clock)();
-        let hooks = self.hooks();
         match off {
             reg::REGION_PRESENT => self.state.lock().region_present = value,
             reg::CPU_NUM => {
@@ -509,36 +608,30 @@ impl HubPi {
             }
             reg::CALIAS_SIZE => {
                 let code = value & CALIAS_MASK;
-                self.state.lock().calias = code;
-                if let Some(h) = hooks {
-                    h.cached_alias_changed(calias_bytes(code));
-                }
+                let mut s = self.state.lock();
+                s.calias = code;
+                self.routing.set_calias(calias_bytes(code));
+                return Effect::CachedAlias;
             }
             reg::CPU_ENABLE_A | reg::CPU_ENABLE_B => {
                 let slice = ((off - reg::CPU_ENABLE_A) / 8) as usize;
                 let on = value & 1 != 0;
                 self.state.lock().cpu_enable[slice] = on;
+                // What the store does to the processor is not established.
                 if slice < usize::from(self.cpus) {
-                    if let Some(h) = hooks {
-                        h.cpu_enable(slice, on);
-                    }
+                    crate::dlog!(LogModule::Hub, "Hub PI: PI_CPU_ENABLE {slice} = {on} (no effect on the processor)");
                 }
-                self.observe(Store::CpuEnable { slice, enabled: on });
             }
             reg::NMI_A | reg::NMI_B => {
                 let slice = ((off - reg::NMI_A) / 8) as usize;
                 if slice < usize::from(self.cpus) {
-                    if let Some(h) = hooks {
-                        h.nmi(slice);
-                    }
+                    crate::dlog!(LogModule::Hub, "Hub PI: NMI to slice {slice} (not delivered)");
                 }
             }
             reg::SOFTRESET => {
                 let enabled = self.state.lock().cpu_enable;
                 for slice in (0..usize::from(self.cpus)).filter(|&i| enabled[i]) {
-                    if let Some(h) = hooks {
-                        h.soft_reset(slice);
-                    }
+                    self.soft_reset(slice);
                 }
             }
             reg::INT_PEND_MOD => self.int_modify(value),
@@ -546,8 +639,7 @@ impl HubPi {
                 crate::dlog!(LogModule::Hub, "Hub PI: write of {value:#x} to the read-only pending register {off:#x}");
             }
             reg::INT_MASK0_A..=reg::INT_MASK1_B if off % 8 == 0 => {
-                self.mask[((off - reg::INT_MASK0_A) / 8) as usize].store(value, Ordering::Release);
-                self.drive();
+                self.change(|| self.mask[((off - reg::INT_MASK0_A) / 8) as usize].store(value, Ordering::Release));
             }
             reg::RT_COMPARE_A | reg::RT_COMPARE_B => {
                 let slot = ((off - reg::RT_COMPARE_A) / 8) as usize;
@@ -556,16 +648,13 @@ impl HubPi {
                 self.arm(&mut s, slot, now());
                 drop(s);
                 self.schedule();
-                self.observe(Store::RtCompare { slice: slot, value: value & RT_MASK });
             }
             reg::RT_PEND_A | reg::RT_PEND_B => {
                 // The handler acknowledges by writing zero, which drops the line.
-                self.rt_pending[((off - reg::RT_PEND_A) / 8) as usize].store(value & 1 != 0, Ordering::Release);
-                self.drive();
+                self.change(|| self.rt_pending[((off - reg::RT_PEND_A) / 8) as usize].store(value & 1 != 0, Ordering::Release));
             }
             reg::RT_EN_A | reg::RT_EN_B => {
-                self.rt_enable[((off - reg::RT_EN_A) / 8) as usize].store(value & 1 != 0, Ordering::Release);
-                self.drive();
+                self.change(|| self.rt_enable[((off - reg::RT_EN_A) / 8) as usize].store(value & 1 != 0, Ordering::Release));
             }
             reg::RT_LOCAL_CTRL => self.state.lock().rt_local_ctrl = value & RT_LOCAL_CTRL_MASK,
             reg::GFX_BASE..reg::GFX_END if off % 8 == 0 => {
@@ -613,11 +702,12 @@ impl HubPi {
             }
             _ => unimp("register", off, Some(value)),
         }
+        Effect::None
     }
 
     /// Whether the register state is locked now, for the `locks` monitor command.
     pub fn is_locked(&self) -> bool {
-        self.state.is_locked()
+        self.state.is_locked() || self.lines.is_locked()
     }
 
     pub fn start(&self) {
@@ -640,7 +730,7 @@ impl HubPi {
     }
 }
 
-impl Resettable for HubPi {
+impl Resettable for Pi {
     /// Everything returns to its reset value except the error stack
     /// addresses, which firmware uses as a warm-start marker. Both processor
     /// enables clear, so the node's processors halt until firmware releases
@@ -650,36 +740,33 @@ impl Resettable for HubPi {
         let mut s = self.state.lock();
         let (addr, running) = (s.err_stack_addr, s.running);
         *s = State::new();
+        self.routing.set_calias(calias_bytes(s.calias));
         s.err_stack_addr = addr;
         s.running = running;
         drop(s);
         self.rt_origin.store(now, Ordering::Release);
-        for bank in &self.pend {
-            bank.store(0, Ordering::Release);
-        }
-        for m in &self.mask {
-            m.store(0, Ordering::Release);
-        }
-        for slot in 0..2 {
-            self.rt_pending[slot].store(false, Ordering::Release);
-            self.rt_enable[slot].store(false, Ordering::Release);
-        }
-        self.drive();
-        self.schedule();
-        if let Some(h) = self.hooks() {
-            for slice in 0..usize::from(self.cpus) {
-                h.cpu_enable(slice, false);
+        self.change(|| {
+            for bank in &self.pend {
+                bank.store(0, Ordering::Release);
             }
-        }
+            for m in &self.mask {
+                m.store(0, Ordering::Release);
+            }
+            for slot in 0..2 {
+                self.rt_pending[slot].store(false, Ordering::Release);
+                self.rt_enable[slot].store(false, Ordering::Release);
+            }
+        });
+        self.schedule();
     }
 }
 
-impl BusDevice for HubPi {
+impl BusDevice for Pi {
     fn read64(&self, addr: u64) -> BusRead64 {
         BusRead64::ok(self.read(addr, true))
     }
     fn write64(&self, addr: u64, value: u64) -> u32 {
-        self.write(addr, value);
+        let _ = self.write(addr, value);
         BUS_OK
     }
 }

@@ -42,7 +42,7 @@
 //! Ported from hw/misc/sgi-sn0-module-management.c in
 //! jamesbraid/qemu-sgi-origami.
 
-use crate::dev::elsc::{Action, Build, Elsc, ElscConfig, ModuleOps};
+use crate::dev::elsc::{Action, Build, Elsc, ElscConfig, ModuleOps, ModuleOutput};
 use crate::dev::heart::Clock;
 use crate::dev::elsc_nvram::ElscNvram;
 use crate::dev::i2c::{BusBusy, I2cBus, I2cTarget, Service};
@@ -52,6 +52,7 @@ use crate::devlog::LogModule;
 use crate::dlog;
 use crate::traits::Resettable;
 use parking_lot::Mutex;
+use std::time::Duration;
 use std::sync::{Arc, Weak};
 
 /// One adapter per node board on a four-node module.
@@ -67,18 +68,6 @@ const SERVICE_PERIOD_NS: u64 = 1_000_000;
 const MESSAGE_LIFETIME_NS: u64 = 1_000_000_000;
 const PULSE_NS: u64 = 100_000_000;
 const RECOVERY_TICKS: u32 = 5000;
-
-/// What the module does to the rest of the machine, in the order it
-/// happened.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModuleEvent {
-    /// The module's reset line, high for the 100 ms of a pulse.
-    Reset(bool),
-    /// The module's NMI line, high for the 100 ms of a pulse.
-    Nmi(bool),
-    /// The module's power line.
-    Power(bool),
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModuleConfig {
@@ -141,7 +130,7 @@ struct State {
     /// The controller's queues need reinitialising, once the scheduler's lock
     /// is released: the controller takes its own lock for that.
     reinit: bool,
-    events: Vec<ModuleEvent>,
+    events: Vec<ModuleOutput>,
     /// The level each output line was last driven to; a line is only
     /// reported when it changes.
     reset_line: Option<bool>,
@@ -219,18 +208,22 @@ impl State {
     fn drive_power(&mut self) {
         if self.cfg.can_power && self.power_line != Some(self.power_on) {
             self.power_line = Some(self.power_on);
-            self.events.push(ModuleEvent::Power(self.power_on));
+            self.events.push(ModuleOutput::Power(self.power_on));
         }
     }
 
     fn drive_pulse(&mut self, reset: bool, nmi: bool) {
         if self.cfg.can_reset && self.reset_line != Some(reset) {
             self.reset_line = Some(reset);
-            self.events.push(ModuleEvent::Reset(reset));
+            // The line is high for the 100 ms of a pulse. A restart is asked
+            // for at the rising edge, and nothing waits for the fall.
+            if reset {
+                self.events.push(ModuleOutput::Reset);
+            }
         }
         if self.cfg.can_nmi && self.nmi_line != Some(nmi) {
             self.nmi_line = Some(nmi);
-            self.events.push(ModuleEvent::Nmi(nmi));
+            self.events.push(ModuleOutput::Nmi(nmi));
         }
     }
 
@@ -352,7 +345,7 @@ impl State {
 
     fn set_message(&mut self, processor: usize, pending: bool) {
         if processor >= PROCESSOR_CODES {
-            dlog!(LogModule::Bedrock, "o2000 module: message for processor {processor}, outside the eight published codes");
+            dlog!(LogModule::Module, "o2000 module: message for processor {processor}, outside the eight published codes");
             return;
         }
         if pending {
@@ -368,11 +361,11 @@ impl State {
 
     fn start_pulse(&mut self, nmi: bool) -> bool {
         if !(if nmi { self.cfg.can_nmi } else { self.cfg.can_reset }) {
-            dlog!(LogModule::Bedrock, "o2000 module: {} requested on a module that declares no such path", if nmi { "NMI" } else { "reset" });
+            dlog!(LogModule::Module, "o2000 module: {} requested on a module that declares no such path", if nmi { "NMI" } else { "reset" });
             return false;
         }
         if self.pulse_active {
-            dlog!(LogModule::Bedrock, "o2000 module: pulse requested during a {} pulse", if self.pulse_nmi { "NMI" } else { "reset" });
+            dlog!(LogModule::Module, "o2000 module: pulse requested during a {} pulse", if self.pulse_nmi { "NMI" } else { "reset" });
             return false;
         }
         self.pulse_active = true;
@@ -384,7 +377,7 @@ impl State {
 
     fn set_power(&mut self, on: bool) -> bool {
         if !self.cfg.can_power {
-            dlog!(LogModule::Bedrock, "o2000 module: power {} requested on a module that declares no power path", if on { "up" } else { "down" });
+            dlog!(LogModule::Module, "o2000 module: power {} requested on a module that declares no power path", if on { "up" } else { "down" });
             return false;
         }
         if !on {
@@ -411,13 +404,13 @@ impl State {
             Action::None => return false,
         };
         if !declared {
-            dlog!(LogModule::Bedrock, "o2000 module: destructive command refused, this module declares no {} path", if action == Action::Reset { "reset" } else { "power" });
+            dlog!(LogModule::Module, "o2000 module: destructive command refused, this module declares no {} path", if action == Action::Reset { "reset" } else { "power" });
             return false;
         }
         if self.pulse_active {
             // No source settles that overlap, so every destructive action is
             // refused for the duration of a pulse. A model choice.
-            dlog!(LogModule::Bedrock, "o2000 module: destructive command during a {} pulse", if self.pulse_nmi { "NMI" } else { "reset" });
+            dlog!(LogModule::Module, "o2000 module: destructive command during a {} pulse", if self.pulse_nmi { "NMI" } else { "reset" });
             return false;
         }
         true
@@ -493,7 +486,7 @@ impl ModuleOps for Link {
             Action::Cycle | Action::None => unreachable!("the controller never hands over {action:?}"),
         });
         if !done {
-            dlog!(LogModule::Bedrock, "o2000 module: an acknowledged action did not happen");
+            dlog!(LogModule::Module, "o2000 module: an acknowledged action did not happen");
         }
     }
 
@@ -512,7 +505,7 @@ impl ModuleOps for Link {
     fn console_owner(&self, processor: usize) {
         self.0.with(|s| {
             if processor >= PROCESSOR_CODES {
-                dlog!(LogModule::Bedrock, "o2000 module: console output from processor {processor}, outside the eight published codes");
+                dlog!(LogModule::Module, "o2000 module: console output from processor {processor}, outside the eight published codes");
             } else {
                 s.console_processor = processor;
             }
@@ -692,9 +685,31 @@ impl Origin2000Module {
 
     /// The reset, NMI and power lines' changes, in the order they happened,
     /// with time brought up to the present first.
-    pub fn take_events(&self) -> Vec<ModuleEvent> {
+    pub fn take_events(&self) -> Vec<ModuleOutput> {
         self.elsc.poll();
         self.shared.run(|s| std::mem::take(&mut s.events))
+    }
+
+    /// Call `wake` after any access that may have moved [`Self::next_due`];
+    /// see [`Elsc::set_wake`]. The module's own pulse starts only from an
+    /// action its controller hands it, so the controller's report covers it.
+    pub fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>) {
+        self.elsc.set_wake(wake);
+    }
+
+    /// How long until the module or its controller has an output to give, or
+    /// a committed action to run; zero if it is due now, `None` if nothing is
+    /// pending.
+    pub fn next_due(&self) -> Option<Duration> {
+        let (pulse_ends, queued) = {
+            let st = self.shared.state.lock();
+            (st.pulse_deadline, !st.events.is_empty())
+        };
+        if queued {
+            return Some(Duration::ZERO);
+        }
+        let pulse = pulse_ends.map(|d| Duration::from_nanos(d.saturating_sub((self.shared.clock)())));
+        [self.elsc.next_due(), pulse].into_iter().flatten().min()
     }
 
     /// Let time pass for the module and its controller when no guest is

@@ -43,8 +43,8 @@
 //!
 //! Ported from hw/misc/sgi-hub.c in jamesbraid/qemu-sgi-origami.
 
-use crate::dev::hub::{HubObserver, Store};
-use crate::dev::hub_pi::MODIFY_SET;
+use super::pi::MODIFY_SET;
+use super::Effect;
 use crate::devlog::LogModule;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_ERR, BUS_OK};
 use parking_lot::Mutex;
@@ -157,8 +157,8 @@ fn unimp(what: &str, off: u64, value: Option<u64>) {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct Bte {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Bte {
     length: u64,
     source: u64,
     dest: u64,
@@ -210,18 +210,14 @@ struct Windows {
     packets: OnceLock<Arc<dyn BusDevice>>,
 }
 
-pub struct HubIo {
+pub struct Io {
     widget_revision: u8,
     manufacturer: u16,
     state: Mutex<State>,
     windows: Arc<Windows>,
-    fabric: OnceLock<Weak<dyn NodeFabric>>,
-    /// The far end's reset input, where a warm reset from IIO_ILCSR goes.
-    reset_out: OnceLock<Arc<dyn Fn() + Send + Sync>>,
-    observer: OnceLock<Arc<dyn HubObserver>>,
 }
 
-impl HubIo {
+impl Io {
     /// `widget_revision` is the chip revision in bits 31:28 of the widget
     /// identification word and `manufacturer` its 11-bit manufacturer code.
     pub fn new(widget_revision: u8, manufacturer: u16) -> Self {
@@ -235,19 +231,7 @@ impl HubIo {
                 widgets: Default::default(),
                 packets: OnceLock::new(),
             }),
-            fabric: OnceLock::new(),
-            reset_out: OnceLock::new(),
-            observer: OnceLock::new(),
         }
-    }
-
-    /// Report stores to the scratch registers (see [`Store`]).
-    pub fn set_observer(&self, observer: Arc<dyn HubObserver>) {
-        let _ = self.observer.set(observer);
-    }
-
-    pub fn set_fabric(&self, fabric: Weak<dyn NodeFabric>) {
-        let _ = self.fabric.set(fabric);
     }
 
     /// Put `dev` at crossbar widget `widget` (0 to 15) of the XIO space the
@@ -263,10 +247,6 @@ impl HubIo {
         self.windows.packets.set(dev).unwrap_or_else(|_| panic!("the XIO packet face is taken"));
     }
 
-    /// Where a warm reset written to IIO_ILCSR goes.
-    pub fn connect_reset(&self, reset: Arc<dyn Fn() + Send + Sync>) {
-        let _ = self.reset_out.set(reset);
-    }
 
     /// The widget identification word.
     pub fn widget_id(&self) -> u64 {
@@ -367,7 +347,10 @@ impl HubIo {
         }
     }
 
-    pub fn write(&self, off: u64, value: u64) {
+    /// A store from the bus. A control write that launches a block-transfer
+    /// engine is returned for the Hub to run with [`Self::run_bte`], after this
+    /// unit's lock is released.
+    pub fn write(&self, off: u64, value: u64) -> Effect {
         if let Some(n) = Self::bwin_entry(off) {
             // Stored: OpenBSD's window allocator reads an entry straight back.
             let entry = value as u32 & BWIN_MASK;
@@ -375,15 +358,14 @@ impl HubIo {
             if entry & BWIN_IO_SPACE != 0 && (n != 0 || entry & 0x1f != 0) {
                 crate::dlog!(LogModule::Hub, "Hub IO: unsupported I/O big window {n}, entry {entry:#x}");
             }
-            return;
+            return Effect::None;
         }
         if let Some((engine, r)) = Self::bte_entry(off) {
-            self.bte_write(engine, r, value);
-            return;
+            return self.bte_write(engine, r, value);
         }
         if Self::icrb_c(off) {
             unimp("read-only incoming-request-buffer register", off, Some(value));
-            return;
+            return Effect::None;
         }
         let mut s = self.state.lock();
         match off {
@@ -406,10 +388,7 @@ impl HubIo {
                 s.link_status = (s.link_status & !LINK_WRITABLE) | (value & LINK_WRITABLE);
                 drop(s);
                 if value & LINK_WARM_RESET != 0 {
-                    match self.reset_out.get() {
-                        Some(reset) => reset(),
-                        None => crate::dlog!(LogModule::Hub, "Hub IO: warm reset with nothing at the far end of the XIO link"),
-                    }
+                    crate::dlog!(LogModule::Hub, "Hub IO: warm reset with nothing at the far end of the XIO link");
                 }
             }
             reg::LLP_LOG => {} // closing a sampling interval clears zero counts
@@ -418,10 +397,6 @@ impl HubIo {
             reg::SCRATCH_0 | reg::SCRATCH_1 => {
                 let index = ((off - reg::SCRATCH_0) / 8) as usize;
                 s.scratch[index] = value & SCRATCH_MASK;
-                drop(s);
-                if let Some(observer) = self.observer.get() {
-                    observer.stored(Store::IoScratch { index, value: value & SCRATCH_MASK });
-                }
             }
             reg::MISC_ENABLE => {
                 if value & MISC_PRECISE_CLEAR != 0 {
@@ -450,6 +425,7 @@ impl HubIo {
             reg::XTALK_PRESCALE => s.xtalk_prescale = value & PRESCALE_MASK,
             _ => unimp("unimplemented register", off, Some(value)),
         }
+        Effect::None
     }
 
     fn bte_address(engine: usize, what: &str, value: u64) -> u64 {
@@ -459,7 +435,7 @@ impl HubIo {
         value & BTE_ADDRESS_MASK
     }
 
-    fn bte_write(&self, engine: usize, r: u64, value: u64) {
+    fn bte_write(&self, engine: usize, r: u64, value: u64) -> Effect {
         let mut s = self.state.lock();
         let b = &mut s.bte[engine];
         match r {
@@ -471,23 +447,18 @@ impl HubIo {
                 b.control = value & BTE_CONTROL_MASK;
                 // Launches if armed; busy clear does nothing.
                 if b.length & BTE_BUSY != 0 {
-                    let launch = *b;
-                    drop(s);
-                    self.bte_launch(engine, launch);
+                    return Effect::Bte(engine, *b);
                 }
             }
             bte::NOTIFY => b.notify = Self::bte_address(engine, "notification", value),
             _ => b.interrupt = value & (BTE_INT_LEVEL_MASK | BTE_INT_NODE_MASK),
         }
+        Effect::None
     }
 
-    /// Run the armed transfer through the node fabric, outside the state lock.
-    fn bte_launch(&self, engine: usize, b: Bte) {
-        let Some(fabric) = self.fabric.get().and_then(Weak::upgrade) else {
-            crate::dlog!(LogModule::Hub, "Hub IO: BTE{engine} launched with no fabric");
-            self.state.lock().bte[engine].length = BTE_BUSY | BTE_ERROR | (b.length & BTE_LINES);
-            return;
-        };
+    /// Run the transfer a control write launched through the node `fabric`,
+    /// outside every unit lock.
+    pub fn run_bte(&self, engine: usize, b: Bte, fabric: &dyn NodeFabric) {
         let lines = b.length & BTE_LINES;
         if b.control & BTE_POISON != 0 {
             crate::dlog!(LogModule::Hub, "Hub IO: BTE{engine} launched in poison mode; the copy runs but no directory state is poisoned");
@@ -553,14 +524,14 @@ impl HubIo {
     }
 }
 
-impl HubIo {
+impl Io {
     /// Whether the register state is locked now, for the `locks` monitor command.
     pub fn is_locked(&self) -> bool {
         self.state.is_locked()
     }
 }
 
-impl Resettable for HubIo {
+impl Resettable for Io {
     fn power_on(&self) {
         *self.state.lock() = State::new();
         // Entries reset to zero with the windows enabled: a guest calls a zero
@@ -571,12 +542,12 @@ impl Resettable for HubIo {
     }
 }
 
-impl BusDevice for HubIo {
+impl BusDevice for Io {
     fn read64(&self, addr: u64) -> BusRead64 {
         BusRead64::ok(self.read(addr))
     }
     fn write64(&self, addr: u64, value: u64) -> u32 {
-        self.write(addr, value);
+        let _ = self.write(addr, value);
         BUS_OK
     }
 }

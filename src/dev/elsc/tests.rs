@@ -138,7 +138,7 @@ impl Rig {
         self.clock.advance_secs(s);
     }
 
-    fn events(&self) -> Vec<ElscEvent> {
+    fn events(&self) -> Vec<ModuleOutput> {
         self.elsc.take_events()
     }
 
@@ -377,15 +377,15 @@ pub(crate) fn text(resp: &[u8]) -> String {
     String::from_utf8_lossy(&resp[1..1 + resp[0] as usize]).into_owned()
 }
 
-fn power_events(events: &[ElscEvent]) -> Vec<bool> {
+fn power_events(events: &[ModuleOutput]) -> Vec<bool> {
     events
         .iter()
-        .filter_map(|e| if let ElscEvent::Power(on) = e { Some(*on) } else { None })
+        .filter_map(|e| if let ModuleOutput::Power(on) = e { Some(*on) } else { None })
         .collect()
 }
 
-fn count_nmi(events: &[ElscEvent]) -> usize {
-    events.iter().filter(|e| **e == ElscEvent::Nmi(true)).count()
+fn count_nmi(events: &[ModuleOutput]) -> usize {
+    events.iter().filter(|e| **e == ModuleOutput::Nmi(true)).count()
 }
 
 // ---- framing and the request grammar -------------------------------------
@@ -498,7 +498,7 @@ fn no_supervisor_on_i2c() {
     // A destructive command with no "pas" ever sent.
     rig.assert_reply("rst", "ok ");
     rig.step_secs(1);
-    assert!(rig.events().contains(&ElscEvent::Reset));
+    assert!(rig.events().contains(&ModuleOutput::Reset));
 }
 
 // ---- arbitration -----------------------------------------------------------
@@ -1143,7 +1143,7 @@ fn hbt_is_stopped_only_by_clr_or_zero() {
     rig.step_secs(1);
     rig.assert_reply("rst", "ok ");
     rig.step_secs(1);
-    assert!(rig.events().contains(&ElscEvent::Reset));
+    assert!(rig.events().contains(&ModuleOutput::Reset));
     rig.module_reset();
     rig.clock.advance_ms(7999);
     rig.elsc.poll();
@@ -1163,7 +1163,7 @@ fn rst_resets_the_module_not_the_controller() {
     rig.assert_reply("tas A", "ok 0");
     rig.assert_reply("rst", "ok ");
     rig.step_secs(1);
-    assert!(rig.events().contains(&ElscEvent::Reset));
+    assert!(rig.events().contains(&ModuleOutput::Reset));
     rig.module_reset();
     // It freed the lock the controller was holding.
     rig.assert_reply("tas B", "ok 0");
@@ -1176,7 +1176,7 @@ fn rst_waits_for_the_ack_to_be_read() {
     rig.request_without_read("rst");
     rig.step_secs(5);
     rig.elsc.poll();
-    assert!(!rig.events().contains(&ElscEvent::Reset));
+    assert!(!rig.events().contains(&ModuleOutput::Reset));
 
     // The ack survives to be fetched in a separate read transaction.
     let resp = rig.read_response();
@@ -1185,7 +1185,7 @@ fn rst_waits_for_the_ack_to_be_read() {
     assert_eq!(text(&resp), "ok ");
     // Only now, once the ack has been read, does the reset wait begin.
     rig.step_secs(1);
-    assert!(rig.events().contains(&ElscEvent::Reset));
+    assert!(rig.events().contains(&ModuleOutput::Reset));
 }
 
 #[test]
@@ -1198,7 +1198,7 @@ fn rst_is_dropped_when_its_ack_is_superseded_unread() {
     // No reset ran: the lock is still held.
     rig.step_secs(5);
     rig.assert_reply("tas B", "ok A");
-    assert!(!rig.events().contains(&ElscEvent::Reset));
+    assert!(!rig.events().contains(&ModuleOutput::Reset));
 }
 
 #[test]
@@ -1212,7 +1212,7 @@ fn rst_fires_without_a_stop() {
     assert_eq!(text(&resp), "ok ");
     // Reading the last ack byte committed the reset.
     rig.step_secs(1);
-    assert!(rig.events().contains(&ElscEvent::Reset));
+    assert!(rig.events().contains(&ModuleOutput::Reset));
 }
 
 #[test]
@@ -1237,7 +1237,7 @@ fn rst_survives_a_nack_on_the_last_text_byte() {
     rig.w(CTRL, ctl::ESO | ctl::STA | ctl::ACK);
     rig.w(DATA, (ELSC_ADDR << 1) | 1);
     rig.step_secs(1);
-    assert!(rig.events().contains(&ElscEvent::Reset));
+    assert!(rig.events().contains(&ModuleOutput::Reset));
 }
 
 #[test]
@@ -1249,7 +1249,7 @@ fn rst_releases_the_i2c_bus() {
     let resp = rig.read_frame(false);
     assert_eq!(text(&resp), "ok ");
     rig.step_secs(1);
-    assert!(rig.events().contains(&ElscEvent::Reset));
+    assert!(rig.events().contains(&ModuleOutput::Reset));
     rig.module_reset();
 
     // Re-enable and read identity-NVRAM page 7, offset 0, directly. With the
@@ -1296,7 +1296,7 @@ fn rst_waits_one_second_and_a_second_rst_restarts_the_wait() {
     rig.assert_reply("tas", "ok A");
     rig.step_ms(1);
     rig.elsc.poll();
-    assert!(rig.events().contains(&ElscEvent::Reset));
+    assert!(rig.events().contains(&ModuleOutput::Reset));
     rig.module_reset();
     rig.assert_reply("tas", "ok 0");
     // The controller rides through the reset it caused.
@@ -1330,7 +1330,7 @@ fn a_power_cycle_inside_the_rst_wait_does_not_cancel_it() {
     rig.assert_reply("tas", "ok A");
     rig.step_ms(1);
     rig.elsc.poll();
-    assert!(rig.events().contains(&ElscEvent::Reset));
+    assert!(rig.events().contains(&ModuleOutput::Reset));
 }
 
 #[test]
@@ -1564,6 +1564,70 @@ fn pwr_d_posts_pd_remote_to_the_hubs() {
     rig.assert_reply("clr", "ok ");
 }
 
+/// The controller says when it next has an output to give, and not for the
+/// grant ring's ticks: an idle controller is never due, a pending NMI is due
+/// when its wait ends and its pulse when that ends, and a power-down
+/// countdown is due when it runs out.
+#[test]
+fn the_controller_reports_when_it_is_next_due() {
+    let ms = Duration::from_millis;
+    let rig = Rig::new();
+    assert_eq!(rig.elsc.next_due(), None, "the ring ticks, but nothing is due");
+    rig.assert_reply("nmi", "ok ");
+    assert_eq!(rig.elsc.next_due(), Some(ms(1000)));
+    rig.step_ms(400);
+    assert_eq!(rig.elsc.next_due(), Some(ms(600)));
+    rig.step_ms(600);
+    assert_eq!(rig.elsc.next_due(), Some(ms(0)), "due now");
+    rig.elsc.poll();
+    assert_eq!(rig.events(), [ModuleOutput::Nmi(true)]);
+    assert_eq!(rig.elsc.next_due(), Some(ms(100)), "the pulse ends");
+    rig.step_ms(100);
+    rig.elsc.poll();
+    assert_eq!(rig.events(), [ModuleOutput::Nmi(false)]);
+    assert_eq!(rig.elsc.next_due(), None);
+
+    rig.assert_reply("pwr d 3", "ok ");
+    let countdown = rig.elsc.next_due().expect("a power-down is counting down");
+    assert!(countdown > ms(2900) && countdown <= ms(3000), "{countdown:?}");
+    rig.step_secs(3);
+    rig.elsc.poll();
+    assert_eq!(power_events(&rig.events()), [false]);
+}
+
+/// A bus access that passes a deadline before the machine's visit queues the
+/// output itself and clears the timer. The controller stays due until the
+/// outputs are taken, or the power-off, reset or NMI would wait for the next
+/// unrelated access.
+#[test]
+fn an_access_that_beats_the_visit_leaves_its_outputs_due() {
+    let rig = Rig::new();
+    rig.assert_reply("nmi", "ok ");
+    rig.step_ms(1100);
+    rig.assert_reply("ver", "ok V 3.1S  ");
+    assert_eq!(rig.elsc.next_due(), Some(Duration::ZERO), "the queued outputs are due now");
+    assert_eq!(rig.events(), [ModuleOutput::Nmi(true), ModuleOutput::Nmi(false)]);
+    assert_eq!(rig.elsc.next_due(), None, "taken, so nothing is due");
+}
+
+/// An access that moves the schedule wakes the machine, and one that leaves
+/// it alone does not.
+#[test]
+fn an_access_wakes_the_machine_only_when_the_schedule_moved() {
+    let rig = Rig::new();
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let w = woken.clone();
+    rig.elsc.set_wake(Box::new(move || {
+        w.fetch_add(1, Ordering::SeqCst);
+    }));
+    rig.assert_reply("ver", "ok V 3.1S  ");
+    let after_first = woken.load(Ordering::SeqCst);
+    rig.assert_reply("ver", "ok V 3.1S  ");
+    assert_eq!(woken.load(Ordering::SeqCst), after_first, "a query changes nothing");
+    rig.assert_reply("nmi", "ok ");
+    assert!(woken.load(Ordering::SeqCst) > after_first, "an NMI request arms a timer");
+}
+
 #[test]
 fn nmi_pulses_after_one_second_for_100_ms_and_frees_the_lock() {
     let rig = Rig::new();
@@ -1575,14 +1639,14 @@ fn nmi_pulses_after_one_second_for_100_ms_and_frees_the_lock() {
     assert_eq!(count_nmi(&rig.events()), 0);
     rig.step_ms(1);
     rig.elsc.poll();
-    assert_eq!(rig.events(), [ElscEvent::Nmi(true)]);
+    assert_eq!(rig.events(), [ModuleOutput::Nmi(true)]);
     rig.assert_reply("tas", "ok A");
     rig.clock.advance_ms(99);
     rig.elsc.poll();
     assert!(rig.events().is_empty());
     rig.step_ms(1);
     rig.elsc.poll();
-    assert_eq!(rig.events(), [ElscEvent::Nmi(false)]);
+    assert_eq!(rig.events(), [ModuleOutput::Nmi(false)]);
     rig.assert_reply("tas", "ok 0");
 
     // A power cycle inside the wait does not cancel it, but the pulse then
@@ -1785,7 +1849,7 @@ fn a_serial_reset_runs_once_its_reply_is_printed() {
     let out = rig.aux.take();
     assert!(out.ends_with("\x14ok\r\n\x14\r\nMSC: rst\x14\r"), "{out:?}");
     rig.step_secs(1);
-    assert!(rig.events().contains(&ElscEvent::Reset));
+    assert!(rig.events().contains(&ModuleOutput::Reset));
 }
 
 #[test]

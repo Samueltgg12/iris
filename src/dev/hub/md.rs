@@ -2,8 +2,9 @@
 //! error and DIMM registers, the one-wire master that reads the node's board
 //! record, the slot identity and the diagnostic indicators.
 //!
-//! Offsets are from the base of the Hub window. The node's I2C controller and
-//! the bring-up UART are mapped over this block by the shell, and are not here.
+//! Offsets are from the base of the Hub window. The node's I2C controller is
+//! mapped over this block by the shell, and is not here. The bring-up UART
+//! after it is not modelled.
 //!
 //! # What is approximated here
 //!
@@ -46,7 +47,7 @@ pub mod reg {
     pub const MLAN_CTL: u64 = 0x20_00a8;
     pub const PERF_CNT0: u64 = 0x21_0010;
     /// The I2C controller's S0 and S1, mapped over the Hub window by the
-    /// shell, and the bring-up UART after them.
+    /// shell. The bring-up UART's registers follow them.
     pub const I2C_BASE: u64 = 0x22_0000;
     pub const SLOTID_USTAT: u64 = 0x22_0048;
     pub const LED0: u64 = 0x22_0050;
@@ -107,7 +108,7 @@ impl State {
     }
 }
 
-pub struct HubMd {
+pub struct Md {
     clock: Clock,
     signals: SlotSignals,
     state: Mutex<State>,
@@ -120,7 +121,7 @@ fn unimp(what: &str, off: u64, value: Option<u64>) {
     }
 }
 
-impl HubMd {
+impl Md {
     pub fn new(clock: Clock, signals: SlotSignals) -> Self {
         Self { clock, signals, state: Mutex::new(State::new(None)) }
     }
@@ -203,14 +204,14 @@ impl HubMd {
     }
 }
 
-impl HubMd {
+impl Md {
     /// Whether the register state is locked now, for the `locks` monitor command.
     pub fn is_locked(&self) -> bool {
         self.state.is_locked()
     }
 }
 
-impl Resettable for HubMd {
+impl Resettable for Md {
     /// A slot started before reset must not complete after it.
     fn power_on(&self) {
         let mut s = self.state.lock();
@@ -223,7 +224,7 @@ impl Resettable for HubMd {
     }
 }
 
-impl BusDevice for HubMd {
+impl BusDevice for Md {
     fn read64(&self, addr: u64) -> BusRead64 {
         BusRead64::ok(self.read(addr))
     }

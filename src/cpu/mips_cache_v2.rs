@@ -723,6 +723,16 @@ pub trait MipsCache: Send + Sync {
     unsafe fn set_cached_view(&self, _sp: *const crate::ppmem::PpMemSpace, _view: usize) {}
     /// The ppmem window's `window_shift`, when it is not the 4GB window's.
     fn set_tcache_shift(&self, _shift: u32) {}
+    /// tcache: the window's fine table (`PpMemSpace::fine_table`), which the
+    /// cache tests on a miss in the region bitmap before taking the bus.
+    /// Default no-op: such a cache takes the bus.
+    ///
+    /// # Safety
+    /// `table` must hold `regions` bits and outlive this cache.
+    unsafe fn set_tcache_fine(&self, _table: *const std::sync::atomic::AtomicU64, _regions: u64) {}
+    /// tcache: pointer to this cache's key for the window pointers it keeps,
+    /// for `PpMemSpace::add_key_sink`. Null when it keeps none.
+    fn tcache_key_ptr(&self) -> *mut u64 { std::ptr::null_mut() }
 
     /// Whether `fetch` of cacheable RAM only reads: no line fill, no LRU or
     /// tag change, no exception. Then a caller that does not need the
@@ -1460,7 +1470,7 @@ pub struct CpuCache<
     /// `PpMemSpace`. Zero until a window is attached, which reads as "nothing
     /// is directly mapped" and sends every access to the bus.
     #[cfg(feature = "tcache")]
-    tc_bitmap: UnsafeCell<u64>,
+    tc_bitmap: AtomicU64,
     /// tcache + jitv2: base of ppmem's generation window, one `AtomicU64` per
     /// 4KB page (`gen_base + (phys >> 12)`).
     ///
@@ -1691,7 +1701,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             #[cfg(feature = "tcache")]
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
             #[cfg(feature = "tcache")]
-            tc_bitmap: UnsafeCell::new(0),
+            tc_bitmap: AtomicU64::new(0),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
             #[cfg(feature = "r5ksc_triton")]
@@ -1850,7 +1860,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// `MappedMemory::set_bitmap_sink2` to publish through on every remap.
     #[cfg(feature = "tcache")]
     pub fn tc_bitmap_ptr(&self) -> *mut u64 {
-        self.tc_bitmap.get()
+        self.tc_bitmap.as_ptr()
     }
 
     /// tcache + jitv2: hand the cache ppmem's generation-window base so window
@@ -1918,7 +1928,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         {
             TC_PROBES.fetch_add(1, Ordering::Relaxed);
         }
-        let hit = crate::ppmem::bitmap_maps(unsafe { *self.tc_bitmap.get() }, phys_addr);
+        let hit = crate::ppmem::bitmap_maps(self.tc_bitmap.load(Ordering::Relaxed), phys_addr);
         #[cfg(feature = "developer")]
         if hit {
             TC_HITS.fetch_add(1, Ordering::Relaxed);

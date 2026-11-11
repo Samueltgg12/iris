@@ -12,7 +12,7 @@
 //!
 //! The controller is an I2C target at seven-bit address 0x08 on the Hub's
 //! bus, next to its [`ElscNvram`]. The module's power, reset and NMI are
-//! outputs, reported as [`ElscEvent`]s the machine drains with
+//! outputs, reported as [`ModuleOutput`]s the machine drains with
 //! [`Elsc::take_events`].
 //!
 //! No specification of the controller's protocol, firmware or microcontroller
@@ -58,7 +58,8 @@ use crate::traits::Resettable;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 /// Seven-bit I2C address the controller answers at.
 pub const I2C_ADDR: u8 = 0x08;
@@ -94,15 +95,18 @@ const ARB_POSITIONS: u32 = 5;
 const SIGNAL_BASE: u8 = 0xe0;
 const NS_PER_MS: u64 = 1_000_000;
 
-/// What the controller does to its module and to the processors.
+/// What a module controller does to its module and to the processors. The
+/// Origin 200's [`Elsc`] and the Origin 2000 module's controller
+/// ([`crate::dev::o2000_module`]) both emit it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ElscEvent {
+pub enum ModuleOutput {
     /// Module power output: low as the module loses power, high as it
     /// returns. A power-down is repeated when the controller learns that a
     /// pending power-up was cancelled, so the machine asks again whether
     /// anything is left to bring a module back.
     Power(bool),
-    /// A pulse on the module's reset line (instantaneous in the model).
+    /// A pulse on the module's reset line (instantaneous in the model; a
+    /// controller that holds the line for a while reports its rising edge).
     Reset,
     /// The NMI output, high for the 100 ms of a pulse.
     Nmi(bool),
@@ -526,8 +530,11 @@ struct State {
 
     /// Bytes for the AUX port, sent once the lock is released.
     out: Vec<u8>,
-    events: Vec<ElscEvent>,
+    events: Vec<ModuleOutput>,
     release_bus: bool,
+    /// What [`Self::due`] said when the machine was last told it might have
+    /// moved; `None` before the first report.
+    reported_due: Option<Option<u64>>,
 }
 
 impl State {
@@ -592,6 +599,7 @@ impl State {
             out: Vec::new(),
             events: Vec::new(),
             release_bus: false,
+            reported_due: None,
         }
     }
 
@@ -607,6 +615,23 @@ impl State {
 
     fn pending(&self, timer: usize) -> bool {
         self.deadlines[timer].is_some()
+    }
+
+    /// When the controller next has something to tell its machine, in the
+    /// clock's nanoseconds: a destructive action committed and waiting to
+    /// run, an output already queued that nobody has taken, or a timer that
+    /// ends in one of the module's outputs. The queue counts because a bus
+    /// access can pass a deadline before the machine's visit and queue the
+    /// output itself, which leaves no timer behind to wake the machine for.
+    /// The grant ring's tick and a message's expiry change only what a bus
+    /// access sees, and the access that sees it replays them first, so they
+    /// are not due.
+    fn due(&self) -> Option<u64> {
+        if self.deferred_scheduled || !self.events.is_empty() {
+            return Some(self.now);
+        }
+        const OUTPUT_TIMERS: [usize; 7] = [T_PWR_DOWN, T_RST, T_NMI, T_NMI_PULSE, T_HBT, T_POWER_UP, T_START];
+        OUTPUT_TIMERS.iter().filter_map(|&t| self.deadlines[t]).min()
     }
 
     fn cancel(&mut self, timer: usize) {
@@ -645,7 +670,7 @@ impl State {
             T_NMI => self.pulse_nmi(),
             T_NMI_PULSE => {
                 self.nmi_pulse_active = false;
-                self.events.push(ElscEvent::Nmi(false));
+                self.events.push(ModuleOutput::Nmi(false));
                 self.tas_lock = TAS_FREE;
                 self.reinitialize();
             }
@@ -753,7 +778,7 @@ impl State {
     /// whether anything is left to power a module up.
     fn recheck_shutdown(&mut self) {
         if !self.powered() && self.module.is_none() {
-            self.events.push(ElscEvent::Power(false));
+            self.events.push(ModuleOutput::Power(false));
         }
     }
 
@@ -820,7 +845,7 @@ impl State {
         self.module_off = true;
         self.reinitialize();
         self.release_bus = true;
-        self.events.push(ElscEvent::Power(false));
+        self.events.push(ModuleOutput::Power(false));
     }
 
     fn power_up_complete(&mut self, announce: bool) {
@@ -834,7 +859,7 @@ impl State {
             return;
         }
         self.module_off = false;
-        self.events.push(ElscEvent::Power(true));
+        self.events.push(ModuleOutput::Power(true));
     }
 
     fn power_up_expired(&mut self) {
@@ -878,7 +903,7 @@ impl State {
         // committed fires instead and the shutdown is lost.
         if self.deferred_committed {
             dlog!(
-                LogModule::Bedrock,
+                LogModule::Module,
                 "elsc: \"pwr d\" countdown expired while a {} is committed; that action fires instead",
                 self.deferred_action.name()
             );
@@ -900,18 +925,18 @@ impl State {
             // The module drives the pulse itself and frees the lock as it
             // starts.
             if !m.nmi() {
-                dlog!(LogModule::Bedrock, "elsc: the module could not pulse its NMI output");
+                dlog!(LogModule::Module, "elsc: the module could not pulse its NMI output");
                 return;
             }
             self.tas_lock = TAS_FREE;
             return;
         }
         if self.nmi_pulse_active {
-            dlog!(LogModule::Bedrock, "elsc: NMI requested during an NMI pulse");
+            dlog!(LogModule::Module, "elsc: NMI requested during an NMI pulse");
             return;
         }
         self.nmi_pulse_active = true;
-        self.events.push(ElscEvent::Nmi(true));
+        self.events.push(ModuleOutput::Nmi(true));
         self.arm_ms(T_NMI_PULSE, NMI_PULSE_MS);
     }
 
@@ -919,14 +944,14 @@ impl State {
         self.tas_lock = TAS_FREE;
         if self.module.is_some() {
             if !self.can_execute(Action::Reset) {
-                dlog!(LogModule::Bedrock, "elsc: the module refused the reset an acknowledged \"rst\" asked for");
+                dlog!(LogModule::Module, "elsc: the module refused the reset an acknowledged \"rst\" asked for");
                 return;
             }
             self.outbox.push(Action::Reset);
             return;
         }
         self.release_bus = true;
-        self.events.push(ElscEvent::Reset);
+        self.events.push(ModuleOutput::Reset);
     }
 
     fn hbt_arm(&mut self, seconds: u64) {
@@ -967,7 +992,7 @@ impl State {
                     // running; the cycle follows once it has ended.
                     self.arm_ms(T_HBT, NMI_PULSE_MS);
                 } else {
-                    dlog!(LogModule::Bedrock, "elsc: the heartbeat watchdog's power cycle cannot run on this module");
+                    dlog!(LogModule::Module, "elsc: the heartbeat watchdog's power cycle cannot run on this module");
                     self.hbt_stage = Heartbeat::Idle;
                 }
             }
@@ -1118,7 +1143,7 @@ impl State {
             self.deferred_action = action;
         } else {
             dlog!(
-                LogModule::Bedrock,
+                LogModule::Module,
                 "elsc: \"{command}\" while a {} is already committed; that action fires and this \"ok\" may not match it",
                 self.deferred_action.name()
             );
@@ -1503,7 +1528,7 @@ impl State {
     fn log_unimp_once(&mut self, bit: u8, what: &str) {
         if self.unimp_logged & bit == 0 {
             self.unimp_logged |= bit;
-            dlog!(LogModule::Bedrock, "elsc: {what}");
+            dlog!(LogModule::Module, "elsc: {what}");
         }
     }
 
@@ -1694,7 +1719,7 @@ impl State {
             }
             if self.cfg.master && (c == b'o' || (0x04..=0x06).contains(&c)) {
                 dlog!(
-                    LogModule::Bedrock,
+                    LogModule::Module,
                     "elsc: \"sla\" report {c:#04x} from a slave controller; the shutdown or fan report it starts is not modelled"
                 );
             }
@@ -2158,7 +2183,7 @@ impl State {
         self.cancel(T_NMI_PULSE);
         if self.nmi_pulse_active {
             self.nmi_pulse_active = false;
-            self.events.push(ElscEvent::Nmi(false));
+            self.events.push(ModuleOutput::Nmi(false));
         }
         self.hbt_stop();
         self.hbt_delay = 0;
@@ -2310,6 +2335,9 @@ pub struct Elsc {
     state: Mutex<State>,
     clock: Clock,
     backend: Mutex<Arc<dyn SerialBackend>>,
+    /// Told, with no controller lock held, that [`Self::next_due`] may have
+    /// moved.
+    wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl Elsc {
@@ -2320,7 +2348,24 @@ impl Elsc {
             state: Mutex::new(State::new(cfg, nvram, busy)),
             clock,
             backend: Mutex::new(null_serial_backend()),
+            wake: OnceLock::new(),
         }
+    }
+
+    /// Call `wake` after any access that may have moved [`Self::next_due`]:
+    /// one that changed it, or one that handed the module an action to carry
+    /// out. Once, before the machine runs.
+    pub fn set_wake(&self, wake: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.wake.set(wake);
+    }
+
+    /// How long until the controller next has an output to give, or a
+    /// committed action to run: zero if it is due now, `None` if nothing is
+    /// pending. A machine that has no bus access to piggy-back on visits the
+    /// controller (`take_events`) when this says to.
+    pub fn next_due(&self) -> Option<Duration> {
+        let due = self.state.lock().due()?;
+        Some(Duration::from_nanos(due.saturating_sub((self.clock)())))
     }
 
     /// Attach the module that owns this controller's power, reset and bus
@@ -2357,12 +2402,16 @@ impl Elsc {
     /// Run `f` with the timers brought up to the present, then send what it
     /// wrote to the AUX port with the lock released.
     fn run<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        let (value, out, actions, module) = {
+        let (value, out, actions, module, moved) = {
             let mut st = self.state.lock();
             st.advance((self.clock)());
             let value = f(&mut st);
-            (value, std::mem::take(&mut st.out), std::mem::take(&mut st.outbox), st.module.clone())
+            let due = st.due();
+            let moved = st.reported_due != Some(due);
+            st.reported_due = Some(due);
+            (value, std::mem::take(&mut st.out), std::mem::take(&mut st.outbox), st.module.clone(), moved)
         };
+        let acted = !actions.is_empty();
         // What the module does reaches back into the controller, so it runs
         // with the lock released.
         if let Some(m) = module {
@@ -2374,6 +2423,11 @@ impl Elsc {
             let backend = self.backend.lock().clone();
             for byte in out {
                 backend.send_byte(byte);
+            }
+        }
+        if moved || acted {
+            if let Some(wake) = self.wake.get() {
+                wake();
             }
         }
         value
@@ -2402,7 +2456,7 @@ impl Elsc {
 
     /// The module-power, reset and NMI outputs, in the order they happened,
     /// with time brought up to the present first.
-    pub fn take_events(&self) -> Vec<ElscEvent> {
+    pub fn take_events(&self) -> Vec<ModuleOutput> {
         self.run(|st| {
             if st.deferred_scheduled {
                 st.run_committed_action();
@@ -2472,7 +2526,7 @@ impl I2cTarget for Elsc {
     fn send(&self, byte: u8) -> bool {
         self.run(|st| {
             if st.rx.len() > MAX_FRAME {
-                dlog!(LogModule::Bedrock, "elsc: request longer than the protocol allows, byte dropped");
+                dlog!(LogModule::Module, "elsc: request longer than the protocol allows, byte dropped");
             } else {
                 st.rx.push(byte);
             }
