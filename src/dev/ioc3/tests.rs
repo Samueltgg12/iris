@@ -6,12 +6,39 @@
 //! Ported from tests/qtest/octane-test.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
+use super::kbd::*;
+use super::parallel::*;
+use super::serial::*;
+use super::superio::*;
+use std::collections::VecDeque;
 use std::sync::Mutex;
+use crate::dev::ds1685::{Ds1685, NVRAM_OFF_NV};
+use crate::pci::PciDmaStatus;
 use crate::irq::LevelProbe;
 use crate::traits::MachineEvent;
 use crate::pci::PciFunction;
+use crate::dev::ng1::rex3::Rex3;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAC: [u8; 6] = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
+
+impl Ioc3 {
+    fn predivider(&self, p: usize) -> u8 {
+        self.sh.sio.as_ref().unwrap().uart(p, |u| u.predivider)
+    }
+
+    fn baudbase(&self, p: usize) -> u32 {
+        self.sh.sio.as_ref().unwrap().uart(p, |u| u.core.baudbase())
+    }
+
+    fn rtc(&self) -> &Arc<Ds1685> {
+        self.sh.rtc.as_ref().unwrap()
+    }
+
+    fn rx_pending(&self, p: usize) -> usize {
+        self.sh.sio.as_ref().unwrap().uart(p, |u| u.core.rx_pending())
+    }
+}
 
 /// A sink for a serial line: what the guest sent, and what the host types.
 #[derive(Default)]
@@ -64,6 +91,11 @@ impl PciDma for TestMem {
     }
 }
 
+/// The Octane's IOC3, as the machine builds it but for the records.
+fn octane() -> Ioc3 {
+    Ioc3::new(&IP30, MAC, ByteBus::Ds1685(Ds1685::new(None)))
+}
+
 struct Rig {
     c: Ioc3,
     mem: Arc<TestMem>,
@@ -73,7 +105,7 @@ struct Rig {
 
 impl Rig {
     fn new() -> Rig {
-        Rig::with(Ioc3::octane(MAC, false))
+        Rig::with(octane())
     }
 
     fn with(c: Ioc3) -> Rig {
@@ -128,6 +160,50 @@ fn identity_and_bar() {
     assert_eq!(cfg.interrupt_pin(), PCI_INTA);
     cfg.write(4, 0xffff_ffff);
     assert_eq!(cfg.read(4), 0xfff0_0000, "one megabyte of memory space");
+}
+
+/// A row of the board table builds a chip with the identity, the children
+/// and the GPIO straps the row names, and nothing else.
+#[test]
+fn each_board_reads_back_as_its_row_says() {
+    for board in [&IP30, &IP29, &BASEIO, &BASEIO6G, &IP34, &IP34_NO_PS2, &MIO] {
+        let bus = match board.cells.byte_bus {
+            ByteBusPart::None => ByteBus::None,
+            ByteBusPart::Ds1685 => ByteBus::Ds1685(Ds1685::new(None)),
+            ByteBusPart::M48t35 => {
+                ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap()))
+            }
+        };
+        let r = Rig::with(Ioc3::new(board, MAC, bus));
+        let name = board.name;
+        assert_eq!(r.c.state().config().read(11), (board.subsystem_id as u32) << 16 | VENDOR_ID as u32, "{name}");
+        // A child that is fitted keeps what is written to it; one that is
+        // not reads zero.
+        let keeps = |a: u32, v: u32, mask: u32| {
+            r.w32(a, v);
+            r.r32(a) & mask == v & mask
+        };
+        assert_eq!(r.c.sh.serial.iter().all(|s| s.is_some()), board.cells.serial, "{name}: serial");
+        r.w8(reg::SERIAL_A + 7, 0x5a);
+        assert_eq!(r.r8(reg::SERIAL_A + 7) == 0x5a, board.cells.serial, "{name}: UART");
+        assert_eq!(keeps(0x9c, 0x1234, 0xffff), board.cells.kbd, "{name}: keyboard");
+        assert_eq!(keeps(0x80, 0x55, u32::MAX), board.cells.parallel, "{name}: parallel");
+        assert_eq!(keeps(0xf8, 0x3, 0x3), board.cells.eth, "{name}: Ethernet");
+        assert_eq!(r.c.eth().is_some(), board.cells.eth);
+        // The one-wire master is the chip's: a slot always finishes. Whether a
+        // part answers the reset with presence is the board's.
+        r.w32(reg::PIN_CONTROL_SET, 1 << 21);
+        r.w32(reg::MICROLAN, (500 << 10) | (13 << 2));
+        let v = r.r32(reg::MICROLAN);
+        assert_eq!(v & 2, 2, "{name}: the slot finishes");
+        assert_eq!(v & 1 == 0, board.cells.w1, "{name}: presence");
+        let straps: u32 = board.gpio.iter().map(|w| matches!(w.to, PinUse::Strap(true)) as u32 * (1 << w.pin)).sum();
+        assert_eq!(r.r32(reg::PIN_DATA), straps, "{name}: straps");
+        let rtc = board.cells.byte_bus == ByteBusPart::Ds1685;
+        r.w8(reg::BYTEBUS_DEV1, 0x40);
+        r.w8(reg::BYTEBUS_DEV2, 0x55);
+        assert_eq!(r.r8(reg::BYTEBUS_DEV2) == 0x55, rtc, "{name}: DS1685");
+    }
 }
 
 /// The reference Octane2's PROM monitor reads the chip's type 0
@@ -250,11 +326,11 @@ fn the_scratch_register_programs_the_predivider_under_dlab() {
     r.w8(reg::SERIAL_A + 3, 0x80);
     r.w8(reg::SERIAL_A + 7, 6);
     assert_eq!(r.r8(reg::SERIAL_A + 7), 6, "reads back what was written");
-    assert_eq!(r.c.sh.st.lock().uart[0].predivider, 6);
-    assert_eq!(r.c.sh.st.lock().uart[0].core.baudbase(), 22_118_400 / 3 / 16, "the divisor's clock follows it");
+    assert_eq!(r.c.predivider(0), 6);
+    assert_eq!(r.c.baudbase(0), 22_118_400 / 3 / 16, "the divisor's clock follows it");
     // Written 0 or 1 means nothing.
     r.w8(reg::SERIAL_A + 7, 1);
-    assert_eq!(r.c.sh.st.lock().uart[0].predivider, 6);
+    assert_eq!(r.c.predivider(0), 6);
 }
 
 /// A serial pass-through bit follows the 16550's level and ignores an
@@ -341,12 +417,12 @@ fn diagnostic_output_commands_keep_the_running_output() {
     let r = Rig::new();
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 100);
     r.w32(reg::INT_OUTPUT, IO_DIAG | IO_PERIODIC | 5);
-    assert_eq!(r.c.sh.st.lock().int_out.active, IO_PERIODIC | 100);
+    assert_eq!(r.c.sh.int_out.lock().active, IO_PERIODIC | 100);
     // So do counts outside 2..=0xfffe.
     r.w32(reg::INT_OUTPUT, IO_SQUARE | 1);
-    assert_eq!(r.c.sh.st.lock().int_out.active, IO_PERIODIC | 100);
+    assert_eq!(r.c.sh.int_out.lock().active, IO_PERIODIC | 100);
     r.w32(reg::INT_OUTPUT, IO_SQUARE | 0xffff);
-    assert_eq!(r.c.sh.st.lock().int_out.active, IO_PERIODIC | 100);
+    assert_eq!(r.c.sh.int_out.lock().active, IO_PERIODIC | 100);
 }
 
 #[test]
@@ -411,11 +487,12 @@ fn a_pin_register_reaches_the_shared_data_word() {
 }
 
 /// Pins 2 and 3 are read-only inputs the board drives high, on the Octane
-/// and the Octane2 alike. Writes and direction changes cannot replace them.
+/// and the Octane2 alike (one row serves both). Writes and direction changes
+/// cannot replace them.
 #[test]
 fn the_board_inputs_are_read_only() {
-    for octane2 in [false, true] {
-        let r = Rig::with(Ioc3::octane(MAC, octane2));
+    {
+        let r = Rig::with(octane());
         for pin in [2u32, 3] {
             let reg = reg::PIN_REG_FIRST + 4 * pin;
             assert_eq!(r.r32(reg), 1);
@@ -435,6 +512,95 @@ fn the_board_inputs_are_read_only() {
     }
 }
 
+/// Direction and data are separate words: control has set and clear aliases
+/// and never touches data, data holds what is written to an output pin and
+/// the per-pin register is one bit of it. Pins 2 and 3 read their strap.
+#[test]
+fn gpio_direction_data_and_inputs_are_separate_words() {
+    let r = Rig::new();
+    r.w32(reg::PIN_CONTROL_SET, 0x0000_00f0);
+    assert_eq!(r.r32(reg::PIN_DATA), 0x0c, "direction leaves data, the straps read high");
+    r.w32(reg::PIN_DATA, 0x0000_0050);
+    assert_eq!(r.r32(reg::PIN_DATA), 0x5c);
+    assert_eq!(r.r32(reg::PIN_REG_FIRST + 4 * 4), 1);
+    assert_eq!(r.r32(reg::PIN_REG_FIRST + 4 * 5), 0);
+    r.w32(reg::PIN_CONTROL_CLR, 0x0000_0030);
+    assert_eq!(r.r32(reg::PIN_CONTROL_SET), 0x0000_00c0);
+    assert_eq!(r.r32(reg::PIN_DATA), 0x5c, "direction does not change data");
+    r.w32(reg::PIN_DATA, 0xffff_ffff);
+    assert_eq!(r.r32(reg::PIN_DATA), 0xffff_ffff);
+    r.w32(reg::PIN_DATA, 0);
+    assert_eq!(r.r32(reg::PIN_DATA), 0x0c, "only the straps stay");
+}
+
+/// The Octane's pins 0 and 1 are the front lightbar: white power, shown as
+/// the status bar's green, and red fault. Only a change of the pin's value
+/// moves the bit, and other pins do not.
+#[test]
+fn the_octane_lightbar_follows_pins_0_and_1() {
+    let r = Rig::new();
+    let hb = Arc::new(AtomicU64::new(0));
+    r.c.set_heartbeat(hb.clone());
+    let lit = || hb.load(Ordering::Relaxed) & (Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+    r.w32(reg::PIN_REG_FIRST, 1);
+    assert_eq!(lit(), Rex3::HB_LED_GREEN);
+    r.w32(reg::PIN_REG_FIRST + 4, 1);
+    assert_eq!(lit(), Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+    r.w32(reg::PIN_REG_FIRST, 0);
+    assert_eq!(lit(), Rex3::HB_LED_RED);
+    r.w32(reg::PIN_REG_FIRST + 4 * 6, 1);
+    assert_eq!(lit(), Rex3::HB_LED_RED, "an unwired pin lights nothing");
+    r.w32(reg::PIN_DATA, 0b11);
+    assert_eq!(lit(), Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+    r.w32(reg::PIN_DATA, 0);
+    assert_eq!(lit(), 0);
+}
+
+/// What each board's row says about the pins, written out per board: the
+/// levels its straps hold, and the status-bar bits its outputs reach. A pin
+/// the row does not list is unwired: it keeps what is written and reaches no
+/// status-bar bit.
+#[test]
+fn each_row_wires_its_pins_as_listed() {
+    // (board, pins held high, [(pin, status-bar bit)])
+    let rows: [(&Ioc3Board, u32, &[(u32, u64)]); 6] = [
+        (&IP30, 0b1100, &[(0, Rex3::HB_LED_GREEN), (1, Rex3::HB_LED_RED)]),
+        (&IP29, 0, &[]),
+        (&BASEIO, 0, &[]),
+        (&BASEIO6G, 0, &[]),
+        (&IP34, 0, &[]),
+        (&MIO, 0, &[]),
+    ];
+    for (board, straps, bits) in rows {
+        let bus = match board.cells.byte_bus {
+            ByteBusPart::None => ByteBus::None,
+            ByteBusPart::Ds1685 => ByteBus::Ds1685(Ds1685::new(None)),
+            ByteBusPart::M48t35 => {
+                ByteBus::M48t35(Arc::new(crate::dev::timekeeper::Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap()))
+            }
+        };
+        let r = Rig::with(Ioc3::new(board, MAC, bus));
+        let hb = Arc::new(AtomicU64::new(0));
+        r.c.set_heartbeat(hb.clone());
+        let name = board.name;
+        for pin in 0..9u32 {
+            let reg = reg::PIN_REG_FIRST + 4 * pin;
+            let strapped = straps >> pin & 1 != 0;
+            let bit = bits.iter().find(|b| b.0 == pin).map_or(0, |b| b.1);
+            r.w32(reg, 1);
+            let high = r.r32(reg) == 1;
+            let leds = hb.load(Ordering::Relaxed) & (Rex3::HB_LED_GREEN | Rex3::HB_LED_RED);
+            let listed = board.gpio.iter().any(|w| w.pin as u32 == pin && matches!(w.to, PinUse::Strap(_)));
+            assert_eq!(high, strapped || !listed, "{name} pin {pin}: a written 1 reads back unless a strap holds it low");
+            assert_eq!(leds, bit, "{name} pin {pin}: status-bar bit after a 1");
+            r.w32(reg, 0);
+            assert_eq!(r.r32(reg) == 1, strapped, "{name} pin {pin}: a written 0");
+            assert_eq!(hb.load(Ordering::Relaxed) & (Rex3::HB_LED_GREEN | Rex3::HB_LED_RED), 0, "{name} pin {pin}: cleared");
+        }
+        assert_eq!(r.r32(reg::PIN_DATA), straps, "{name}: nothing but the straps left");
+    }
+}
+
 // The MicroLAN protocol (search, match, page reads, CRCs) is tested with the
 // wire in `dev::w1`; the register cell and the board's default wire are below.
 
@@ -449,17 +615,17 @@ fn the_microlan_register_finishes_a_slot_inside_the_write() {
     assert_eq!(v & !3, (500 << 10) | (13 << 2), "the timing written reads back");
 }
 
-/// The wire the chip builds for itself: the station-address part and the
-/// two board records.
+/// The wire the chip is built with: the station-address part. The board
+/// records are the machine's.
 #[test]
-fn the_default_wire_carries_the_mac_part_and_two_board_records() {
+fn the_default_wire_carries_the_mac_part() {
     let r = Rig::new();
     r.w32(reg::PIN_CONTROL_SET, 1 << 21);
     r.w32(reg::MICROLAN, (500 << 10) | (13 << 2));
     assert_eq!(r.r32(reg::MICROLAN) & 1, 0, "a reset is answered with presence");
-    let mut families: Vec<u8> = r.c.sh.st.lock().wire().roms().iter().map(|rom| rom[0]).collect();
+    let mut families: Vec<u8> = r.c.sh.w1.roms().iter().map(|rom| rom[0]).collect();
     families.sort();
-    assert_eq!(families, [0x0b, 0x0b, 0x91]);
+    assert_eq!(families, [0x91]);
 }
 
 // ---------------------------------------------------------------------------
@@ -786,16 +952,15 @@ fn host_input_arrives_in_the_receive_ring_after_the_timer() {
     // looked. Hold the timer off while looking, then let it run out.
     let wait = Duration::from_nanos(0x200 * TIMER_TICK_NS);
     let due = {
-        let mut st = r.c.sh.st.lock();
-        let port = &mut st.sdma.port[0];
-        let due = port.rx_deadline.expect("the first character started the timer");
+        let serial = r.c.sh.serial[0].as_ref().unwrap();
+        let due = serial.rx_deadline().expect("the first character started the timer");
         assert!(due >= before + wait && due <= after + wait, "the reload's 32 ms from the character");
-        port.rx_deadline = Some(Instant::now() + Duration::from_secs(3600));
+        serial.set_rx_deadline(Some(Instant::now() + Duration::from_secs(3600)));
         due
     };
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE) >> HELD_SHIFT & 7, 2, "two held in the packer");
     assert_eq!(r.r32(A + sdma_off::RX_CONSUME) & ARM_RX_TIMER, ARM_RX_TIMER);
-    r.c.sh.st.lock().sdma.port[0].rx_deadline = Some(due);
+    r.c.sh.serial[0].as_ref().unwrap().set_rx_deadline(Some(due));
     std::thread::sleep(due.saturating_duration_since(Instant::now()));
     r.c.service();
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE), 8, "posted when the timer ran out");
@@ -929,13 +1094,13 @@ fn nvram_survives_in_a_file() {
     let path = std::env::temp_dir().join(format!("ioc3-nvram-{}", std::process::id()));
     {
         let r = Rig::new();
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_nvram_file(&path).unwrap();
         r.w8(reg::BYTEBUS_DEV1, 0x30);
         r.w8(reg::BYTEBUS_DEV2, 0xc3);
     }
     {
         let r = Rig::new();
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_nvram_file(&path).unwrap();
         r.w8(reg::BYTEBUS_DEV1, 0x30);
         assert_eq!(r.r8(reg::BYTEBUS_DEV2), 0xc3);
     }
@@ -949,13 +1114,13 @@ fn nvram_writes_reach_the_file_after_a_pause() {
     let path = std::env::temp_dir().join(format!("ioc3-nvram-quiet-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let r = Rig::new();
-    r.c.set_nvram_file(&path).unwrap();
+    r.c.rtc().set_nvram_file(&path).unwrap();
     rtc_w(&r, 0x45, 0x66);
     let in_file = || std::fs::read(&path).unwrap()[NVRAM_OFF_NV + 5];
     assert_eq!(in_file(), 0, "not yet written");
-    r.c.flush_nvram_after(Duration::from_secs(3600));
+    r.c.rtc().flush_after(Duration::from_secs(3600));
     assert_eq!(in_file(), 0, "the writes have not paused for long enough");
-    r.c.flush_nvram_after(Duration::ZERO);
+    r.c.rtc().flush_after(Duration::ZERO);
     assert_eq!(in_file(), 0x66);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0x200);
     let _ = std::fs::remove_file(&path);
@@ -964,12 +1129,12 @@ fn nvram_writes_reach_the_file_after_a_pause() {
 #[test]
 fn software_power_off_is_reported() {
     let r = Rig::new();
-    assert!(!r.c.powered_off());
+    assert!(!r.c.rtc().powered_off());
     r.w8(reg::BYTEBUS_DEV1, 0x0a);
     r.w8(reg::BYTEBUS_DEV2, 0x10); // bank 1
     r.w8(reg::BYTEBUS_DEV1, 0x4a);
     r.w8(reg::BYTEBUS_DEV2, 0x08);
-    assert!(r.c.powered_off());
+    assert!(r.c.rtc().powered_off());
 }
 
 const ECP: u32 = reg::PAR_ECP_BASE;
@@ -1050,52 +1215,25 @@ fn parallel_dma_drains_a_context_and_raises_service() {
     assert_eq!(r.r32(reg::INT_STATUS) & int::PARALLEL_SERVICE, 0, "quieted at the port");
 }
 
-/// What the Ethernet block is told and asked.
-#[derive(Default)]
-struct MockEth {
-    regs: Mutex<std::collections::BTreeMap<u32, u32>>,
-    wired: Mutex<Option<(Arc<dyn PciDma>, Box<dyn Fn(bool) + Send + Sync>)>>,
-}
-
-impl Ioc3EthPort for MockEth {
-    fn read32(&self, off: u32) -> u32 {
-        *self.regs.lock().unwrap().get(&off).unwrap_or(&0)
-    }
-    fn write32(&self, off: u32, val: u32) {
-        self.regs.lock().unwrap().insert(off, val);
-    }
-    fn connect(&self, dma: Arc<dyn PciDma>, irq: Box<dyn Fn(bool) + Send + Sync>) {
-        *self.wired.lock().unwrap() = Some((dma, irq));
-    }
-}
-
 #[test]
-fn the_ethernet_registers_are_forwarded_and_the_block_is_wired() {
+fn the_ethernet_registers_are_the_macs_and_it_gets_the_chips_dma() {
     let r = Rig::new();
-    let eth = Arc::new(MockEth::default());
-    r.c.attach_eth(eth.clone());
-    // Attached after the bridge gave DMA: wired at once.
-    assert!(eth.wired.lock().unwrap().is_some());
-    r.w32(0xf4, 0x1234);
+    let eth = r.c.eth().unwrap().clone();
+    r.w32(0xf8, 0x1234);
     r.w32(0x150, 0xbeef);
-    assert_eq!(eth.read32(0xf4), 0x1234);
+    assert_eq!(eth.read32(0xf8), 0x1234);
     assert_eq!(eth.read32(0x150), 0xbeef);
-    assert_eq!(r.r32(0xf4), 0x1234);
+    assert_eq!(r.r32(0xf8), 0x1234);
     // Just before the block and just after it are not the block's.
     r.w32(0xec, 7);
     assert_eq!(eth.read32(0xec), 0);
     r.w32(0x154, 7);
-    assert_eq!(eth.read32(0x154), 0);
+    assert_eq!(r.r32(0x154), 0);
     // Only 32-bit accesses reach the block.
-    assert_eq!(r.r8(0xf4), 0);
-}
-
-#[test]
-fn the_ethernet_block_gets_the_chips_view_of_memory() {
-    let r = Rig::new();
-    let eth = Arc::new(MockEth::default());
-    r.c.attach_eth(eth.clone());
-    let dma = eth.wired.lock().unwrap().as_ref().unwrap().0.clone();
+    assert_eq!(r.r8(0xf8), 0);
+    // Its ring entries go through the chip's byte order: the first descriptor
+    // word is big-endian on the bus, as `Ioc3Dma` places it.
+    let dma = r.c.sh.core.dma().unwrap().clone();
     assert!(dma.dma_write(0x500, &[0xde, 0xad, 0xbe, 0xef]).is_ok());
     assert_eq!(&r.mem.0.lock().unwrap()[0x500..0x504], &[0xef, 0xbe, 0xad, 0xde]);
     let mut b = [0u8; 4];
@@ -1106,30 +1244,27 @@ fn the_ethernet_block_gets_the_chips_view_of_memory() {
 /// Ethernet drives the PCI pin; the SuperIO line is a different one.
 #[test]
 fn the_ethernet_level_drives_the_pci_pin_not_the_superio_line() {
-    let c = Ioc3::octane(MAC, false);
-    let eth = Arc::new(MockEth::default());
-    c.attach_eth(eth.clone());
+    let c = octane();
     c.state().connect_dma(TestMem::new());
     let (pin, line) = LevelProbe::line();
     c.state().connect_irq(line);
     c.attached();
     let (sup, sline) = LevelProbe::line();
     c.connect_superio_interrupt(sline);
-    let wired = eth.wired.lock().unwrap();
-    let irq = &wired.as_ref().unwrap().1;
-    irq(true);
+    let eth = c.eth().unwrap();
+    eth.write32(0xf8, 1);
+    eth.raise_for_test(1);
     assert!(pin.level());
     assert!(!sup.level());
     assert_eq!(c.int_status(), 0, "no SuperIO status bit for it");
-    irq(false);
+    eth.write32(0xf4, 1);
     assert!(!pin.level());
 }
 
 #[test]
 fn buffer_ram_parity_follows_the_mac_control_bit() {
     let r = Rig::new();
-    let eth = Arc::new(MockEth::default());
-    r.c.attach_eth(eth.clone());
+    let eth = r.c.eth().unwrap().clone();
     // Checking off: stored as written, 17 bits, no error flag.
     r.w32(reg::SSRAM, 0x0001_0001);
     assert_eq!(r.r32(reg::SSRAM), 0x0001_0001);
@@ -1198,21 +1333,141 @@ fn the_superio_line_never_ends_up_stale_across_threads() {
     }
 }
 
+/// A line that records every call it gets. The Bridge turns a rise into a
+/// packet, so each call must be a change of level: a repeat is an edge the
+/// registers never made.
+#[derive(Default)]
+struct EdgeProbe {
+    level: Mutex<bool>,
+    rises: std::sync::atomic::AtomicUsize,
+    repeats: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::irq::InterruptController for EdgeProbe {
+    fn set_line(&self, _line: u32, level: bool) {
+        let mut now = self.level.lock().unwrap();
+        if level == *now {
+            self.repeats.fetch_add(1, Ordering::SeqCst);
+        } else if level {
+            self.rises.fetch_add(1, Ordering::SeqCst);
+        }
+        *now = level;
+    }
+}
+
+/// Linux acknowledges a source and then unmasks it, as two writes. Status and
+/// enable are one pair under one lock, so the Bridge, which latches a rising
+/// edge, is not given one the words never made, whoever else reads or
+/// republishes the line meanwhile. The source here is raised only while it is
+/// masked, so the output is low for the whole run.
+#[test]
+fn the_superio_line_never_rises_while_status_and_enable_never_agree() {
+    let c = Arc::new(octane());
+    let probe = Arc::new(EdgeProbe::default());
+    c.connect_superio_interrupt(crate::irq::IrqLine::new(probe.clone(), 0));
+    let bit = int::KEYBOARD;
+    let done = Arc::new(AtomicBool::new(false));
+    let others: Vec<_> = (0..2)
+        .map(|_| {
+            let (c, done) = (c.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    c.sh.core.republish();
+                    let _ = c.bar_read(0, reg::INT_STATUS, 4);
+                }
+            })
+        })
+        .collect();
+    for _ in 0..100_000 {
+        c.sh.core.set_bits(bit);
+        c.bar_write(0, reg::INT_STATUS, bit, 4);
+        c.bar_write(0, reg::INT_ENABLE_SET, bit, 4);
+        c.bar_write(0, reg::INT_ENABLE_CLR, bit, 4);
+    }
+    done.store(true, Ordering::SeqCst);
+    for t in others {
+        t.join().unwrap();
+    }
+    assert_eq!(probe.rises.load(Ordering::SeqCst), 0, "a rising edge the words never made");
+}
+
+/// Four threads raise, lower, enable and disable one source. The line is
+/// driven under the words' lock and only on a change, so it is never given a
+/// repeated level (a stale or duplicate edge), rises and falls alternate, and
+/// it ends where the words say.
+#[test]
+fn the_superio_line_is_driven_only_on_change_and_in_order_across_threads() {
+    for _ in 0..20 {
+        let c = Arc::new(octane());
+        let probe = Arc::new(EdgeProbe::default());
+        c.connect_superio_interrupt(crate::irq::IrqLine::new(probe.clone(), 0));
+        // Connecting states the line's level once, changed or not.
+        probe.repeats.store(0, Ordering::SeqCst);
+        let bit = int::KEYBOARD;
+        let ops: [fn(&Core, u32); 4] = [Core::set_bits, Core::clear_bits, Core::enable, Core::disable];
+        let threads: Vec<_> = ops
+            .into_iter()
+            .map(|op| {
+                let c = c.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..5_000 {
+                        op(&c.sh.core, bit);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(probe.repeats.load(Ordering::SeqCst), 0, "a level repeated to the parent");
+        let want = c.sh.core.status() & c.sh.core.enabled() != 0;
+        assert_eq!(*probe.level.lock().unwrap(), want);
+    }
+}
+
+/// A host key and writes of the enable words race; once both finish, the
+/// line agrees with status AND enable.
+#[test]
+fn the_superio_line_follows_enable_writes_racing_a_host_key() {
+    for _ in 0..20 {
+        let r = Arc::new(Rig::new());
+        r.w32(K_TX, 0xf4);
+        let _ = r.r32(K_RX);
+        let (a, b) = (r.clone(), r.clone());
+        let keys = std::thread::spawn(move || {
+            for _ in 0..200 {
+                a.c.ps2().push_kb(winit::keyboard::KeyCode::KeyA, true);
+                a.c.ps2().push_kb(winit::keyboard::KeyCode::KeyA, false);
+            }
+        });
+        let enables = std::thread::spawn(move || {
+            for _ in 0..400 {
+                b.w32(reg::INT_ENABLE_SET, int::KEYBOARD);
+                b.w32(reg::INT_ENABLE_CLR, int::KEYBOARD);
+            }
+        });
+        keys.join().unwrap();
+        enables.join().unwrap();
+        r.c.service();
+        let want = r.r32(reg::INT_STATUS) & r.r32(reg::INT_ENABLE_SET) != 0;
+        assert_eq!(r.superio.level(), want);
+    }
+}
+
 #[test]
 fn the_ethernet_pin_follows_the_last_level_given() {
-    let c = Ioc3::octane(MAC, false);
-    let eth = Arc::new(MockEth::default());
-    c.attach_eth(eth.clone());
+    let c = octane();
     c.state().connect_dma(TestMem::new());
     let (pin, line) = LevelProbe::line();
     c.state().connect_irq(line);
     c.attached();
-    let wired = eth.wired.lock().unwrap();
-    let irq = &wired.as_ref().unwrap().1;
-    for i in 0..1000 {
-        irq(i % 2 == 0);
+    let eth = c.eth().unwrap();
+    eth.write32(0xf8, 1);
+    for _ in 0..1000 {
+        eth.raise_for_test(1);
+        eth.write32(0xf4, 1);
     }
-    irq(true);
+    eth.raise_for_test(1);
     assert!(pin.level());
 }
 
@@ -1313,7 +1568,7 @@ fn nvram_and_extended_ram_survive_in_a_512_byte_file() {
     let _ = std::fs::remove_file(&path);
     {
         let r = Rig::new();
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_nvram_file(&path).unwrap();
         rtc_w(&r, 0x0f, 0x5c);
         rtc_w(&r, 0x45, 0x66); // bank 0 RAM
         rtc_w(&r, 0x0a, 0x10);
@@ -1326,7 +1581,7 @@ fn nvram_and_extended_ram_survive_in_a_512_byte_file() {
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0x200);
     {
         let r = Rig::new();
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_nvram_file(&path).unwrap();
         assert_eq!(rtc_r(&r, 0x0f), 0x5c);
         assert_eq!(rtc_r(&r, 0x45), 0x66);
         rtc_w(&r, 0x0a, 0x10);
@@ -1349,7 +1604,7 @@ fn a_qemu_layout_image_loads() {
     img[0xc0 + 1] = 0x02;
     std::fs::write(&path, &img).unwrap();
     let r = Rig::new();
-    r.c.set_nvram_file(&path).unwrap();
+    r.c.rtc().set_nvram_file(&path).unwrap();
     assert_eq!(rtc_r(&r, 0x0f), 0x42);
     rtc_w(&r, 0x0a, 0x10);
     rtc_w(&r, 0x50, 9);
@@ -1384,7 +1639,7 @@ fn a_set_date_survives_a_relaunch() {
     let _ = std::fs::remove_file(&clock);
     {
         let r = Rig::new();
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_nvram_file(&path).unwrap();
         assert!(!clock.exists(), "no reference until the guest sets the clock");
         set_2004(&r);
     }
@@ -1393,8 +1648,8 @@ fn a_set_date_survives_a_relaunch() {
     assert_eq!((reference.len(), &reference[..8]), (24, &b"DS168RF1"[..]));
     {
         let r = Rig::new();
-        r.c.set_rtc_offset(&crate::config::RtcOffset { years: -5, ..Default::default() });
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_rtc_offset(&crate::config::RtcOffset { years: -5, ..Default::default() });
+        r.c.rtc().set_nvram_file(&path).unwrap();
         // A new run: register B is the part's power-up BCD, 24-hour.
         rtc_w(&r, 0x0a, 0x30);
         assert_eq!(rtc_r(&r, 0x48), 0x20);
@@ -1420,7 +1675,7 @@ fn an_unreadable_clock_file_leaves_the_nvram_usable() {
     let _ = std::fs::remove_dir_all(&clock);
     std::fs::create_dir(&clock).unwrap(); // reading a directory fails
     let r = Rig::new();
-    r.c.set_nvram_file(&path).unwrap();
+    r.c.rtc().set_nvram_file(&path).unwrap();
     assert_eq!(rtc_r(&r, 0x0f), 0x42);
     assert!(rtc_r(&r, 0x09) >= 0x26, "host time, in BCD");
     drop(r);
@@ -1438,8 +1693,8 @@ fn rtc_offset_starts_a_clock_with_no_reference() {
     let _ = std::fs::remove_file(&clock);
     let year = |years| {
         let r = Rig::new();
-        r.c.set_rtc_offset(&crate::config::RtcOffset { years, ..Default::default() });
-        r.c.set_nvram_file(&path).unwrap();
+        r.c.rtc().set_rtc_offset(&crate::config::RtcOffset { years, ..Default::default() });
+        r.c.rtc().set_nvram_file(&path).unwrap();
         let y = rtc_r(&r, 0x09);
         drop(r);
         assert!(!clock.exists(), "a seed writes no reference");
@@ -1555,10 +1810,10 @@ fn an_nvram_write_marks_the_ram_dirty_and_leaves_the_file_alone() {
     let path = std::env::temp_dir().join(format!("ioc3-nvram-perbyte-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let (r, _tm) = running_rig();
-    r.c.set_nvram_file(&path).unwrap();
+    r.c.rtc().set_nvram_file(&path).unwrap();
     rtc_w(&r, 0x45, 0x66);
     assert_eq!(std::fs::read(&path).unwrap()[NVRAM_OFF_NV + 5], 0, "not written per byte");
-    assert!(r.c.sh.st.lock().rtc.dirty_since.is_some(), "the RAM counts as unsaved");
+    assert!(r.c.rtc().dirty_since().is_some(), "the RAM counts as unsaved");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1569,7 +1824,7 @@ fn nvram_reaches_the_file_after_the_debounce_with_no_flush() {
     let path = std::env::temp_dir().join(format!("ioc3-nvram-timer-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let (r, _tm) = running_rig();
-    r.c.set_nvram_file(&path).unwrap();
+    r.c.rtc().set_nvram_file(&path).unwrap();
     r.c.start();
     rtc_w(&r, 0x45, 0x66);
     let in_file = || std::fs::read(&path).map(|f| f[NVRAM_OFF_NV + 5]).unwrap_or(0);
@@ -1587,7 +1842,8 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     r.c.start();
     r.c.start();
     assert!(r.c.is_running());
-    assert_eq!(r.c.threads.lock().len(), 3, "two receive threads and the NVRAM writer");
+    assert_eq!(r.c.threads.lock().len(), 2, "two receive threads");
+    assert!(r.c.rtc().is_running(), "and the clock's NVRAM writer");
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000);
     assert!(timer_pending(&r, K_INT_OUT));
@@ -1595,13 +1851,14 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     r.c.stop();
     assert!(!r.c.is_running());
     assert!(r.c.threads.lock().is_empty());
+    assert!(!r.c.rtc().is_running());
     assert!(r.c.sh.armed.lock().iter().all(|a| a.is_none()));
     // Typed input waits in the backend while stopped.
     r.wire[0].inp.lock().unwrap().extend(b"x");
     std::thread::sleep(Duration::from_millis(20));
-    assert!(r.c.sh.st.lock().uart[0].core.rx_pending() == 0);
+    assert!(r.c.rx_pending(0) == 0);
     r.c.start();
-    assert!(eventually(|| r.c.sh.st.lock().uart[0].core.rx_pending() != 0));
+    assert!(eventually(|| r.c.rx_pending(0) != 0));
     assert!(timer_pending(&r, K_INT_OUT), "start arms the deadlines the chip holds");
     r.c.stop();
 }
@@ -1620,27 +1877,42 @@ fn a_periodic_output_always_has_a_timer_pending_between_callbacks() {
     r.c.stop();
 }
 
-/// A receive thread's pass that read the chip before a register write
-/// cannot arm after that write from what it read, and so cannot remove the
-/// timer the write set. The test holds the timer table so the pass stops
-/// just short of arming, and the write must then wait for it.
+/// A pass that read the chip's deadlines before a register write must not arm
+/// from them after it. A thread re-arms as the receive polls do while the
+/// test rewrites the interrupt output, and after each write has returned the
+/// timer slot must serve the chip's deadline. A stale pass would put the older
+/// deadline back, or a timer for an output the write had just cleared.
 #[test]
 fn a_pass_that_read_the_chip_first_arms_first() {
     let (r, _tm) = running_rig();
     r.c.start();
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     let sh = &r.c.sh;
+    // A callback re-arming on its own would blur what the slot should hold.
+    let idle = sh.gate.lock();
+    let stop = AtomicBool::new(false);
     std::thread::scope(|s| {
-        let table = sh.armed.lock();
-        // The chip still holds no output deadline when this pass reads it.
-        let pass = s.spawn(|| sh.with_st(false, |_, _| ()));
-        assert!(eventually(|| sh.st.is_locked()), "the pass keeps the chip until it has the table");
-        let write = s.spawn(|| r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000));
-        drop(table);
-        pass.join().unwrap();
-        write.join().unwrap();
+        let poller = s.spawn(|| {
+            while !stop.load(Ordering::SeqCst) {
+                sh.rearm();
+                std::thread::yield_now();
+            }
+        });
+        for i in 0..5_000u32 {
+            r.w32(reg::INT_OUTPUT, if i % 2 == 0 { IO_PERIODIC | (0x1000 + i) } else { 0 });
+            let held = sh.armed.lock()[K_INT_OUT].map(|(_, d)| d);
+            let want = decode(sh.io_due.load(Ordering::SeqCst));
+            if held != want {
+                stop.store(true, Ordering::SeqCst);
+                poller.join().unwrap();
+                panic!("write {i} left the slot at {held:?}, the chip holds {want:?}");
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        poller.join().unwrap();
     });
-    assert!(timer_pending(&r, K_INT_OUT));
+    // `stop` waits out a callback, so it cannot run while the gate is held.
+    drop(idle);
     r.c.stop();
 }
 
@@ -1657,9 +1929,8 @@ fn dropping_a_running_chip_ends_its_threads() {
 /// The clock's power-off bit tells the machine once, through its event sender.
 #[test]
 fn the_clocks_power_off_is_sent_to_the_machine_once() {
-    let r = Rig::new();
     let (tx, rx) = std::sync::mpsc::sync_channel(4);
-    r.c.set_event_sender(tx);
+    let r = Rig::with(Ioc3::new(&IP30, MAC, ByteBus::Ds1685(Ds1685::new(Some(tx)))));
     rtc_w(&r, 0x0a, 0x10); // bank 1
     assert!(rx.try_recv().is_err());
     rtc_w(&r, 0x4a, 0x08);
@@ -1701,9 +1972,22 @@ fn the_uarts_are_in_the_superio_block() {
 // Snapshots
 // ---------------------------------------------------------------------------
 
+/// The saved clock's seconds: the chip's calendar runs on in real time, so
+/// two saves a host stall apart differ in it and in nothing else.
+fn clock_seconds(v: &toml::Value) -> i64 {
+    v["chip"]["rtc"]["clock"]["time"].as_integer().unwrap()
+}
+
+/// `v` with the running clock's seconds cleared, for comparing the rest.
+fn without_clock(v: &toml::Value) -> toml::Value {
+    let mut v = v.clone();
+    v["chip"]["rtc"]["clock"].as_table_mut().unwrap().remove("time");
+    v
+}
+
 #[test]
 fn save_load_round_trip() {
-    for build in [|| Ioc3::octane(MAC, false), || Ioc3::octane(MAC, true)] {
+    for build in [octane] {
         let src = Rig::with(build());
         src.w8(reg::SERIAL_A + 3, 0x80);
         src.w8(reg::SERIAL_A + 7, 6);
@@ -1714,10 +1998,13 @@ fn save_load_round_trip() {
 
         let dst = Rig::with(build());
         dst.c.load_state(&v1).expect("load_state");
-        assert_eq!(v1, dst.c.save_state());
-        let st = dst.c.sh.st.lock();
-        assert_eq!(st.uart[0].predivider, 6);
-        assert_eq!(st.ssram[0x40] & SSRAM_DATA, 0x1234);
+        // Seconds may pass between the load and the save, as on a loaded host.
+        dst.c.sh.rtc.as_ref().unwrap().advance_clock(2);
+        let v2 = dst.c.save_state();
+        assert_eq!(without_clock(&v1), without_clock(&v2));
+        assert_eq!(clock_seconds(&v2), clock_seconds(&v1) + 2, "the restored clock runs on from the saved time");
+        assert_eq!(dst.c.predivider(0), 6);
+        assert_eq!(dst.c.sh.ssram.lock()[0x40] & SSRAM_DATA, 0x1234);
     }
 }
 
@@ -1739,32 +2026,33 @@ fn ioc3_load_into_a_dirtied_instance_equals_load_into_a_fresh_one() {
     let fresh = Rig::new();
     used.c.load_state(&v).unwrap();
     fresh.c.load_state(&v).unwrap();
-    assert_eq!(used.c.save_state(), fresh.c.save_state());
-    assert_eq!(used.c.save_state(), v);
+    // The loads and saves are not at one instant, so the clock may have moved.
+    used.c.sh.rtc.as_ref().unwrap().advance_clock(1);
+    assert_eq!(without_clock(&used.c.save_state()), without_clock(&fresh.c.save_state()));
+    assert_eq!(without_clock(&used.c.save_state()), without_clock(&v));
 }
 
 /// A periodic interrupt output keeps the time its next pulse had left,
 /// counted from the load rather than from the save.
 #[test]
 fn a_pending_output_keeps_its_time_left() {
-    let src = Ioc3::octane(MAC, false);
+    let src = octane();
     src.bar_write(0, reg::INT_OUTPUT, IO_PERIODIC | 100, 4);
     let at_save = Instant::now();
     let left = Duration::from_micros(20);
     let v = {
-        let mut st = src.sh.st.lock();
-        st.int_out.next = Some(at_save + left);
-        st.save_state(at_save)
+        src.sh.int_out.lock().next = Some(at_save + left);
+        src.sh.save_state(at_save)
     };
-    let dst = Ioc3::octane(MAC, false);
+    let dst = octane();
     let at_load = at_save + Duration::from_millis(5);
-    dst.sh.st.lock().load_state(&v, at_load).unwrap();
-    assert_eq!(dst.sh.st.lock().int_out.next, Some(at_load + left));
+    dst.sh.load_state(&v, at_load).unwrap();
+    assert_eq!(dst.sh.int_out.lock().next, Some(at_load + left));
 }
 
 #[test]
 fn a_short_buffer_ram_is_refused() {
-    let c = Ioc3::octane(MAC, false);
+    let c = octane();
     let mut v = c.save_state();
     let chip = v.as_table_mut().unwrap().get_mut("chip").unwrap().as_table_mut().unwrap();
     chip.insert("ssram".into(), toml::Value::Array(Vec::new()));
@@ -1789,9 +2077,8 @@ fn an_octane_chip_reset_keeps_the_pci_header() {
 /// Dallas clock ports unfitted, and has no PHY reset on GPIO 5.
 #[test]
 fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
-    let r = Rig::with(Ioc3::new(Ioc3Config::fuel(MAC)));
-    let clock = Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap());
-    r.c.attach_timekeeper(clock.clone());
+    let clock = Arc::new(crate::dev::timekeeper::Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap());
+    let r = Rig::with(Ioc3::new(&IP34, MAC, ByteBus::M48t35(clock.clone())));
     let cfg = r.c.state().config();
     cfg.write(1, 0xffff_0146);
     cfg.write(3, 0xffff_ffff);
@@ -1809,8 +2096,7 @@ fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
     r.w8(reg::BYTEBUS_DEV1, 0x40);
     r.w8(reg::BYTEBUS_DEV2, 0x55);
     assert_eq!(r.r8(reg::BYTEBUS_DEV2), 0);
-    r.c.attach_eth(crate::dev::ioc3_eth::Ioc3Eth::new_fuel(MAC));
-    use crate::dev::ioc3_eth::{bits::MII_READ, reg::{MII_CONTROL, MII_DATA_R, MII_DATA_W}};
+    use crate::dev::ioc3::eth::{bits::MII_READ, reg::{MII_CONTROL, MII_DATA_R, MII_DATA_W}};
     r.w32(MII_DATA_W, 7);
     r.w32(MII_CONTROL, (1 << 5) | 0x19);
     r.w32(reg::PIN_CONTROL_SET, 1 << 5);
@@ -1827,7 +2113,8 @@ fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
 /// survive a chip reset.
 #[test]
 fn the_fuel_ioc3_delivers_keyboard_and_mouse_traffic_across_reset() {
-    let r = Rig::with(Ioc3::new(Ioc3Config::fuel(MAC)));
+    let clock = Arc::new(crate::dev::timekeeper::Timekeeper::at(2026, 1, 1, 0, 0, 0).unwrap());
+    let r = Rig::with(Ioc3::new(&IP34, MAC, ByteBus::M48t35(clock)));
     for _ in 0..2 {
         r.c.reset();
         r.c.ps2().power_on();

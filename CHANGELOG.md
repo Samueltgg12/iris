@@ -13,6 +13,33 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Newport: experimental live rendering on the host GPU
+
+- A `rex-gpu` build renders Newport's flat fills on the host GPU when
+  `IRIS_REX3_GPU=auto|vulkan|metal|dx12` is set. It is experimental and off by
+  default; without the variable a `rex-gpu` build renders as before, and
+  default and release builds are unchanged. Everything outside the supported
+  subset (complete RGB blocks and spans with `SRC` logic, no blending,
+  shading, patterns or host pixels) still runs on the CPU, which is
+  synchronized first. On an RTX 5070 long spans run about 3.3x as fast as
+  on the CPU renderer, and 8-pixel draws about 1.5x.
+- Fills are binned on the CPU into 32 x 32 screen tiles and drawn by one
+  workgroup per tile, without GPU barriers; synchronization reads back only
+  the tiles that were drawn.
+- If the GPU fails, the draws it had not yet returned are replayed on the
+  CPU and rendering continues there for the rest of the run.
+- A strict synthetic REX3 replay corpus (`src/dev/ng1/testdata`) checks the
+  interpreter, the Cranelift JIT and the GPU engine against one another; Linux
+  CI runs its CPU half. See `TESTING.md`.
+
+### A dropped O2 with a PCI card frees its bus
+
+- An O2 whose PCI card had its BAR placed by the PROM or the guest kept its
+  physical bus and decode table after the machine dropped (a GUI Stop then
+  Start, or a test). The BAR's mapping holds the card, and the card holds
+  memory for its DMA, which owns the bus. The O2's drop now lets go of the
+  bus's devices, as the other machines' do.
+
 ### jitv2: registers in loops stay in host registers
 
 - A compiled page with a loop keeps the registers its loops use most in host
@@ -33,6 +60,46 @@ hashes are given where a change is easiest to understand by reading the commit.
   boot: the century IRIX writes while SET is up restarted the clock from the
   old time. The DS1685/DS1687 model now holds a century written under SET
   until SET clears, as the part does, and snapshots keep it.
+### SGI Fuel (IP34 board, IP35 software platform)
+
+- Added a headless Fuel profile, `fuel_ip34`: the 500 MHz R14000, 512 MiB
+  of RAM, Bedrock, two XBridge PCI heads, IOC3 serial ports, PS/2 and
+  Ethernet, a two-channel ISP12160, a Lucent OHCI USB controller and the
+  L1 system controller. PROM 6.210 passes its diagnostics and IRIX 6.5.30
+  boots to the login on the L1 or an IOC3 serial console, and `halt -p`
+  powers it off. See the [Fuel guide](docs/fuel-ip34.md).
+- **The Fuel takes a VPro board**: `[graphics] board = "v12"` or `"v10"`
+  fits the Octane's VPro model at crossbar widget 13. IRIX 6.5.30 with the
+  VPro driver brings the X login screen up on it.
+- `[machine] emu_id` (0 to 4095) gives a Fuel its own host id: the station
+  address becomes `08:00:69:e2:<emu_id>` and IRIX prints its last four bytes
+  (`69e20070` for emu_id 7). Unset, the Fuel keeps `08:00:69:12:34:56`.
+- **jitv2 compiles the reset PROM from the PROM.** The PROM runs from the reset
+  window uncached; once memory covers that window the cached view returns RAM
+  there, and the compile pool used to compile RAM's bytes in place of the
+  PROM's. The board now presents an uncached instruction fetch of that window at
+  an address of the PROM's own (`MipsExecutor::uncached_fetch_alias`), so its
+  code page is keyed, compiled and invalidated by address like any other. The
+  other machines are unchanged.
+
+### IOC3
+
+- The IOC3 is a parent and one child per function, as Linux's
+  `drivers/mfd/ioc3.c` has it, with a table of boards
+  ([docs/dev/ioc3.md](docs/dev/ioc3.md)). The 16550s and the parallel port's
+  registers are modelled as the external Super I/O part they are; serial and
+  parallel ring DMA, the PS/2 controller, the one-wire master and the Ethernet
+  MAC are children. The interrupt status and enable words are atomics and a
+  change drives the Bridge input only when the output flips. The DS1685 and its
+  NVRAM file moved to `src/dev/ds1685.rs`. Snapshots are compatible.
+- The Ethernet threads are `ioc3-eth-rx` and `ioc3-eth-net` on every machine
+  (the Octane's were `ip30-eth-*`).
+- An Octane2 (V10 or V12 graphics) presents the Octane2's front plane, power
+  supply, system board and processor module records, not the Octane's.
+- The Onyx2's BaseIO-G has the MediaIO daughtercard: its own board record, a
+  second IOC3 at PCI device 6 with serial ports, keyboard and mouse and a
+  parallel port, and RAD1 audio at device 7. `hinv` now lists four serial
+  ports, the parallel port and the audio processor.
 
 ### Benchmark and test suites: one pinned compiler
 
@@ -40,16 +107,51 @@ hashes are given where a change is easiest to understand by reading the commit.
 - The embedded benchmark image is built with GCC 16.2.1 again. Since 6adc7927 it had been built with GCC 14.2, and benchmark results recorded on images built in between are not comparable with results from before or after. CI rebuilds the image in the container and fails on any byte difference, replacing the digest of the guest sources.
 - The compiler changes the benchmark: GCC 14.2 runs Dhrystone in 428 guest instructions per iteration where GCC 16.2.1 needs 313, so results from images built by different compilers are not comparable.
 
-### cpu-tests: results judged by test name
+### Test suites in CI
 
 - `cache/index_tag_rt` writes back the lines it invalidates and `umode/load_miss_third` no longer takes a hidden Virtual Coherency exception, so neither depends on how big the suite's code comes out.
 - CI judges `cpu-tests` by test name, not by failure count: the harness prints TAP, `cpu-tests/expected-failures.txt` lists the failing tests per CPU and engine, and `cargo test --release --test cpu_tests -- --ignored` runs the suite and the check, locally as in CI.
-- `cpu-tests` and the benchmark's accuracy check are cargo integration tests, one case per CPU: `cargo test --release [--features jitv2] --test cpu_tests --test bench_accuracy -- --ignored` builds the emulator for the engine it names, so it cannot judge a stale or wrong-engine binary. `make -C cpu-tests check-run CPU=... ENGINE=...` now runs that test for one cell, and `cpu-tests/run/matrix.sh` is gone. CI runs the same tests and marks a failing case, with the tests that broke, on the pull request.
+- `cpu-tests` and the benchmark's accuracy check are cargo integration tests, one case per CPU: `cargo test --release [--features jitv2] --test cpu_tests --test bench_accuracy -- --ignored` builds the emulator for the engine it names, so it cannot judge a stale or wrong-engine binary. It replaces `make -C cpu-tests check-run` and `cpu-tests/run/matrix.sh`, which are gone with `cpu-tests/run/check.py`.
+- CI builds each engine's emulator once for both suites and runs the tests under `cargo nextest` (`.config/nextest.toml`), with panic=abort test builds, and so does the workspace test job. Every guest test and benchmark kernel is a JUnit case, so a failure is annotated by name on the pull request. `iris-bench run --junit FILE` writes the kernels' report. See [TESTING.md](TESTING.md#continuous-integration).
+- Pull requests are tested on Linux x86-64, Linux arm64 and Windows, and draft pull requests on Linux x86-64 only; the rest start when a pull request is marked ready for review. macOS is tested on pushes to `main`. Only the Linux x86-64 test step fails the job. Every job has a time limit.
+
+### Interpreter hot-path check
+
+- `cargo test -p iris-checks -- --ignored` checks a lightning release build
+  for formatting calls in the interpreter's hot code and for a hit-path cache
+  fetch left out of line, as CI does on Linux x86-64. It replaces
+  `tools/hot-path-check.sh` and needs no binutils.
+### Benchmark report
+
+- The per-kernel table has a "vs base" column for every cell and a "native" column for every cell. Both used to divide the best cell by the base or the host, so a slower build still read 1.00x.
+- A rerun under the same label is kept (`<label>.2.json`, `.3.json`) instead of replacing the last result. `report` groups them into one column showing the median, `[min-max]` and the run count, and ratios use the medians.
+- `report` warns when the runs it compares differ in guest image, run length (quick or full), clock (timed or `ci_clock`), host CPU or emulator build features, names the cells on each side, and prints `n/c` instead of a ratio between cells that differ. Kernel rates count iterations of compiled guest code, so a rebuilt image read as an emulator regression. `--across-features` keeps ratios between feature sets, which `matrix` does since that is its point.
+- `iris-bench reference` refuses a `ci_clock` run, whose rates are constants of the build.
+- A failed `run --iris` shows the emulator's exit status and the tail of its stderr as well as its stdout. A run killed for timing out keeps what the emulator printed before it hung.
+- `run --deterministic --iris` reads the emulator's build features first and refuses a binary without `ci_clock`, which would have produced a timed run saved as deterministic. Lightning builds are no longer passed `--jitv2-compile sync`, which they reject.
+- A lightning build is its own engine in the GUI's reference comparison. It was compared with the plain interpreter's row, though lightning compiles out breakpoints and traceback to run faster.
+- `iris --test-device-run-config time_pct=N,repeats=N,groups=MASK` (config key `test_device_run_config`) sets the run configuration the test device publishes, so a bare-metal benchmark started from the command line can be asked for a shorter run, as the in-process runner's `--quick` already could.
+- `iris-bench ab --a BASE --b CHANGE` compares two emulator builds with paired rounds on one guest image and judges each kernel by an interval, so a slowdown shows without a stored baseline. `--concurrent` starts both builds together each round; pin the command with `taskset` or `start /affinity` if the host needs it.
+
+### iris-bench guest suite
+
+- `iris-bench irix` finds the programs a step `requires` on IRIX 6.5.22; it skipped every step before. A `requires` with a slash in it is tested as a path.
+- The guest suite uses `dd` and `ping` options IRIX accepts. `net/loopback_ping` now floods 10000 packets instead of sending 100, so earlier results for that step do not compare.
+- `disk/read_cold` reads from the disk instead of the guest's buffer cache, which served it before. Its setup needs one and a half times the guest's memory free in `/tmp`, and fails, removing its file, when it cannot write that.
+- `iris-ci` exits 4 when the guest command `run` sent fails and 5 when a wait for the guest times out; both used to exit 2, like any error iris reported. A `wait-serial` that runs out sets `"timeout": true` in its error response.
+- A guest step that fails is recorded as a `FAILED` row and the suite carries on; it used to stop at the first quiet failure and lose the results so far. A step skipped for a missing program is a `SKIP` row.
+- A step in `bench/irix/steps.toml` can set `timeout`. A hung step is a `FAILED` row, the guest gets Ctrl-C, and the suite goes on once the shell answers. The X steps have timeouts; `gfx/xwd_root` blocked the suite for good on an Indy sitting at the login screen.
+- `iris-bench report` shows a guest run as a "Guest steps" table with each step's status, time and rate, instead of blank rows in the kernel tables. `iris-bench reference` refuses a guest run.
+- `iris-bench irix --junit FILE` also writes the guest suite as a JUnit report: one case per step, failed where the step failed or timed out and skipped where its program is missing.
+- `iris-bench irix` also runs `bench/irix/benchies.toml`: Dhrystone 2.1 and the C Whetstone (new in `test/dhrystone` and `test/whetstone`, with IRIX N32 binaries) and `iris_bench`. `--steps` can be repeated. A step prints its last line of output, so the program's own figure shows. Steps whose binary is not in the guest are skipped.
 
 ### Boot test
 
 - `iris-ci junit FILE --suite NAME --case 'pass|SECONDS|NAME'` writes a JUnit report of checks a shell script has made, one case each (`fail|SECONDS|NAME|MESSAGE` for a failed one), so a CI test reporter can name the check that failed.
 - The nightly boot test writes its checks (seeding NVRAM, the serial login, iris quitting cleanly) as `boot-test.xml`, and CI annotates the run with any that failed.
+- `iris-ci screen-wait GOLDEN` takes screenshots until the guest screen matches a PNG: a pixel differs when a channel is more than `--threshold` (32) away, and a match allows `--max-pixels` (128) of them. On a timeout it writes the last screenshot and a diff image with the differing pixels in red, and exits 5.
+- The nightly boot test also boots IRIX 5.3 on the graphics console and fails unless the login screen matches `scripts/boot-goldens/indy-irix53.png`. The job's limit is 40 minutes, enough for every wait in both boots to run out.
+- The graphics boot's checks are JUnit cases too; a passing screen match records how many pixels differed.
 
 ### PCI
 
@@ -88,6 +190,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### R10000-family cache lines as memory
 
 - A valid primary data or secondary cache line now holds its page in that CPU's own copy of ppmem's window, so a PROM that keeps its stack in cache lines reads and writes the lines with cached accesses while the uncached path, DMA and the other CPUs see memory. Index Store Data writes through to such a line. `l2 probe 0` lists the pages held. Nothing changes on a load, store or fetch. A valid R5000 primary data line does the same, for the O2's POST stack.
+- Primary instruction lines hold their pages too, each word written there as the instruction it predecodes, for the eleven predecode classes the model knows. Index Load Data (I) where a held secondary line would refill the set returns that line's words, predecoded, until Index Store Data (I) writes the set. Only the Tezro's PROM uses them.
 - jitv2 does not compile a page any CPU's cache holds lines in: that CPU runs it from its own view in the interpreter, and every other page stays compiled.
 - The O2 keeps POST's stack in those lines. CRIME's side page for the uncached path and the tag-store hook are gone, and an O2 snapshot an older iris took during POST is refused.
 
@@ -95,6 +198,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - The R10000 family has 44-bit virtual and 40-bit physical addresses, FrameMask and a 28-bit EntryLo PFN, picks the TLB refill vector by address space, invalidates overlapped TLB writes (Status.TS), and completes uncached stores nothing answers. Partial LWR keeps the upper word, and the cache diagnostics (Index Store Data, secondary tag mask, Config size) work.
 - `cpu` takes the parts each machine shipped with, such as `r12000_360` on the Octane, or a family name for the machine's own. The Indy and Indigo2 R4400 is now rev 5.0 at 150 MHz, the O2 R10000 rev 3.4 at 250 MHz, and an Indy no longer takes an R10000 (the R10000 Indigo2 is the IP28). The R12000 and R14000 are new.
+- The R16000 is a family of its own, with four parts for the Tezro (`r16000_700` rev 2.1, `r16000_800` rev 2.2, `r16000_900` and `r16000_1000` rev 3.0) and a 4, 8 or 16 MB secondary cache picked once when a machine is built, so no run-time field or branch is added. `hinv` prints an R16000's major revision two below the PRId register's, and the part table undoes that in one place. The FIR is 0x0900, the one R14000 value on record; a model choice. No machine takes them yet.
 
 ### Onyx2
 
@@ -131,6 +235,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   from the NAT. A disk cloned from a LAN machine, re-addressed from its
   desktop, used to lose the network about 20 minutes later, when its
   cached ARP entry for the old gateway expired.
+- On a Windows host, the NAT handles data from a host socket as soon as it
+  arrives. It used to look at its host sockets on a timer tick, a few
+  milliseconds apart, and woke on that tick even with nothing to do.
+- On a Windows host, a guest connecting to a host port nothing listens on is
+  refused, as on other hosts. The NAT had answered it as an open connection.
 
 ### IMPACT detail textures
 
@@ -494,6 +603,18 @@ where they differed:
   sectors in the overlay's dirty record and leaves the rest sparse, on every OS, so
   the cost follows what the guest wrote. Reflinking is unchanged. On Windows the
   copy is marked sparse first.
+
+### SGI Tezro (IP53 board, IP35 software platform)
+
+- Added a headless Tezro profile with the 700 MHz R16000 (`r16000_700`, the default; `cpu = "r16000"` takes it too), 4 MiB cache, 4 GiB RAM, a PIC with PXBOW, and the IO9's IOC4, ISP12160 and BCM5701. The 800, 900 and 1000 MHz chips (`r16000_800`, `r16000_900`, `r16000_1000`) are listed and take four processors; see the [Tezro guide](docs/tezro-ip53.md).
+- A Tezro can fit a VPro V12 at widget 12 with `[graphics] board = "v12"`, on the VPro model the Octane and the Fuel use.
+- A Tezro fits one, two or four processors, four by default, and two or four bring a second PIC at widget 11 on the PXBOW's link 11. Every fitted processor runs, each on its own host thread, so a default four-processor Tezro runs four.
+- The Tezro's L1 names its node board for the chip and the processor count, as inventories print it (`IP53_4CPU` 030-1868-001 at 700 MHz, 030-1956-002 at 800 MHz, `IP59_4CPU` and `IP59_2CPU` at 1 GHz, `IP53_2CPU` and `IP53_1CPU` for the smaller 700 MHz boards), so the PROM tries only the fitted processor positions and a one- or two-processor Tezro's first boot does not power-cycle the module for its empty ones.
+- The Tezro's IO9 bus has the TI PCI-to-PCI bridge every Tezro capture shows at device 2, with nothing behind it.
+- A Tezro refuses a `banks` list whose two banks of a pair differ in size: Bedrock keeps one size code for each pair.
+- The Tezro's BCM5701 reports PCI revision 0x15 and has the chip's capability list with vital product data reads, so IRIX's driver no longer waits out its VPD poll at every attach.
+- The Tezro's PIC fails a configuration read of an empty slot as a master timeout, so the PROM no longer records two phantom devices per empty slot.
+- `[machine] emu_id` (0 to 4095) gives a Tezro its own host id: the L1 answers the system serial request with `LEMU2<emu_id>0`, IRIX's `sysinfo -s` and `lmhostid` print its fold (`d5200420` for emu_id 42), and iris prints both at start-up. The board serial stays `EMUN00`, so the PROM keeps its NVRAM across an emu_id change.
 
 ### `IRIS_GUI_GL` works in iris-gui
 

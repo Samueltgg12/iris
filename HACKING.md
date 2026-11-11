@@ -16,13 +16,15 @@ Other documents:
 
 ## 1. What IRIS is
 
-IRIS emulates five SGI workstations: the Indy (IP24), the Indigo2 (IP22), the
-Indigo2 IMPACT (IP28), the O2 (IP32) and the Octane (IP30). The CPU is an
-R4400, R5000, R10000, R12000 or R14000, chosen at runtime from the parts the
-machine shipped with (`src/cpu/parts.rs`).
-Graphics is Newport (REX3), GR2 (XZ/Extreme) or IMPACT on the Indy and
-Indigo2, GBE on the O2 and Solid IMPACT on the Octane. It boots the real PROMs
-and IRIX 5.3 and 6.5 to a desktop with networking.
+IRIS emulates seven SGI workstations: the Indy (IP24), the Indigo2 (IP22),
+the Indigo2 IMPACT (IP28), the O2 (IP32), the Octane (IP30), the Fuel (IP34
+board, IP35 software platform) and the Tezro (IP53 board, IP35 software
+platform). The CPU is an R4400, R5000, R10000, R12000, R14000 or R16000,
+chosen at runtime from the parts the machine shipped with
+(`src/cpu/parts.rs`). Graphics is Newport (REX3), GR2 (XZ/Extreme) or IMPACT
+on the Indy and Indigo2, GBE on the O2 and Solid IMPACT on the Octane; the
+Fuel and the Tezro take a VPro or run headless on their serial consoles. It
+boots the real PROMs and IRIX 5.3 and 6.5 to a desktop with networking.
 
 It is **not cycle-accurate**, anywhere. IRIX is interrupt-driven and does not
 care how many cycles an instruction takes, so IRIS models behaviour
@@ -101,6 +103,12 @@ the machine supplies only a route from controller number to bus.
 Flash command engines share `FlashBacking` file storage while retaining
 their own command state.
 
+`ScsiTarget::bus_reset` defaults to no action. Disk targets record reset as
+unit attention. Only the ISP12160 calls it; the other controllers keep
+their earlier behaviour of not reporting resets to targets.
+The ISP12160 releases its controller state lock before walking either bus.
+Target callbacks run under that bus lock and must not reacquire it.
+
 ## 2. Data path and endianness
 
 **Word-transparent architecture.** Host `u32`/`u64` values are bit
@@ -169,6 +177,9 @@ screenshots), `CpuDevice` (what `Machine` holds for the CPU).
 Serial lines have two halves. A UART model owns the registers: the Indy's
 `Z85c30`, and `Ns16550` (`src/dev/ns16550.rs`), the 16550A core that the O2's
 `MaceUart` (lane decode, interrupt line, monitor) and the Octane's IOC3 wrap.
+The IOC4's serial ring-DMA engine is its own module, `ioc_serial_dma.rs`, which
+the chip drives through its `SerialDmaHost` trait (its 16550s, interrupt bits and
+bus master); the IOC3 keeps its own copy for now.
 The host end is a `SerialBackend` from `src/dev/serial_host.rs`, which the
 machine constructors pick with `console_backends`: the CI backend, a TCP
 console, or a log tee. A UART's transmit is instant and its receive side
@@ -305,8 +316,12 @@ Every device that has real work to do runs on its own thread:
 | `VNC-Grab`, `VNC-Pointer`, `VNC-Client`/`VNC-Read` | with `--vnc`: frame diffing, pointer steering, one pair per viewer |
 | `machine-events` | power-off and reset requests from devices |
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
-| `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
-| `ip30-eth-rx`, `ip30-eth-net` | Octane ethernet receive pump; the network backend |
+| `ISP12160-0` | Fuel SCSI request ring for both ISP12160 channels |
+| `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane and Fuel serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
+| `l1-serial` | Fuel and Tezro L1 console UART worker |
+| `IOC4-RX-0` to `IOC4-RX-3` | Tezro IOC4 serial input |
+| `bcm5701-rx`, `bcm5701-net` | Tezro BCM5701 receive pump and network backend |
+| `ioc3-eth-rx`, `ioc3-eth-net` | IOC3 ethernet receive pump (every machine with an IOC3); the network backend |
 | `odyssey-work`, `odyssey-raster`, `odyssey-pool-N`, `odyssey-display` | VPro: the front end decodes the queued command-FIFO stores (the processor's stores only queue); the raster unit sets each draw up and walks its primitives into 2x2 quads; a pool of workers (`[graphics] threads`, default 2) walks, shades and stores filled triangles and stores every other fragment, one screen tile at a time; and the display composes each whole frame from board memory (64-bit words, as main memory is: a field is a bit range of its word, read by shift and mask with no byte order, `vram.rs`) as the scan-out registers describe it, counts the retrace and presents the window at 60 Hz. No board-wide lock: the front end owns its state, an access that needs the drawing is answered busy until it is done, the display FIFO (PB&J's register file) has its own lock and never waits for the drawing (`display_fifo.rs`), and the display reads board memory while it is drawn, as the board's own scan-out does; nobody tracks which rows changed. The raster thread sets primitives up and writes each as one command in a ring of 64-byte slots (`pipe/ring.rs`): a triangle's record and bounding box, a quad it shaded itself (lines, points), or a clear's rectangle; the slot's index goes on the queue of every screen tile (`[graphics] tile`, default 32 pixels) it touches. A worker takes a ready tile and owns it until its queue is empty, walking each triangle within the tile and shading and storing quad by quad, so every pixel sees its fragments in command order with no other ordering, and the depth pre-test reads depth its own tile stored. A slot is retired once all its tiles have run it. The raster thread drains the ring before any other work on board memory (a texture upload waits for the shader alone). A completion (a fence's token, a query's words) does not drain: it rides the ring and runs once the ring retires past the quads queued before it. A quad's four pixels are lanes: the walk's depth, the texture unit's positions and the colour weights run on the host's SIMD unit (`fearless_simd`, `pipe/lanes.rs`, the level detected at start-up), bit for bit the scalar arithmetic. When its queue runs dry the raster thread does not drain: it keeps one count of the raster unit's pending jobs for the quads still in flight, and a front-end wait or a refused processor read asks it to store them. `IRIS_ODSY_SHADER=inline` makes the raster thread shade every quad itself, and `IRIS_ODSY_BACKEND=inline` stores on the raster thread with no pool. The texture registers a draw reads live in an array of draw state slots (`pipe/slot.rs`): the front end writes the current slot, a draw latches it and holds it until its job is given back, and a write while a queued draw holds the current slot first copies it to a free one, so the stages read their draw's registers with no lock |
 
 Threads that have nothing to do park instead of spinning: the graphics
@@ -361,6 +376,16 @@ The rules, in order of importance:
 When a device has several locks, document their order next to them and keep
 to it. Graphics recording is an example: `rec` before `trace`, and the
 consumer thread never takes `rec`.
+
+Bedrock, the Fuel's node chip, shows rule 4 at the scale of a whole chip.
+Each processor interface's interrupt inputs (pending banks, masks, timer and
+error status) are atomics, so a register read takes no lock. A store, an
+inbound packet or a comparator changes one and publishes the slot's levels
+into Cause bits 10-14 of its CPU's interrupt word under one lock per
+interface, which keeps the last levels it wrote, as the Interrupts section
+asks. The CPU reads its word without a lock. A counter read, inbound DMA
+and PIO take no lock. The comparators fire on host timers, as the Hub's do,
+not from the CPU's batch hook.
 
 ## 6. The CPU
 
@@ -493,13 +518,34 @@ three boards have optional JITs (`rex-jit`, `gr2-jit`, `gr4-jit`) that
 compile pixel pipelines with Cranelift; the interpreter remains the
 reference, and each JIT has an equivalence test against it.
 
-The optional `rex-gpu` feature builds on `rex-dirty-upload` and adds a
-replay-only wgpu path on the `REX3-Processor` thread. Explicit GPU replay may
-batch its supported fills, but it reads them back before an unsupported draw
-falls back to the CPU, before the GFIFO becomes idle or exits, and before
-`GFXBUSY` is released. Completed batches publish through the existing damage
-tracker, and the CPU framebuffer remains canonical at every replay observation
-point. Normal live emulation never enables this path.
+The optional `rex-gpu` feature builds on `rex-dirty-upload` and adds a wgpu
+path for Newport flat fills on the `REX3-Processor` thread. It is used by
+recording replay and, only when `IRIS_REX3_GPU` is set, by the experimental
+live renderer. It is separate from the `wgpu` feature's common layer below
+and owns its own device.
+
+The CPU framebuffer stays canonical at every observation point. Supported
+fills are batched; the engine synchronizes (reads the GPU work back into the
+CPU plane) before an unsupported draw falls back to the CPU, before the GFIFO
+becomes idle or exits, at a display fence, in `wait_idle`, and before any
+other CPU write to the plane, and only then releases `GFXBUSY` or publishes
+the fence. Completed work publishes through the existing damage tracker.
+
+The GPU copy of the RGB plane covers only the 1,344 x 1,024 screen and is
+stored tile-major in 32 x 32 tiles (5.25 MiB). The CPU bins each accepted
+fill into the tiles it covers; the shader runs one workgroup per tile, each
+invocation owning four pixels and applying that tile's fills in submission
+order, so no GPU barrier is needed. A synchronization copies back only the
+rows of tiles touched since the previous one: every other tile still equals
+the CPU plane, because only accepted fills change the GPU plane and any CPU
+mutation first makes the next draw re-upload it.
+
+Every accepted fill is also journaled until the next synchronization (at most
+65,536 draws or 4,194,304 pixels). On any GPU error, device loss or readback
+timeout the journal is replayed onto the CPU plane, which still holds the
+last synchronization, and the engine is disabled; the guest-visible context
+already advanced when each draw was accepted. The failed wgpu objects are
+leaked, since destroying a lost device can block or abort inside wgpu.
 
 Scanout is decoupled from drawing: the display thread reads the framebuffer
 without locks and composes it through the board's colour maps and DAC.
@@ -727,13 +773,24 @@ code into host code with Cranelift. The concepts:
   pointer as their first argument and return status in registers.
 - **The interpreter is the fallback and the reference.** Instructions without
   an emitter end the compiled region or call the interpreter's handler. The
-  equivalence tests, the cpu-tests matrix, `jitcheck` and the
+  equivalence tests, the cpu-tests suite run on both engines, `jitcheck` and the
   `jitv2_lockstep` feature compare the JIT against the interpreter.
 - **Several CPUs share one pool.** Compiled code reaches CPU state only through
   its core pointer, so it runs on either CPU. Dispatch reads pages lock-free, the
   pfn map publishes a slot after its claim, and inline stores bump generations
   atomically. Compiled code is freed only by a full flush, and every flush parks
   all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`).
+- **Uncached fetches the board decodes apart.** A page is keyed by the
+  physical address of the fetch. The IP35 reset PROM answers an uncached fetch
+  at 0x1fc00000 whatever RAM sits behind the cached view there, so a board whose
+  banks reach that window presents the fetch at an address of its own
+  (`uncached_fetch_alias`, which only the R16000 model takes) and the JIT sees
+  two different frames. Compiles read
+  that frame through the executor's cached bus (`set_cached_bus`, given
+  `Ip35Bus::code_view`), and its generation counter is the PROM device's, so a
+  flash command invalidates it and a store to RAM never does. The alias wraps the
+  translation (`update_translate_fn` installs the wrapper when one is set), so
+  the other machines' fetch paths are the ones they always had.
 - Compiled pages can optionally be cached on disk across runs
   (`[jitv2] cache`, [docs/jitv2-persistent-cache.md](docs/jitv2-persistent-cache.md)).
 
@@ -757,6 +814,26 @@ introspection commands are in [debug.md](debug.md#jit-v2).
   Crossbow and the Bridge with IOC3 and two ISP1040 SCSI controllers, an
   R10000, and IMPACT graphics (see the [Octane guide](docs/octane-ip30.md)
   for the boards).
+- **IP34 board, IP35 software platform (Fuel)**: one 500 MHz R14000, 512 MiB
+  in two 256 MiB banks, Bedrock, an XBridge with two PCI heads (`Bridge` and
+  `Xbow` built as the XBridge's parts), IOC3, a two-channel ISP12160, an OHCI
+  USB controller and the L1. A VPro board (the Octane's Odyssey model) can sit
+  at crossbar widget 13; its packets and DMA go through Bedrock's inbound path,
+  and the PI graphics registers are stored but count no credits. Without one
+  the machine runs headless on the L1 or an IOC3 serial console. Bedrock is
+  one device (`src/dev/bedrock/`): its two PIs, memory controller, I/O,
+  local-bus, network and crossbar blocks are plain fields, and a block's
+  access returns what it changed elsewhere for the chip to act on. The node around it (the processor bus, flash, L1 and Hub-special page)
+  is `src/ip35/node.rs`. Snapshots are unsupported. See the
+  [Fuel guide](docs/fuel-ip34.md).
+- **IP53 board, IP35 software platform (Tezro)**: its own board
+  (`src/ip53_machine.rs`) on the Bedrock node it shares with the Fuel
+  (`ip35::node`): one, two or four R16000s (700 MHz by default), each run on its own host
+  thread, memory from 512 and 1024 MiB banks (4 GiB by default), and a PIC
+  whose PXBOW is widget 0, carrying the IO9's IOC4, ISP12160 and BCM5701;
+  the two- and four-processor board adds a second PIC at widget 11. It runs
+  headless on the L1 or an IOC4 serial console. See the
+  [Tezro guide](docs/tezro-ip53.md).
 
 The Indy and Indigo2 profiles each have an embedded PROM fallback;
 `src/platform.rs` and `src/machine.rs` wire their differences, and
@@ -782,9 +859,21 @@ with full debug info for `perf` and flamegraphs. Every feature is listed in
 [FEATURES.md](FEATURES.md).
 
 Tests: `cargo test --workspace` (unit tests, including per-device snapshot
-round trips and, with `--features jitv2`, the JIT equivalence tests),
-`make -C cpu-tests run` (bare-metal instruction correctness), `iris-bench`
-(bare-metal throughput and accuracy). See [TESTING.md](TESTING.md).
+round trips and, with `--features jitv2`, the JIT equivalence tests). The
+bare-metal suites are integration tests, ignored by a plain `cargo test`:
+
+```
+cargo test --release [--features jitv2] --test cpu_tests -- --ignored       # instruction correctness
+cargo test --release [--features jitv2] --test bench_accuracy -- --ignored  # benchmark checksums
+cargo test -p iris-checks -- --ignored                                       # no formatting in hot code (needs a lightning release build)
+iris-bench run                                                              # throughput
+```
+
+The two suites build the emulator for the engine on their command line, so a
+verdict never comes from a stale or wrong-engine binary. CI runs the unit tests on Linux x86-64, Linux
+arm64 and Windows, and the suites on a pull request that touches them; failures
+show as annotations on the pull request. [TESTING.md](TESTING.md) has the commands,
+what CI runs and how to read its results.
 
 ## 11. References
 

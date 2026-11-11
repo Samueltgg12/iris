@@ -197,7 +197,7 @@ interrupt, the NVRAM flush) as `hptimer` one-shots, so they fire without the
 guest touching the chip. RAD audio is paced by `hptimer` too and
 has no thread of its own. Each ISP1040 runs a request-ring thread, started
 with the machine and joined when it stops. The Ethernet has a receive pump
-and the network backend (`ip30-eth-rx`, `ip30-eth-net`). A power-off from the
+and the network backend (`ioc3-eth-rx`, `ioc3-eth-net`). A power-off from the
 guest (the DS1685 clock powering the machine down) reaches the machine
 through its event channel. `HACKING.md` lists the thread names.
 
@@ -239,6 +239,7 @@ through its event channel. `HACKING.md` lists the thread names.
 
 ## Chips
 
+- [The IOC3 and its children](dev/ioc3.md)
 - [IOC3 PS/2 keyboard and mouse](dev/ioc3-ps2.md)
 - [QLogic ISP1040 SCSI controllers](dev/isp1040.md)
 

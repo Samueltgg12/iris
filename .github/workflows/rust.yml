@@ -8,14 +8,16 @@ on:
     # ready_for_review: marking a draft ready starts the full set below.
     types: [ opened, synchronize, reopened, ready_for_review ]
 
-# One run per pull request; a new push cancels the run it replaces. Main
-# pushes are never cancelled and get a group per commit, so none queues.
+# One run per pull request and one for main; a newer push cancels the older run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # libchdman-rs fetches a prebuilt archive at build time; compile from source
+  # when that download fails.
+  LIBCHDMAN_PREBUILT_FALLBACK: "1"
 
 # Runner images match release.yml: ubuntu-24.04 (glibc floor), macos-26 (pinned
 # through GitHub's macos-15 -> macos-26 migration; arm64), windows-latest (x64).
@@ -38,10 +40,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(
-          github.event_name != 'pull_request' && '["ubuntu-24.04","ubuntu-24.04-arm","windows-latest","macos-26"]' ||
-          github.event.pull_request.draft && '["ubuntu-24.04"]' ||
-          '["ubuntu-24.04","ubuntu-24.04-arm","windows-latest"]') }}
+        # Platforms per event kind; a failure fails the job only where gates is true.
+        # arm64 Linux gates: 24 of 24 recent pull-request runs passed every test there.
+        include: ${{ fromJSON('{
+          "push":[{"os":"ubuntu-24.04","gates":true},{"os":"ubuntu-24.04-arm","gates":true},{"os":"windows-latest","gates":false},{"os":"macos-26","gates":false}],
+          "draft":[{"os":"ubuntu-24.04","gates":true}],
+          "ready":[{"os":"ubuntu-24.04","gates":true},{"os":"ubuntu-24.04-arm","gates":true},{"os":"windows-latest","gates":false}]
+          }')[github.event_name != 'pull_request' && 'push' || github.event.pull_request.draft && 'draft' || 'ready'] }}
     steps:
     - uses: actions/checkout@v5
     # rust-toolchain.toml pins nightly; `rustup show` installs it up front so a
@@ -64,9 +69,9 @@ jobs:
     # tests never ran — a GUI-only breakage could not turn this red. It needs no
     # extra system packages: wayland, X11 and GL are dlopen'd at runtime, so the
     # only thing it links is libasound, which is already installed above.
-    # Linux x86-64 skips it: its nextest step builds the same code and fails the job.
+    # Gating platforms skip it: their nextest step builds the same code.
     - name: Build
-      if: matrix.os != 'ubuntu-24.04'
+      if: ${{ !matrix.gates }}
       run: cargo build --workspace --verbose
     # Linux compiles the replay example inside the matcher test step below.
     - name: Check REX3 GPU replay
@@ -75,23 +80,29 @@ jobs:
     - name: Test REX3 GPU matcher
       if: runner.os == 'Linux'
       run: cargo test -p iris --lib --example rex3-gpu-probe --features rex-gpu rex3_gpu::tests
+    - name: Validate strict synthetic REX3 CPU corpus
+      if: runner.os == 'Linux'
+      run: |
+        cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_replay_testdata -- --nocapture
+        cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_corpus_ -- --nocapture
+        REX3_CORPUS_IO_DIR=target cargo test -p iris --lib --features gputrace,rex-jit,rexdiag rex3_corpus_filesystem_security -- --ignored --nocapture
     # The VPro fragment pipeline's SIMD kernels against their scalar
     # formulas, on every level the runner's CPU has (src/dev/odyssey/pipe/
     # lanes.rs): deterministic, so they gate everywhere. macos-26 and
-    # ubuntu-24.04-arm are the runners with NEON. Linux x86-64 skips it:
-    # its nextest step runs the same tests.
+    # ubuntu-24.04-arm are the runners with NEON. Gating platforms skip it:
+    # their nextest step runs the same tests.
     - name: Run SIMD lane tests
-      if: matrix.os != 'ubuntu-24.04'
+      if: ${{ !matrix.gates }}
       run: cargo test -p iris --lib the_lane_
     # nextest runs each test in its own process and writes the JUnit report
     # the annotations below come from. It does not run doctests.
-    # Only Linux x86-64 fails the job; the other platforms report a failure
+    # Only gating platforms fail the job; the others report a failure
     # (a red step, which the API still counts as a pass) and carry on.
     - name: Run tests
-      continue-on-error: ${{ matrix.os != 'ubuntu-24.04' }}
+      continue-on-error: ${{ !matrix.gates }}
       run: cargo nextest run --workspace --profile ci
     - name: Run doctests
-      continue-on-error: ${{ matrix.os != 'ubuntu-24.04' }}
+      continue-on-error: ${{ !matrix.gates }}
       run: cargo test --workspace --doc
     - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
       if: ${{ !cancelled() }}
@@ -112,7 +123,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04","windows-latest"]' || '["ubuntu-24.04","windows-latest","macos-26"]') }}
+        include: ${{ fromJSON('{
+          "push":[{"os":"ubuntu-24.04"},{"os":"windows-latest"},{"os":"macos-26"}],
+          "ready":[{"os":"ubuntu-24.04"},{"os":"windows-latest"}]
+          }')[github.event_name != 'pull_request' && 'push' || 'ready'] }}
     steps:
     - uses: actions/checkout@v5
     - name: Install pinned toolchain
@@ -127,10 +141,19 @@ jobs:
         save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Build
       run: cargo build --release -p iris --bins --features lightning,jitv2,gpujit,idle-pause,hostgl
-    # Needs this build: lightning, and fat LTO from the release profile.
+    # Reads the binary built above (lightning, fat LTO); x86-64 only.
+    - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39  # v2.90.3
+      if: runner.os == 'Linux'
+      with:
+        tool: nextest
     - name: Check the interpreter's hot paths
       if: runner.os == 'Linux'
-      run: tools/hot-path-check.sh target/release/iris
+      run: cargo nextest run -p iris-checks --profile ci --run-ignored only
+    - uses: mikepenz/action-junit-report@a16be3a69023e9bd7e748ede768b3282ea7b30ce  # v6.7.1
+      if: ${{ runner.os == 'Linux' && !cancelled() }}
+      with:
+        report_paths: target/nextest/ci/junit.xml
+        annotate_only: true
     - name: Build opt-in REX3 dirty uploads
       run: |
         cargo build -p iris --features rex-dirty-upload
@@ -141,6 +164,28 @@ jobs:
         cargo test -p iris --test rex3_dirty --features rex-dirty-upload
         cargo test -p iris --lib --features rex-dirty-upload go_damage_classifies_planes_bounds_and_non_writes
         cargo test -p iris --lib --features rex-dirty-upload register_traffic_is_clean_and_draws_publish_selected_plane
+
+  # Full-size JIT-vs-interpreter sweeps. Debug builds run them scaled down, so
+  # main runs them at full size in release (no LTO: it costs 4x the build).
+  jit-sweeps:
+    name: JIT sweeps (release)
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+    - uses: actions/checkout@v5
+    - name: Install pinned toolchain
+      run: rustup show
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+    - uses: Swatinem/rust-cache@v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - name: Run the sweeps
+      run: cargo test --release -p iris --lib --features gpujit -- rss_jit_tests re3_jit_tests
 
   # The distribution scripts run only in nightly and release builds, so lint
   # them here where a mistake shows up on the pull request.

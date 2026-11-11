@@ -12,10 +12,10 @@
 #   cpu-tests  is this instruction correct — one at a time, clean state.
 #              R4400 vs R5000 because the mips4/ group requires each MIPS IV
 #              instruction to compute on R5000 and raise Reserved Instruction
-#              on R4400. interp vs jitv2 because a guest-visible ISA suite is
-#              the cleanest JIT differential available. It does not run on the
-#              R10000: every expectation in it is chosen by PRId, and it has
-#              none for that CPU.
+#              on R4400; the R10000, R12000 and R14000 because their FPU, CP0,
+#              TLB and cache differ from both (cpu-tests/docs/r10000.md).
+#              interp vs jitv2 because a guest-visible ISA suite is the
+#              cleanest JIT differential available.
 #
 #   bench      is it still correct after ten million of them, with whatever
 #              state the last million left — and how long did that take.
@@ -58,11 +58,10 @@ on:
     paths: *suite_paths
   workflow_dispatch:
 
-# One run per pull request; a new push cancels the run it replaces. Main
-# pushes are never cancelled and get a group per commit, so none queues.
+# One run per pull request and one for main; a newer push cancels the older run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -70,7 +69,7 @@ env:
 jobs:
   guests:
     name: Build the guest binaries
-    runs-on: ubuntu-24.04
+    runs-on: &ubuntu ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -125,7 +124,7 @@ jobs:
   # here means a kernel is not deterministic even against itself.
   host-baseline:
     name: Host baseline
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -146,7 +145,7 @@ jobs:
   # the CPU model, so one run is enough.
   embedded:
     name: Embedded runner
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -162,7 +161,7 @@ jobs:
   suites:
     name: ${{ matrix.engine }}
     needs: guests
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -249,7 +248,7 @@ jobs:
     name: Comparison report
     needs: suites
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5

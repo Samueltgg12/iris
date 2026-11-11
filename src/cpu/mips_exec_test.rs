@@ -673,6 +673,9 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>();
         check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
         check::<crate::cpu::mips_cache_shadow::R12000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R16000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R16000Scache8ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R16000Scache16ShadowCache>();
     }
 
     /// JIT store callouts carry the same source register as the interpreter.
@@ -1427,6 +1430,180 @@ mod tests {
         on_big_stack(|| {
             run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
             run::<R4400Cache>(false);
+        });
+    }
+
+    /// 2^31 is a single but not a word, so CVT.W.S of it is Invalid with the
+    /// largest word as the default result, like any other overflow. It was
+    /// taken for in range because `i32::MAX as f32` rounds up to it. -2^31
+    /// still converts exactly.
+    #[test]
+    fn cvt_w_s_of_2_to_the_31_is_invalid() {
+        const FCSR_CV: u32 = 0x0001_0000;
+        on_big_stack(|| {
+            let mut exec = tlb_exec::<R4400Cache>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            let cvt = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_W);
+            for (input, want, invalid) in [(2147483648.0f32, i32::MAX, true), (-2147483648.0f32, i32::MIN, false)] {
+                exec.core.fpu_fcsr = 0;
+                exec.core.fpr[1] = input.to_bits() as u64;
+                assert_eq!(exec.exec(cvt), EXEC_COMPLETE, "{input}");
+                assert_eq!(exec.core.fpr[2] as u32, want as u32, "{input} result");
+                assert_eq!(exec.core.fpu_fcsr & FCSR_CV != 0, invalid, "{input} Cause.V");
+            }
+        });
+    }
+
+    /// A conversion whose result a word cannot hold takes Unimplemented
+    /// Operation on the R10000 family, leaving fd alone (NEC U10278EJ4V0UM
+    /// Appendix B.4, p. 350); the R4400 raises Invalid and writes the default.
+    #[test]
+    fn unrepresentable_conversions_are_unimplemented_on_the_r10000_family() {
+        const FCSR_CE: u32 = 0x0002_0000;
+        const FCSR_CV: u32 = 0x0001_0000;
+        const OLD: u64 = 0x5a5a_5a5a;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(traps: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            let cvt = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_W);
+            for input in [2147483648.0f32, f32::INFINITY, -1.0e20, f32::NAN] {
+                exec.core.fpu_fcsr = 0;
+                exec.core.fpr[1] = input.to_bits() as u64;
+                exec.core.fpr[2] = OLD;
+                let s = exec.exec(cvt);
+                if traps {
+                    assert!(s & EXEC_IS_EXCEPTION != 0, "{input} traps");
+                    assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE, "{input} FPE");
+                    assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CE, "{input} Cause.E alone");
+                    assert_eq!(exec.core.fpr[2], OLD, "{input} fd untouched");
+                } else {
+                    assert_eq!(s, EXEC_COMPLETE, "{input}");
+                    assert_eq!(exec.core.fpu_fcsr & (FCSR_CE | FCSR_CV), FCSR_CV, "{input} Cause.V");
+                }
+            }
+            // A representable value still converts.
+            exec.core.fpu_fcsr = 0;
+            exec.core.fpr[1] = 7.0f32.to_bits() as u64;
+            assert_eq!(exec.exec(cvt), EXEC_COMPLETE);
+            assert_eq!(exec.core.fpr[2] as u32, 7);
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+            run::<R4400Cache>(false);
+        });
+    }
+
+    /// The R10000 converts to a long "only up to 51 bits; otherwise an
+    /// Unimplemented Operation exception is taken" (R10000 UM v2.0 p. 312):
+    /// 2^52 traps there and converts on the R12000, whose manual has no such
+    /// limit. Both ends of [-2^51, 2^51) convert.
+    #[test]
+    fn cvt_l_stops_at_51_bits_on_the_r10000() {
+        const FCSR_CE: u32 = 0x0002_0000;
+        const OLD: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(limited: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            let cvt_l_d = make_cop1_compute(RS_D, 0, 1, 2, FUNCT_FCVT_L);
+            let cvt_l_s = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FCVT_L);
+            let p52 = (1i64 << 52) as f64;
+            let cases = [
+                (cvt_l_d, p52.to_bits(), 1i64 << 52, limited),
+                (cvt_l_d, (-p52).to_bits(), -(1i64 << 52), limited),
+                (cvt_l_s, (p52 as f32).to_bits() as u64, 1i64 << 52, limited),
+                (cvt_l_d, (((1i64 << 51) - 1) as f64).to_bits(), (1i64 << 51) - 1, false),
+                (cvt_l_d, (-((1i64 << 51) as f64)).to_bits(), -(1i64 << 51), false),
+                (cvt_l_s, ((1i64 << 49) as f32).to_bits() as u64, 1i64 << 49, false),
+            ];
+            for (instr, input, want, traps) in cases {
+                exec.core.fpu_fcsr = 0;
+                exec.core.fpr[1] = input;
+                exec.core.fpr[2] = OLD;
+                let s = exec.exec(instr);
+                if traps {
+                    assert!(s & EXEC_IS_EXCEPTION != 0, "{want} traps");
+                    assert_eq!(exec.core.fpu_fcsr & FCSR_CE, FCSR_CE, "{want} Cause.E");
+                    assert_eq!(exec.core.fpr[2], OLD, "{want} fd untouched");
+                } else {
+                    assert_eq!(s, EXEC_COMPLETE, "{want}");
+                    assert_eq!(exec.core.fpr[2] as i64, want, "{want} converts");
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(false);
+        });
+    }
+
+    /// "undefined opcodes (bits 25:24 are 0 or 1) take Reserved Instruction
+    /// exceptions and undefined formats (bits 25:24 are 2 or 3) take
+    /// Unimplemented Operation exceptions" on the R10000 (R10000 UM v2.0
+    /// p. 357). The R5000 keeps Reserved Instruction for both.
+    #[test]
+    fn undefined_cop1_formats_are_unimplemented_on_the_r10000_family() {
+        const FCSR_CE: u32 = 0x0002_0000;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(r10k: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            for (name, instr, unimplemented) in [
+                ("rs=7", (OP_COP1 << 26) | (7 << 21), false),
+                ("fmt=18 add", make_cop1_compute(18, 2, 1, 3, FUNCT_FADD), r10k),
+                ("fmt=31 add", make_cop1_compute(31, 2, 1, 3, FUNCT_FADD), r10k),
+            ] {
+                exec.core.fpu_fcsr = 0;
+                let s = exec.exec(instr);
+                assert!(s & EXEC_IS_EXCEPTION != 0, "{name} traps");
+                let want = if unimplemented { crate::cpu::mips_exec::EXC_FPE } else { EXC_RI };
+                assert_eq!((s >> 2) & 0x1F, want, "{name} exception");
+                assert_eq!(exec.core.fpu_fcsr & FCSR_CE != 0, unimplemented, "{name} Cause.E");
+            }
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_v2::R5000Cache>(false);
+        });
+    }
+
+    /// MOVZ.S, MOVN.S, MOVT.S and MOVF.S write fd on the R10000 family even
+    /// when the condition is false: the old low word stays and, with FR set,
+    /// the upper word is zeroed, "even though the condition is false"
+    /// (R10000 UM v2.0 p. 313). The R5000 leaves an unmoved fd alone.
+    #[test]
+    fn untaken_single_conditional_moves_clear_the_upper_word_on_the_r10000_family() {
+        const OLD: u64 = 0xdead_beef_5a5a_5a5a;
+        fn run<C: CpuModel + From<Arc<dyn BusDevice>>>(clears: bool) {
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            exec.set_cp0_status(exec.core.cp0_status | STATUS_CU1 | STATUS_FR);
+            exec.core.fpu_fcsr = 0; // $fcc0 false
+            // (name, instruction, moves) with fs = $f1, fd = $f3; $8 = 0, $9 = 1.
+            let cases = [
+                ("movz.s untaken", make_cop1_compute(RS_S, 9, 1, 3, FUNCT_FMOVZ), false),
+                ("movn.s untaken", make_cop1_compute(RS_S, 8, 1, 3, FUNCT_FMOVN), false),
+                ("movt.s untaken", make_cop1_compute(RS_S, 1, 1, 3, FUNCT_FMOVCF), false),
+                ("movf.s taken", make_cop1_compute(RS_S, 0, 1, 3, FUNCT_FMOVCF), true),
+                ("movz.s taken", make_cop1_compute(RS_S, 8, 1, 3, FUNCT_FMOVZ), true),
+            ];
+            for (name, instr, moves) in cases {
+                exec.core.gpr[8] = 0;
+                exec.core.gpr[9] = 1;
+                exec.core.fpr[1] = 0x2989_815b_3fc0_0000; // 1.5
+                exec.core.fpr[3] = OLD;
+                assert_eq!(exec.exec(instr), EXEC_COMPLETE, "{name}");
+                let low = if moves { 0x3fc0_0000 } else { OLD as u32 };
+                assert_eq!(exec.core.fpr[3] as u32, low, "{name} low word");
+                if clears {
+                    assert_eq!(exec.core.fpr[3] >> 32, 0, "{name} upper word");
+                } else if !moves {
+                    assert_eq!(exec.core.fpr[3], OLD, "{name} untouched");
+                }
+            }
+        }
+        on_big_stack(|| {
+            run::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+            run::<crate::cpu::mips_cache_v2::R5000Cache>(false);
         });
     }
 
@@ -3877,6 +4054,15 @@ mod tests {
             ("qnan,snan", f64::from_bits(0x7FF7_FFFF_FFFF_FFFF), f64::from_bits(0x7FF8_0000_0000_0000), true, true),
         ];
 
+        // One executor for every case: building one dominates the test's
+        // time. Each case rewrites the state it reads, and the registers an
+        // enabled trap writes (Status, Cause, EPC, PC) go back to their
+        // starting values first.
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+        let (status, cause, epc, pc) = (exec.core.cp0_status, exec.core.cp0_cause, exec.core.cp0_epc, exec.core.pc);
+
         for is_d in [false, true] {
             for i in 0..6 {
                 let (name, a_nan, a_snan) = if is_d {
@@ -3886,9 +4072,11 @@ mod tests {
                 };
                 for funct in FUNCT_FC_F..=FUNCT_FC_NGT {
                     for enable in [0, ENABLE_V] {
-                        let (mut exec, _) = create_executor();
-                        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
-                        exec.update_fpr_mode();
+                        exec.core.cp0_status = status;
+                        exec.core.cp0_cause = cause;
+                        exec.core.cp0_epc = epc;
+                        exec.core.pc = pc;
+                        exec.core.in_delay_slot = false;
                         // Stale Cause everywhere, cc0 set, one sticky flag.
                         let before = CAUSE | CC0 | FLAG_I | enable;
                         exec.core.fpu_fcsr = before;
@@ -7429,6 +7617,11 @@ mod tests {
             assert_eq!(entry::<R10000ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, (3 << 62) | (lo & !(3 << 32))));
             assert_eq!(entry::<R10000ShadowCache>(0), (0, 0xC0_0300_4000, (3 << 62) | lo));
             assert_eq!(entry::<R4400ShadowCache>(0xFFFF_C000), (0, 0x0300_4000, (lo & 0x3FFF_FFFF) | 0xC0));
+            // The R16000 types share the R10000 family's TLB.
+            let masked = (3 << 62) | (lo & !(3 << 32));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000Scache8ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
+            assert_eq!(entry::<crate::cpu::mips_cache_shadow::R16000Scache16ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, masked));
         });
     }
 
@@ -7589,6 +7782,10 @@ mod tests {
             assert_eq!(ss_sb::<R10000ShadowCache>(), (1, 1));
             assert_eq!(ss_sb::<R12000ShadowCache>(), (2, 1));
             assert_eq!(ss_sb::<R12000O2ShadowCache>(), (2, 0));
+            // 4, 8 and 16 MB with 128-byte lines: SS codes 3, 4 and 5.
+            assert_eq!(ss_sb::<R16000ShadowCache>(), (3, 1));
+            assert_eq!(ss_sb::<R16000Scache8ShadowCache>(), (4, 1));
+            assert_eq!(ss_sb::<R16000Scache16ShadowCache>(), (5, 1));
         });
     }
 }

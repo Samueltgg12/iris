@@ -9,7 +9,8 @@
 # to check that a branch builds everywhere without publishing anything.
 #
 # The boot-test job then boots IRIX 5.3 with the Linux, macOS and Windows CLI
-# builds, when the IRIX53_BOOT_IMAGE_URL secret is set.
+# builds, once on the serial console and once on the graphics console, when the
+# IRIX53_BOOT_IMAGE_URL secret is set.
 #
 # Runner images are pinned: a glibc-linked Linux binary needs at least the
 # build host's glibc, so ubuntu-24.04 decides which distros our packages run on,
@@ -36,7 +37,7 @@ on:
         required: true
       macos_runner:
         type: string
-        default: macos-26
+        default: &macos_runner macos-26
       require_notarization:
         description: Fail the macOS job instead of shipping an unnotarized app
         type: boolean
@@ -51,7 +52,7 @@ on:
         default: lightning,jitv2,gpujit,idle-pause,hostgl
       macos_runner:
         description: macOS runner image
-        default: macos-26
+        default: *macos_runner
 
 permissions:
   contents: read
@@ -62,11 +63,14 @@ env:
   # what it downloads, so tracking main keeps the two in step; set a commit SHA
   # here to hold back an upstream change.
   ANYLINUX_REF: refs/heads/main
+  # libchdman-rs downloads a prebuilt archive from GitHub releases at build
+  # time and fails the build if the download does. Compile from source then.
+  LIBCHDMAN_PREBUILT_FALLBACK: "1"
 
 jobs:
   version:
     name: Version
-    runs-on: ubuntu-24.04
+    runs-on: &ubuntu ubuntu-24.04
     outputs:
       version: ${{ steps.v.outputs.version }}
       ref: ${{ steps.v.outputs.ref }}
@@ -91,7 +95,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   target: x86_64-pc-windows-msvc,  runner: windows-latest }
+          - { arch: x64,   target: x86_64-pc-windows-msvc,  runner: &windows windows-latest }
           - { arch: arm64, target: aarch64-pc-windows-msvc, runner: windows-11-arm }
     steps:
       - uses: actions/checkout@v5
@@ -100,12 +104,12 @@ jobs:
       - name: Toolchain
         shell: bash
         run: rustup show && rustup target add ${{ matrix.target }}
+      # Registry and git only: release `target` trees overflow the cache quota.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-${{ matrix.target }}-
       - name: Install Inno Setup
@@ -137,6 +141,7 @@ jobs:
           ref: ${{ needs.version.outputs.ref }}
       - name: Toolchain
         run: rustup show && rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      # Only macOS caches `target`: its build is the slowest, and a hit pays.
       - uses: actions/cache@v5
         with:
           path: |
@@ -223,8 +228,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
-          - { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - &linux_x64   { arch: x64,   target: x86_64-unknown-linux-gnu,  runner: *ubuntu }
+          - &linux_arm64 { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v5
         with:
@@ -239,12 +244,12 @@ jobs:
         run: |
           rustup show
           cargo install --locked cargo-deb cargo-generate-rpm
+      # Registry and git only: release `target` trees overflow the cache quota.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-${{ matrix.target }}-
       - name: Build and package
@@ -269,8 +274,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
-          - { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - *linux_x64
+          - *linux_arm64
     steps:
       # git first, so checkout makes a real clone (build.rs reads the commit).
       - name: git
@@ -280,12 +285,12 @@ jobs:
           ref: ${{ needs.version.outputs.ref }}
       - name: Trust the checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # Registry and git only: release `target` trees overflow the cache quota.
       - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: dist-appimage-${{ matrix.arch }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: dist-appimage-${{ matrix.arch }}-
       - name: Build and bundle
@@ -307,7 +312,7 @@ jobs:
   riscv64:
     name: Linux riscv64 (cross)
     needs: version
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     container: debian:trixie
     env:
       # The container runs as root but Actions sets HOME=/github/home; rustup
@@ -366,7 +371,9 @@ jobs:
           if-no-files-found: error
 
   # Boots IRIX 5.3 to a login prompt with the CLI just built, through
-  # scripts/ci-boot-test.sh. The disk image comes from the
+  # scripts/ci-boot-test.sh: once on serial, where "login:" is read, and once
+  # on the graphics board, where the screen must match
+  # scripts/boot-goldens/indy-irix53.png. The disk image comes from the
   # IRIX53_BOOT_IMAGE_URL secret; without it every step is skipped and the job
   # passes with a warning. nightly.yml and release.yml publish only if this
   # whole workflow succeeds, so a failed boot stops the publish.
@@ -374,17 +381,25 @@ jobs:
     name: Boot test (${{ matrix.os }}-${{ matrix.arch }})
     needs: [version, windows, macos, linux]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Every wait in scripts/ci-boot-test.sh running out, per boot: seeding
+    # NVRAM (60 s for the CI socket, 180 s for the PROM menu, 30 s for the
+    # monitor prompt, 6 x 30 s for its commands, 5 s to stop) and the boot
+    # (60 s for the socket, BOOT_TIMEOUT, 5 s between polls, 5 s to stop) is
+    # about 1125 s, so the two boots are about 2250 s. The steps before the
+    # boot took under 30 s in the 2026-11-09 nightly.
+    timeout-minutes: 40
     env:
       VER: ${{ needs.version.outputs.version }}
-      BOOT_TIMEOUT: 900
+      # Per boot. The graphical login appeared within 80 s on all three
+      # runners in the 2026-11-09 nightly, the one run there is so far.
+      BOOT_TIMEOUT: 600
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: linux,   arch: x64,       runner: ubuntu-24.04 }
+          - { os: linux,   arch: x64,       runner: *ubuntu }
           - { os: macos,   arch: universal, runner: "${{ inputs.macos_runner || 'macos-26' }}" }
-          - { os: windows, arch: x64,       runner: windows-latest }
+          - { os: windows, arch: x64,       runner: *windows }
     defaults:
       run:
         shell: bash
@@ -460,7 +475,7 @@ jobs:
           path: boot-image
           key: irix53-boot-image-${{ steps.image.outputs.hash }}
 
-      - name: Boot IRIX 5.3 to the login prompt
+      - name: Boot IRIX 5.3 on the serial and graphics consoles
         if: ${{ steps.image.outputs.present == 'true' }}
         run: bash scripts/ci-boot-test.sh core boot-image/irix53.chd boot-test "$BOOT_TIMEOUT"
 
@@ -479,6 +494,7 @@ jobs:
         with:
           name: boot-test-${{ matrix.os }}-${{ matrix.arch }}
           path: |
+            boot-test/*.png
             boot-test/*.log
             boot-test/boot-test.toml
             boot-test/boot-test.xml
@@ -488,7 +504,7 @@ jobs:
   check:
     name: Check the release files
     needs: [version, windows, macos, linux, appimage, riscv64]
-    runs-on: ubuntu-24.04
+    runs-on: *ubuntu
     steps:
       - uses: actions/checkout@v5
         with:

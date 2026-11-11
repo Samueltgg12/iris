@@ -24,8 +24,9 @@ use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::bridge::{Bridge, RawFlash};
 use crate::dev::heart::{host_clock, Heart, HeartConfig, PIU_BASE, PIU_SIZE};
 use crate::dev::heart_mem::HeartRam;
-use crate::dev::ioc3::Ioc3;
-use crate::dev::ioc3_eth::Ioc3Eth;
+use crate::dev::ds1685::Ds1685;
+use crate::dev::ioc3::{self, ByteBus, Ioc3};
+use crate::dev::ioc3::eth::Ioc3Eth;
 use crate::dev::isp1040::Isp1040;
 use crate::dev::mgras::hq4::ImpactXio;
 use crate::dev::odyssey::Odyssey;
@@ -89,9 +90,6 @@ fn prom_revision(prom: &[u8]) -> Option<(u32, u32)> {
 /// The graphics port the one IMPACT board sits in. A choice: it is where a
 /// measured Octane2 has its graphics board, not a measured SI placement.
 pub const WIDGET_GFX: u8 = 11;
-/// The Bridge input IOC3's SuperIO block (serial, keyboard, clock) is
-/// wired to; the Ethernet uses IOC3's PCI pin.
-const SUPERIO_PIN: u8 = 4;
 /// Bridge slot of the virtio device: 0 and 1 are SCSI, 2 IOC3, 3 the RAD.
 const VIRTIO_SLOT: u8 = 4;
 /// The blank part on the Bridge's second flash select: reads all ones and
@@ -104,13 +102,128 @@ pub fn heart_banks(cfg: &MachineConfig) -> [u64; 4] {
     std::array::from_fn(|i| (cfg.banks[i] as u64) << 20)
 }
 
-/// A MicroLAN with one board-record part. The barcodes (EMU...) and ROM
-/// serials are made up and marked so; the part numbers and names are an
-/// Octane's.
-fn record_bus(barcode: &str, part: &str, revision: &str, name: &str, serial: u64) -> w1::Bus {
-    let mut bus = w1::Bus::new();
-    bus.add(Box::new(board_record_part(&BoardRecord { barcode, part, revision, name }, serial)));
-    bus
+/// One board record on a one-wire line: part, revision and name as the
+/// product's inventory prints them. The barcode and the ROM serial are
+/// made up and marked so (EMU...), so an inventory from the model never
+/// reads as a real unit.
+struct Record {
+    barcode: &'static str,
+    part: &'static str,
+    revision: &'static str,
+    name: &'static str,
+    serial: u64,
+}
+
+impl Record {
+    fn part(&self) -> w1::Ds2505 {
+        board_record_part(
+            &BoardRecord { barcode: self.barcode, part: self.part, revision: self.revision, name: self.name },
+            self.serial,
+        )
+    }
+
+    fn bus(&self) -> w1::Bus {
+        let mut bus = w1::Bus::new();
+        bus.add(Box::new(self.part()));
+        bus
+    }
+}
+
+/// The four identity records a product carries: the processor module on
+/// HEART's one-wire master, the system board on the onboard Bridge's, and
+/// the front plane and power supply on the IOC3's beside its
+/// Ethernet-address part. Names, parts and revisions are the products'
+/// inventories; the processor module's name depends on the module fitted as
+/// well as the product.
+struct Identity {
+    processor: Record,
+    system_board: Record,
+    front_plane: Record,
+    power_supply: Record,
+}
+
+impl Identity {
+    /// The Octane. A PM10 has one processor and a PM20 two, and the PROM's
+    /// diagnostics hold the record to the processors HEART reports.
+    fn octane(cpus: u8) -> Identity {
+        Identity {
+            processor: Record {
+                barcode: "EMUU00",
+                part: "030-0888-004",
+                revision: "B",
+                name: if cpus > 1 { "PM20" } else { "PM10" },
+                serial: 0x5145_4d55_5500,
+            },
+            system_board: Record {
+                barcode: "EMUN00",
+                part: "030-0887-003",
+                revision: "F",
+                name: "IP30",
+                serial: 0x5145_4d55_4e00,
+            },
+            front_plane: Record {
+                barcode: "EMUF00",
+                part: "030-0891-003",
+                revision: "A",
+                name: "FP1",
+                serial: 0x5145_4d55_4600,
+            },
+            power_supply: Record {
+                barcode: "EMUS00",
+                part: "060-0028-003",
+                revision: "A",
+                name: "PWR.SPPLY.SR",
+                serial: 0x5145_4d55_5300,
+            },
+        }
+    }
+
+    /// The Octane2, from one reference unit's inventory. The processor
+    /// module is that unit's single-processor 360 MHz one, for any processor
+    /// count: no inventory of a dual-processor Octane2 is at hand
+    /// (approximation).
+    fn octane2() -> Identity {
+        Identity {
+            processor: Record {
+                barcode: "EMUU00",
+                part: "030-1590-002",
+                revision: "B",
+                name: "PM10360MHZ",
+                serial: 0x5145_4d55_5500,
+            },
+            system_board: Record {
+                barcode: "EMUN00",
+                part: "030-1467-001",
+                revision: "B",
+                name: "IP30",
+                serial: 0x5145_4d55_4e00,
+            },
+            front_plane: Record {
+                barcode: "EMUF00",
+                part: "030-0891-003",
+                revision: "H",
+                name: "FP1",
+                serial: 0x5145_4d55_4600,
+            },
+            power_supply: Record {
+                barcode: "EMUS00",
+                part: "060-0035-002",
+                revision: "A",
+                name: "PWR.SPPLY.ER",
+                serial: 0x5145_4d55_5300,
+            },
+        }
+    }
+
+    /// The IOC3's line: the station-address part, then the front plane and
+    /// the power supply.
+    fn ioc3_wire(&self, mac: [u8; 6]) -> w1::Bus {
+        let mut bus = w1::Bus::new();
+        bus.add(Box::new(w1::sgi::ethernet_address_part(mac, w1::sgi::ETHERNET_PART_SERIAL)));
+        bus.add(Box::new(self.front_plane.part()));
+        bus.add(Box::new(self.power_supply.part()));
+        bus
+    }
 }
 
 pub struct OctaneMachine {
@@ -134,6 +247,8 @@ pub struct OctaneMachine {
     /// own, in config order.
     pub xio_boards: Vec<XioPciBoard>,
     pub ioc3: Arc<Ioc3>,
+    /// The clock on IOC3's byte bus, which IOC3 starts and stops.
+    rtc: Arc<Ds1685>,
     pub scsi: [Arc<Isp1040>; 2],
     eth: Arc<Ioc3Eth>,
     rad: Arc<Rad1>,
@@ -175,7 +290,7 @@ impl OctaneMachine {
         if prom.len() > FLASH_SIZE {
             return Err(format!("Octane PROM {prom_path} is {} bytes; the flash holds {FLASH_SIZE}", prom.len()));
         }
-        let cpu_count = cfg.machine.cpus;
+        let cpu_count = cfg.machine.cpus();
         MachineProfile::OctaneIp30.accepts_cpus(cpu_count)?;
         let banks = heart_banks(cfg);
         let kind = cfg.graphics_board();
@@ -215,10 +330,8 @@ impl OctaneMachine {
         let mem = ram.dma_view();
         let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, host_clock()));
         // HEART's MicroLAN holds the processor module's record.
-        // The PROM's diagnostics hold it to the processors HEART reports: a
-        // PM10 has one and a PM20 two.
-        let module = if cpu_count > 1 { "PM20" } else { "PM10" };
-        heart.set_microlan(record_bus("EMUU00", "030-0888-004", "B", module, 0x5145_4d55_5500));
+        let identity = if octane2 { Identity::octane2() } else { Identity::octane(cpu_count) };
+        heart.set_microlan(identity.processor.bus());
 
         let gfx_link = if board.is_some() || has_vpro { 1 << WIDGET_GFX } else { 0 };
         let xio_widgets = cfg.xio_widgets()?;
@@ -241,7 +354,7 @@ impl OctaneMachine {
         });
         bridge.attach_flash(flash.clone(), FLASH_SIZE as u32);
         bridge.attach_flash_select1(Arc::new(RawFlash::new(&[], FLASH_SELECT1_SIZE)), FLASH_SELECT1_SIZE as u32);
-        bridge.set_microlan(record_bus("EMUN00", "030-0887-003", "F", "IP30", 0x5145_4d55_4e00));
+        bridge.set_microlan(identity.system_board.bus());
         // DMA reaches only widgets the Crossbow has a live link to.
         let links = xbow.clone();
         bridge.set_link_alive(Box::new(move |w| links.carries(w)));
@@ -285,24 +398,24 @@ impl OctaneMachine {
             })
             .transpose()?;
         disks.extend(nvme.as_ref().map(|n| crate::dev::nvme::disk_ref(&cfg.nvme, n)));
-        let ioc3 = Arc::new(Ioc3::octane(mac, false));
+        // The DS1685 on IOC3's byte bus: the guest switching the machine off
+        // through it, and its NVRAM in a file.
+        let rtc = Ds1685::new(Some(event_tx.clone()));
+        rtc.set_rtc_offset(&cfg.rtc_offset);
+        if let Err(e) = rtc.set_nvram_file(&cfg.nvram) {
+            eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);
+        }
+        let ioc3 = Arc::new(Ioc3::new(&ioc3::IP30, mac, ByteBus::Ds1685(rtc.clone())));
+        ioc3.set_microlan(identity.ioc3_wire(mac));
         ioc3.set_heartbeat(heartbeat.clone());
-        let eth = Ioc3Eth::new(mac);
-        eth.set_heartbeat(heartbeat.clone());
-        ioc3.attach_eth(eth.clone());
+        let eth = ioc3.eth().expect("the Octane's IOC3 fits Ethernet").clone();
         pci.attach(slot(2), ioc3.clone());
-        ioc3.connect_superio_interrupt(pci.board_irq(BoardIrq(SUPERIO_PIN)));
+        ioc3.connect_superio(pci);
         ioc3.set_timer_manager(timer_manager.clone());
-        // The guest switching the machine off through the clock.
-        ioc3.set_event_sender(event_tx.clone());
         // ... and resetting itself through HEART.
         heart.on_soft_reset(Box::new(move || {
             let _ = event_tx.try_send(MachineEvent::HardReset);
         }));
-        ioc3.set_rtc_offset(&cfg.rtc_offset);
-        if let Err(e) = ioc3.set_nvram_file(&cfg.nvram) {
-            eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);
-        }
         let rad = Arc::new(Rad1::new());
         rad.set_timer_manager(timer_manager.clone());
         if !cfg.no_audio {
@@ -536,7 +649,6 @@ impl OctaneMachine {
         }
         flash.register_locks();
         ioc3.register_locks();
-        eth.register_locks();
         rad.register_locks();
         if let Some(g) = &gfx {
             monitor.register_device(g.mgras().clone());
@@ -577,6 +689,7 @@ impl OctaneMachine {
             bridge,
             xio_boards,
             ioc3,
+            rtc,
             scsi,
             eth,
             rad,
@@ -682,7 +795,6 @@ impl OctaneMachine {
         let mut d: Vec<Arc<dyn Device>> = vec![
             self.heart.clone(),
             self.ioc3.clone(),
-            self.eth.clone(),
             self.scsi[0].clone(),
             self.scsi[1].clone(),
             self.rad.clone(),
@@ -767,7 +879,6 @@ impl OctaneMachine {
             b.bridge().reset_pci();
         }
         self.ioc3.power_on();
-        self.eth.power_on();
         for c in &self.scsi {
             c.reset();
         }
@@ -1205,7 +1316,7 @@ impl Workstation for OctaneMachine {
         if self.nvram_path.is_empty() {
             return Err("no nvram file configured".into());
         }
-        self.ioc3.flush_nvram();
+        self.rtc.flush();
         Ok(self.nvram_path.clone())
     }
     fn scratch_path(&self) -> Option<&std::path::Path> {
@@ -1338,6 +1449,46 @@ impl Device for Ip30Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Octane2 carries its own four identity records, from one reference
+    /// unit's inventory, and the Octane keeps the ones it had. The IOC3's
+    /// wire holds the Ethernet-address part, the front plane and the power
+    /// supply; HEART's and the Bridge's hold one record each.
+    #[test]
+    fn each_product_carries_its_own_identity_records() {
+        let o = Identity::octane(1);
+        let o2 = Identity::octane2();
+        let key = |i: &Identity| {
+            [&i.processor, &i.system_board, &i.front_plane, &i.power_supply].map(|r| (r.part, r.revision, r.name))
+        };
+        assert_eq!(
+            key(&o),
+            [
+                ("030-0888-004", "B", "PM10"),
+                ("030-0887-003", "F", "IP30"),
+                ("030-0891-003", "A", "FP1"),
+                ("060-0028-003", "A", "PWR.SPPLY.SR"),
+            ]
+        );
+        assert_eq!(
+            key(&o2),
+            [
+                ("030-1590-002", "B", "PM10360MHZ"),
+                ("030-1467-001", "B", "IP30"),
+                ("030-0891-003", "H", "FP1"),
+                ("060-0035-002", "A", "PWR.SPPLY.ER"),
+            ]
+        );
+        assert_eq!(Identity::octane(2).processor.name, "PM20", "a dual-processor Octane's module");
+        let families = |bus: &w1::Bus| {
+            let mut f: Vec<u8> = bus.roms().iter().map(|rom| rom[0]).collect();
+            f.sort();
+            f
+        };
+        assert_eq!(families(&o2.ioc3_wire([8, 0, 0x69, 1, 2, 3])), [0x0b, 0x0b, 0x91]);
+        assert_eq!(families(&o2.processor.bus()), [0x0b]);
+        assert_eq!(families(&o2.system_board.bus()), [0x0b]);
+    }
 
     /// The VPro fitment check reads the PROM's revision from its banner;
     /// a board that needs a newer PROM than the image warns.

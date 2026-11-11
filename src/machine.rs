@@ -53,7 +53,7 @@ pub fn set_emulator_profile(profile: MachineProfile) {
 
 fn emulator_profile() -> Option<MachineProfile> {
     let raw = EMULATOR_PROFILE.load(std::sync::atomic::Ordering::Relaxed);
-    [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30, MachineProfile::Origin200Ip29, MachineProfile::Origin2000Ip27, MachineProfile::Onyx2Ip27]
+    [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30, MachineProfile::Origin200Ip29, MachineProfile::Origin2000Ip27, MachineProfile::Onyx2Ip27, MachineProfile::FuelIp34, MachineProfile::TezroIp53]
         .into_iter().find(|p| *p as u8 == raw)
 }
 
@@ -71,6 +71,8 @@ fn emulator_name_thirds(profile: Option<MachineProfile>) -> &'static [&'static s
         Some(MachineProfile::Origin200Ip29) => &["IRIX", "Iris", "IPsomething", "IP29"],
         Some(MachineProfile::Origin2000Ip27) => &["IRIX", "Iris", "IPsomething", "IP27"],
         Some(MachineProfile::Onyx2Ip27) => &["IRIX", "Iris", "IPsomething", "IP27"],
+        Some(MachineProfile::FuelIp34) => &["IRIX", "Iris", "IPsomething", "IP34"],
+        Some(MachineProfile::TezroIp53) => &["IRIX", "Iris", "IP53"],
         None => &["IRIX", "Iris", "IPsomething"],
     }
 }
@@ -626,7 +628,9 @@ impl Machine {
                 .unwrap_or_else(|| crate::dev::testdev::DEFAULT_DUMP_PATH.to_string());
             eprintln!("iris: test device enabled at {:#010x}, dumps to {}",
                       crate::dev::testdev::TEST_DEV_BASE, path);
-            Some(Arc::new(crate::dev::testdev::TestDevice::new(path)))
+            let run = cfg.test_device_run_config()
+                .expect("test_device_run_config: validate() should have caught this");
+            Some(Arc::new(crate::dev::testdev::TestDevice::with_run_config(path, run)))
         } else {
             None
         };
@@ -2166,11 +2170,13 @@ mod emulator_name_tests {
                 Some(MachineProfile::Origin200Ip29) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
                 Some(MachineProfile::Origin2000Ip27) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
                 Some(MachineProfile::Onyx2Ip27) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
+                Some(MachineProfile::FuelIp34) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
+                Some(MachineProfile::TezroIp53) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "IP34", "O2"],
                 None => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
             }
         };
         for p in [None, Some(MachineProfile::IndyIp24), Some(MachineProfile::Indigo2Ip22),
-                  Some(MachineProfile::Indigo2Ip28), Some(MachineProfile::O2Ip32), Some(MachineProfile::OctaneIp30), Some(MachineProfile::Origin200Ip29), Some(MachineProfile::Origin2000Ip27), Some(MachineProfile::Onyx2Ip27)] {
+                  Some(MachineProfile::Indigo2Ip28), Some(MachineProfile::O2Ip32), Some(MachineProfile::OctaneIp30), Some(MachineProfile::Origin200Ip29), Some(MachineProfile::Origin2000Ip27), Some(MachineProfile::Onyx2Ip27), Some(MachineProfile::FuelIp34), Some(MachineProfile::TezroIp53)] {
             let thirds = emulator_name_thirds(p);
             assert!(!thirds.is_empty());
             for w in thirds {
@@ -2182,7 +2188,7 @@ mod emulator_name_tests {
 
     #[test]
     fn profile_round_trips_through_the_global() {
-        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30, MachineProfile::Origin200Ip29, MachineProfile::Origin2000Ip27, MachineProfile::Onyx2Ip27] {
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30, MachineProfile::Origin200Ip29, MachineProfile::Origin2000Ip27, MachineProfile::Onyx2Ip27, MachineProfile::FuelIp34, MachineProfile::TezroIp53] {
             set_emulator_profile(p);
             assert_eq!(emulator_profile(), Some(p));
         }
@@ -2316,8 +2322,7 @@ mod controller_lifetime_tests {
         let held = crate::cow_disk::load_dirty_sidecar(std::path::Path::new(&sidecar)).unwrap_or_default();
         assert!(held.contains(&3) && held.contains(&4), "power-off left no record of the written sectors");
 
-        // Leak the machine as the process exit would.
-        std::mem::forget(machine);
+        drop(machine);
         let _ = std::fs::remove_file(format!("{}.overlay", path.display()));
         let _ = std::fs::remove_file(&sidecar);
         let _ = std::fs::remove_file(&path);

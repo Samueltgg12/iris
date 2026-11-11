@@ -109,7 +109,65 @@ const MRU_BIT: u64 = 1 << 63;
 const PD_STATE_SHIFT: u32 = 6;
 const SD_STATE_SHIFT: u32 = 10;
 
+/// The primary instruction state, TagLo[6] (NEC U10278EJ3V0UM p. 285).
+const PI_VALID: u64 = 1 << 6;
 
+/// A primary instruction word is the instruction predecoded, 36 bits (NEC
+/// U10278EJ3V0UM p. 288). Neither manual gives the layout. This one is
+/// inferred from the words PROM 6.210 stores, `p` the word and `f` the
+/// instruction: p[25:20] = f[5:0], p[19:15] = f[10:6], p[14:10] = f[25:21],
+/// p[28:26] = f[28:26], p[35:29] a class that also gives f[31:29], and p[4:0]
+/// and p[9:5] the rt and rd fields in the order the class gives. Only the
+/// sampled classes decode, and every row is inferred. `addiu $4,$0,2`
+/// (0x24040002) is 0x3_4420_0004.
+///
+/// Rows: class, f[31:29], whether p[4:0] is rt, the f[28:26] values as a bit
+/// mask, and the function fields of the SPECIAL members.
+const L1I_CLASSES: &[(u8, u32, bool, u8, &[u8])] = &[
+    (0x00, 0, false, 1 << 0, &[0x00]),       // nop
+    (0x08, 0, false, 1 << 0, &[0x38, 0x3c]), // dsll, dsll32
+    (0x18, 0, false, 1 << 0, &[0x25]),       // or
+    (0x1a, 1, true, 0b1010_0011, &[]),       // addi, addiu, ori, lui
+    (0x1e, 3, true, 1 << 1, &[]),            // daddiu
+    (0x35, 5, false, 1 << 7, &[]),           // cache
+    (0x36, 6, true, 1 << 7, &[]),            // ld
+    (0x3f, 2, false, 1 << 0, &[]),           // mtc0
+    (0x40, 0, false, 1 << 3, &[]),           // jal
+    (0x41, 0, false, 0b101, &[0x08]),        // jr, j
+    (0x71, 0, false, 1 << 1, &[]),           // REGIMM
+];
+
+/// The model's own form, bits 35:32 set over an instruction no class holds.
+/// Hardware would never produce it. It takes classes 0x78-0x7f, so a real
+/// word of those classes would be read as raw.
+const L1I_RAW: u64 = 0xf << 32;
+
+/// The instruction a predecoded word encodes, or the class that is refused.
+fn l1i_decode(p: u64) -> Result<u32, u8> {
+    if p >> 32 == L1I_RAW >> 32 {
+        return Ok(p as u32);
+    }
+    let (class, op, funct) = ((p >> 29) as u8 & 0x7f, (p >> 26) as u32 & 7, (p >> 20) as u8 & 0x3f);
+    let &(_, hi3, rt_low, ops, functs) = L1I_CLASSES.iter().find(|c| c.0 == class).ok_or(class)?;
+    if ops >> op & 1 == 0 || (op == 0 && !functs.is_empty() && !functs.contains(&funct)) || (class == 0 && p != 0) {
+        return Err(class);
+    }
+    let (low, high) = ((p & 0x1f) as u32, (p >> 5) as u32 & 0x1f);
+    let (rt, rd) = if rt_low { (low, high) } else { (high, low) };
+    Ok(hi3 << 29 | op << 26 | ((p >> 10) as u32 & 0x1f) << 21 | rt << 16 | rd << 11 | ((p >> 15) as u32 & 0x1f) << 6 | funct as u32)
+}
+
+/// The predecoded word for `f`, or the raw form where no class holds it.
+fn l1i_encode(f: u32) -> u64 {
+    let w = f as u64;
+    let (rt, rd) = (w >> 16 & 0x1f, w >> 11 & 0x1f);
+    L1I_CLASSES.iter().find_map(|&(class, _, rt_low, _, _)| {
+        let (low, high) = if rt_low { (rt, rd) } else { (rd, rt) };
+        let p = (class as u64) << 29 | (w >> 26 & 7) << 26 | (w & 0x3f) << 20 | (w >> 6 & 0x1f) << 15
+            | (w >> 21 & 0x1f) << 10 | high << 5 | low;
+        (l1i_decode(p) == Ok(f)).then_some(p)
+    }).unwrap_or(L1I_RAW | w)
+}
 
 /// R10000 only: ways per set, as CACHE index operations address them. Bit 0
 /// of the index selects the way; the set starts above the line offset. The
@@ -182,6 +240,14 @@ pub struct ShadowCache<
     /// valid lines hold their pages. Null without one.
     view_space: UnsafeCell<*const PpMemSpace>,
     view: UnsafeCell<usize>,
+    /// The held pages whose generation counters are not ppmem's, with the
+    /// counters carrying their `GEN_HELD`: see [`Self::mark_foreign`].
+    #[cfg(feature = "jitv2")]
+    foreign: UnsafeCell<Vec<(u64, *const std::sync::atomic::AtomicU64)>>,
+    /// For each primary instruction set, the 64-byte half of a held
+    /// secondary line that a refill there would load (`refilled_word`), or
+    /// `u64::MAX`.
+    refill: UnsafeCell<Box<[u64]>>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -240,6 +306,9 @@ impl<
             decode: UnsafeCell::new(crate::cpu::decode_cache::DecodeCache::new()),
             view_space: UnsafeCell::new(std::ptr::null()),
             view: UnsafeCell::new(0),
+            #[cfg(feature = "jitv2")]
+            foreign: UnsafeCell::new(Vec::new()),
+            refill: UnsafeCell::new(vec![u64::MAX; Self::PI_SETS].into_boxed_slice()),
         }
     }
 
@@ -370,9 +439,18 @@ impl<
         if s.held.get(self.tag_slot(sel, virt_addr)) == Some(&true) {
             self.store_into_held_line(sel, virt_addr, phys_addr);
         }
+        if sel == CACH_PI {
+            // The set now holds what the guest wrote, not a refill.
+            if let Some(r) = unsafe { &mut *self.refill.get() }.get_mut((virt_addr as usize / IC_LINE.max(1)) % Self::PI_SETS.max(1)) {
+                *r = u64::MAX;
+            }
+        }
     }
 
     // ---- valid lines hold pages in the CPU's cached view ----
+
+    /// Primary instruction sets, as Index Load Data (I) addresses them.
+    const PI_SETS: usize = if IC_LINE == 0 { 0 } else { IC_SIZE / WAYS / IC_LINE };
 
     fn view_space(&self) -> Option<&PpMemSpace> {
         unsafe { (*self.view_space.get()).as_ref() }
@@ -393,6 +471,9 @@ impl<
         match sel {
             CACH_PD if DC_LINE != 0 && (tag >> PD_STATE_SHIFT) & 3 != 0 => {
                 Some((pa_hi | ((tag >> 8) & 0xff_ffff) << 12 | (va & 0xfff & !(DC_LINE as u64 - 1)), DC_LINE))
+            }
+            CACH_PI if IC_LINE != 0 && tag & PI_VALID != 0 => {
+                Some((pa_hi | ((tag >> 8) & 0xff_ffff) << 12 | (va & 0xfff & !(IC_LINE as u64 - 1)), IC_LINE))
             }
             CACH_SD if L2_LINE != 0 && (tag >> SD_STATE_SHIFT) & 3 != 0 => {
                 Some((pa_hi | ((tag >> 14) & 0x3_ffff) << 18 | (va & 0x3_ffff & !(L2_LINE as u64 - 1)), L2_LINE))
@@ -437,10 +518,23 @@ impl<
     /// into it from the data array, since Index Store Tag writes the tag
     /// alone (NEC VR5000/VR10000 instruction manual pp. 24-25). A line with
     /// no memory behind it holds no page and stays in the arrays, as every
-    /// line did before.
+    /// line did before, unless the machine allows lines there.
     fn line_enters(&self, sp: &PpMemSpace, sel: u32, idx: usize, va: u64, (pa, len): (u64, usize)) {
+        let unbacked = !sp.backs(pa);
         let Some(new) = sp.hold_line_page(self.view_no(), pa) else { return };
         let base = unsafe { *self.tc_base.get() };
+        if new {
+            self.mark_foreign(sp, pa, true);
+        }
+        if new && unbacked {
+            // No memory behind the page yet: it starts as what the cache's
+            // bus shows there.
+            let gran = crate::ppmem::granularity() as u64;
+            for a in (pa & !(gran - 1)..(pa & !(gran - 1)) + gran).step_by(8) {
+                let r = self.downstream.read64(a);
+                unsafe { *(base.add(a as usize) as *mut u64) = if r.is_ok() { r.data.rotate_left(32) } else { 0 } };
+            }
+        }
         if l2_op_log(CACHE_LOG_OP) {
             crate::dlog!(LogModule::L2c, "shadow:   -> line {pa:#x} holds its page (new: {new})");
         }
@@ -455,6 +549,7 @@ impl<
             let word = s.data[self.data_slot(sel, s.data.len(), first + (unit * k) as u64 + way)];
             let at = pa + (unit * k) as u64;
             match sel {
+                CACH_PI => self.put_instruction(at, word),
                 CACH_PD => unsafe { *(base.add(at as usize) as *mut u32) = word as u32 },
                 // TagHi is the doubleword's high word and TagLo its low word
                 // (MIPS R10000 UM p. 201; NEC VR10000 UM p. 289, Fig. 13-33).
@@ -468,6 +563,9 @@ impl<
                 _ => unsafe { *(base.add(at as usize) as *mut u64) = word },
             }
         }
+        if sel == CACH_SD {
+            self.set_refill(s.tags[idx], pa, len, true);
+        }
     }
 
     /// The line in slot `idx` of `sel` leaves, unwritten, as Index Store Tag
@@ -476,9 +574,49 @@ impl<
     fn line_leaves(&self, sp: &PpMemSpace, sel: u32, idx: usize, (pa, len): (u64, usize)) {
         let s = self.shadow(sel);
         s.held[idx] = false;
+        if sel == CACH_SD {
+            self.set_refill(s.tags[idx], pa, len, false);
+        }
         let gone = sp.release_line_page(self.view_no(), pa);
+        if gone {
+            self.mark_foreign(sp, pa, false);
+        }
         if l2_op_log(CACHE_LOG_OP) {
             crate::dlog!(LogModule::L2c, "shadow:   -> line {pa:#x} leaves (page released: {gone})");
+        }
+    }
+
+    /// ppmem puts `GEN_HELD` on its own generation counters. Where the cache's
+    /// bus counts a held page's writes on a counter of its own, which compiles
+    /// check instead (the Fuel's reset PROM, mapped over memory), the mark
+    /// goes there too, and comes off with the page's last line. A page
+    /// outside any counter, or on ppmem's, is skipped.
+    #[cfg_attr(not(feature = "jitv2"), allow(unused_variables))]
+    fn mark_foreign(&self, sp: &PpMemSpace, pa: u64, held: bool) {
+        #[cfg(feature = "jitv2")]
+        {
+            use crate::cpu::jitv2::jitv2::GEN_HELD;
+            use crate::ppmem::MappedMemory;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            let page = pa & !(crate::ppmem::granularity() as u64 - 1);
+            let foreign = unsafe { &mut *self.foreign.get() };
+            if held {
+                for a in (page..page + crate::ppmem::granularity() as u64).step_by(4096) {
+                    let g = self.downstream.gen_ptr(a);
+                    let own = unsafe { sp.gen_window_base().add((a >> 12) as usize) as *const AtomicU64 };
+                    if !g.is_null() && g != own {
+                        unsafe { (*g).fetch_add(GEN_HELD, Ordering::Release) };
+                        foreign.push((page, g));
+                    }
+                }
+            } else {
+                foreign.retain(|&(p, g)| {
+                    if p == page {
+                        unsafe { (*g).fetch_add(1u64.wrapping_sub(GEN_HELD), Ordering::Release) };
+                    }
+                    p != page
+                });
+            }
         }
     }
 
@@ -491,24 +629,79 @@ impl<
         let at = pa + (va & (len as u64 - 1) & !(unit - 1));
         let base = unsafe { *self.tc_base.get() };
         match sel {
+            CACH_PI => self.put_instruction(at, value & 0xf_ffff_ffff),
             CACH_PD => unsafe { *(base.add(at as usize) as *mut u32) = value as u32 },
             _ => unsafe {
                 *(base.add(at as usize) as *mut u64) = value;
                 *(base.add((at ^ 8) as usize) as *mut u64) = 0;
             },
         }
+        if sel == CACH_SD {
+            self.set_refill(self.shadow(sel).tags[idx], pa, len, true);
+        }
+    }
+
+    /// A primary instruction word goes into its line's page as the
+    /// instruction it predecodes, so a fetch runs it. A word of a class the
+    /// model does not know leaves the page as it was, where hardware would
+    /// run it.
+    fn put_instruction(&self, at: u64, word: u64) {
+        match l1i_decode(word) {
+            Ok(f) => unsafe { *((*self.tc_base.get()).add(at as usize) as *mut u32) = f },
+            Err(class) => crate::dlog!(LogModule::L2c,
+                "shadow: primary instruction word {word:#011x} at {at:#x}: predecode class {class:#04x} unknown, memory's word runs"),
+        }
+    }
+
+    /// A held secondary line `[pa, pa + len)` with tag `tag` is what a primary
+    /// instruction refill in each set it maps to would load, or stops being.
+    /// The set is the line's virtual index, TagLo[8:7] (VA[13:12], NEC
+    /// U10278EJ3V0UM p. 287), over PA[11:6]. Two lines for one set: the
+    /// later wins.
+    fn set_refill(&self, tag: u64, pa: u64, len: usize, held: bool) {
+        let refill = unsafe { &mut *self.refill.get() };
+        if !held {
+            // By address: the tag may already name another line.
+            refill.iter_mut().filter(|r| (pa..pa + len as u64).contains(*r)).for_each(|r| *r = u64::MAX);
+            return;
+        }
+        for half in (pa..pa + len as u64).step_by(IC_LINE.max(1)) {
+            if let Some(r) = refill.get_mut(((tag >> 7 & 3) << 12 | (half & 0xfff)) as usize / IC_LINE) {
+                *r = half;
+            }
+        }
+    }
+
+    /// Index Load Data (I) in a set a held secondary line maps to, which
+    /// Index Store Data (I) has not written since and where no held primary
+    /// line is: the word a refill from that
+    /// line would have left, predecoded. The model never refills on a fetch,
+    /// so this assumes the line was refilled, whichever way the operand
+    /// names. PROM 6.210, the IP35 machines' PROM, runs a staged secondary
+    /// line and reads the primary words back to stage them itself. Index
+    /// Load Tag (I) still
+    /// reads the stored tag.
+    #[cold]
+    #[inline(never)]
+    fn refilled_word(&self, va: u64) -> Option<u64> {
+        let half = *unsafe { &*self.refill.get() }.get((va as usize / IC_LINE.max(1)) % Self::PI_SETS.max(1))?;
+        if half == u64::MAX || self.shadow(CACH_PI).held[self.tag_slot(CACH_PI, va)] {
+            return None;
+        }
+        let at = half + (va & (IC_LINE as u64 - 1) & !3);
+        Some(l1i_encode(unsafe { *((*self.tc_base.get()).add(at as usize) as *const u32) }))
     }
 
     /// How many lines hold pages.
     fn held_count(&self) -> usize {
-        [CACH_PD, CACH_SD].iter().map(|&sel| self.shadow(sel).held.iter().filter(|&&h| h).count()).sum()
+        [CACH_PI, CACH_PD, CACH_SD].iter().map(|&sel| self.shadow(sel).held.iter().filter(|&&h| h).count()).sum()
     }
 
     /// Every held line goes, with no writeback: power-on, or a snapshot
     /// restore.
     fn drop_held_lines(&self) {
         let Some(sp) = self.view_space() else { return };
-        for sel in [CACH_PD, CACH_SD] {
+        for sel in [CACH_PI, CACH_PD, CACH_SD] {
             for i in 0..self.shadow(sel).held.len() {
                 if self.shadow(sel).held[i] {
                     let line = self.line_of(sel, self.shadow(sel).tags[i], self.slot_va(sel, i)).expect("a held line is valid");
@@ -554,10 +747,13 @@ impl<
         model::R4400 => "R4400",
         model::R5000 => "R5000",
         model::R12000 => "R12000",
+        model::R16000 => "R16000",
         _ => "shadow",
     };
     const CACHE_KIND: &'static str = "shadow";
     const R10K_CACHE_OPS: bool = Self::R10K;
+    const CVT_L_51_BITS: bool = MODEL == model::R10000;
+    const FETCH_ALIAS: bool = MODEL == model::R16000;
 }
 
 impl<
@@ -808,7 +1004,7 @@ impl<
                     s.mru[set] = phys_addr & MRU_BIT != 0;
                     let old = s.tags[idx];
                     s.tags[idx] = phys_addr & mask & !MRU_BIT;
-                    if Self::R10K && matches!(sel, CACH_PD | CACH_SD) && old != s.tags[idx] {
+                    if Self::R10K && matches!(sel, CACH_PI | CACH_PD | CACH_SD) && old != s.tags[idx] {
                         self.tag_changes(sel, idx, virt_addr, old, s.tags[idx]);
                     }
                 }
@@ -844,6 +1040,11 @@ impl<
                     if l2_op_log(CACHE_LOG_HIT) {
                         crate::dlog!(LogModule::L2c, "shadow:   -> ILD slot={slot} data={:#018x} ecc={:#x}",
                                      s.data[slot], s.ecc[slot]);
+                    }
+                    if sel == CACH_PI {
+                        if let Some(p) = self.refilled_word(virt_addr) {
+                            return p;
+                        }
                     }
                     s.data[slot]
                 }
@@ -998,13 +1199,33 @@ pub type R12000ShadowCache =
 pub type R12000Module4MShadowCache =
     ShadowCache<32768, 64, 32768, 32, 4194304, 128, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
 
+/// The R16000 with a 4 MB secondary cache, the Tezro's 700 and 800 MHz parts:
+/// the R12000's geometry and programming model with the larger secondary (SS
+/// code 3 in Config) and 128-byte secondary lines (SB: a model choice). The
+/// PRId here is a placeholder: the part's own, `Part::prid`, is set at build
+/// time, as for the R14000. FIR 0x0900, the one R14000 value on record; a
+/// model choice: no R16000 FIR was found in the retained evidence.
+pub type R16000ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 4194304, 128, true, 0x0000_0f41, 0x0000_0900, 64, { model::R16000 }>;
+
+/// The R16000 with an 8 MB secondary cache, the 900 MHz part's: the 4 MB type
+/// with twice the secondary (SS code 4). The size is a type parameter so the
+/// executor, the translator and the cache know it when they are built, and no
+/// run-time field is read to find it.
+pub type R16000Scache8ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 8388608, 128, true, 0x0000_0f50, 0x0000_0900, 64, { model::R16000 }>;
+
+/// The R16000 with a 16 MB secondary cache, the 1 GHz part's (SS code 5);
+/// otherwise the 4 MB type.
+pub type R16000Scache16ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 16777216, 128, true, 0x0000_0f50, 0x0000_0900, 64, { model::R16000 }>;
+
 /// R12000 3.5 as the O2 has it: the Octane part with 64-byte secondary lines
 /// (SB clear). With 128-byte lines the O2 PROM panics before its banner
 /// (write TLB miss at 0x0); 64 boots. IRIX on the O2 never reads SB and sizes
 /// the secondary cache as 512 KB << SS.
 pub type R12000O2ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 2097152, 64, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
-
 
 /// SGI O2 R10000 (IP32): the IP28 model with 64-byte secondary-cache lines.
 ///
@@ -1238,6 +1459,20 @@ mod tests {
         }
         assert_eq!(run::<R12000ShadowCache>(), 0);
         assert_eq!(run::<R10000ShadowCache>(), 0x1_2345_6780);
+        assert_eq!(run::<R16000ShadowCache>(), 0, "the R16000 follows the R12000 and R14000");
+    }
+
+    /// The three R16000 types differ in the secondary cache alone: size, the
+    /// SS code Config reads from it, and the placeholder PRId each starts
+    /// with; the PRId a part really presents is `Part::prid`'s.
+    #[test]
+    fn the_r16000_types_differ_only_in_the_secondary_cache() {
+        fn id<C: CpuModel + MipsCache>() -> (u32, u32, usize, usize, &'static str, u32, u32, bool) {
+            (C::PRID, C::FIR, C::L2_SIZE, C::L2_LINE, C::NAME, C::VA_BITS, C::PA_BITS, C::R10K_CACHE_OPS)
+        }
+        assert_eq!(id::<R16000ShadowCache>(), (0xf41, 0x900, 4 << 20, 128, "R16000", 44, 40, true));
+        assert_eq!(id::<R16000Scache8ShadowCache>(), (0xf50, 0x900, 8 << 20, 128, "R16000", 44, 40, true));
+        assert_eq!(id::<R16000Scache16ShadowCache>(), (0xf50, 0x900, 16 << 20, 128, "R16000", 44, 40, true));
     }
 
     /// Geometry is what CP0 Config is built from, so it must be the real
@@ -1368,6 +1603,10 @@ mod tests {
         v
     }
 
+    /// The page a line for `pa` holds: the host granule around it, which is
+    /// 16 KB on Apple silicon and 64 KB on Windows.
+    fn page(pa: u64) -> u64 { pa & !(crate::ppmem::granularity() as u64 - 1) }
+
     /// TagLo of a DirtyExclusive primary data line for `pa`'s page.
     fn pd_dirty(pa: u64) -> u64 { (pa >> 12) << 8 | 3 << PD_STATE_SHIFT }
 
@@ -1421,7 +1660,7 @@ mod tests {
         let (at_a, at_a4) = (0x2404_0002u64, 0x03e0_0008u64); // addiu $4,$0,2; jr $31
         c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_3008, at_a4 << 32 | at_a);
         c.cache_op(C_IST | CACH_SD, 0x8000_3000, sd_tag(0x3000, 2));
-        assert_eq!(space.held_line_pages(0), vec![0x3000]);
+        assert_eq!(space.held_line_pages(0), vec![page(0x3000)]);
         assert_eq!(c.read::<4>(0, 0x3008).data, at_a, "the word at A");
         assert_eq!(c.read::<4>(0, 0x300c).data, at_a4, "the word at A + 4");
         c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_3000, 0x9999);
@@ -1514,7 +1753,7 @@ mod tests {
         c.cache_op(C_IST | CACH_SD, 0x8000_0000, 0x1 << 13 | 5 << 10);
         assert!(space.held_line_pages(0).is_empty());
         c.cache_op(C_IST | CACH_PD, 0x8000_4fe0, 0x5 << 8 | 0xc0);
-        assert_eq!(space.held_line_pages(0), vec![0x5000]);
+        assert_eq!(space.held_line_pages(0), vec![page(0x5000)]);
         assert_eq!(c.cache_op(C_ILT | CACH_PD, 0x8000_0fe0, 0) & 0xc0, 0, "way 0 is untouched");
         c.power_on();
         assert!(space.held_line_pages(0).is_empty());
@@ -1571,11 +1810,46 @@ mod tests {
         c.cache_op(C_IST | CACH_PD, 0x8000_6040, pd_dirty(0x6000));
         c.write::<4>(0, 0x6000, 0xbad);
         c.cache_op(C_IST | CACH_PD, 0x8000_6000, 0);
-        assert_eq!(space.held_line_pages(v), vec![0x6000]);
+        assert_eq!(space.held_line_pages(v), vec![page(0x6000)]);
         assert_eq!(c.read::<4>(0, 0x6000).data, 0xbad, "the page stays the view's");
         c.cache_op(C_IWBINV | CACH_PD, 0x8000_6040, 0);
         assert!(space.held_line_pages(v).is_empty());
         assert_eq!(c.read::<4>(0, 0x6000).data, 0x600d);
+    }
+
+    /// The R16000 parts keep the R10000 family's index operations: a valid
+    /// primary data line or secondary line holds its page in the CPU's view,
+    /// with 4, 8 and 16 MiB secondary caches, and Index Store Data fills it.
+    #[test]
+    fn the_r16000_types_hold_lines_in_the_view() {
+        fn run<C: MipsCache + From<Arc<dyn BusDevice>>>() {
+            let (space, mut banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+            let space = Box::new(space);
+            let bank = Arc::new(banks.remove(0));
+            let c = Box::new(C::from(bank.clone() as Arc<dyn BusDevice>));
+            let v = space.add_cached_view(&[c.tcache_bitmap_ptr()]).unwrap();
+            unsafe {
+                c.set_tcache_window(space.view_base(v));
+                c.set_cached_view(&*space, v);
+            }
+            space.map_bank(0, 0, 64 << 20, 64 << 20).unwrap();
+            bank.write32(0x2004, 0x5555_5555);
+            c.cache_op(C_R10K_ISD | CACH_PD, 0x8000_0004, 0xdead_beef);
+            c.cache_op(C_IST | CACH_PD, 0x8000_0000, pd_dirty(0x2000));
+            assert_eq!(space.held_line_pages(v), vec![0x2000]);
+            assert_eq!(c.read::<4>(0, 0x2004).data, 0xdead_beef);
+            assert_eq!(bank.read32(0x2004).data, 0x5555_5555, "memory never saw the line");
+            c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_3008, 0x1111_2222_3333_4444);
+            c.cache_op(C_IST | CACH_SD, 0x8000_3000, sd_tag(0x3000, 2));
+            assert_eq!(space.held_line_pages(v), vec![0x2000, 0x3000]);
+            assert_eq!(c.read::<4>(0, 0x3008).data, 0x3333_4444, "TagLo at the lower address");
+            c.cache_op(C_IST | CACH_PD, 0x8000_0000, 0);
+            c.cache_op(C_IST | CACH_SD, 0x8000_3000, 0);
+            assert!(space.held_line_pages(v).is_empty());
+        }
+        run::<R16000ShadowCache>();
+        run::<R16000Scache8ShadowCache>();
+        run::<R16000Scache16ShadowCache>();
     }
 
     /// Power-on drops every held page. A snapshot taken while lines hold
@@ -1590,5 +1864,78 @@ mod tests {
         assert!(space.held_line_pages(0).is_empty());
         assert!(c.debug_probe("l2", 0, 0).contains("0 valid lines hold 0 pages"));
         assert!(c.load_cache_state(&c.save_cache_state()).is_ok());
+    }
+
+    // ---- primary instruction lines ----
+
+    /// Every class of the table, encoded and decoded back, one field moved
+    /// at a time for the example word, and what the table refuses.
+    #[test]
+    fn predecoded_words_round_trip() {
+        let p = 0x3_4420_0004; // addiu $4,$0,2
+        for (q, f) in [(p, 0x2404_0002), (p | 0x1f << 5, 0x2404_f802), (p | 0x1f << 10, 0x27e4_0002), (p | 0x1f << 15, 0x2404_07c2)] {
+            assert_eq!(l1i_decode(q), Ok(f), "{q:#x}");
+        }
+        for (class, f) in [(0x08, 0x0009_20f8), (0x08, 0x0009_20fc), (0x18, 0x0109_5025), (0x1a, 0x2084_0010),
+                           (0x1a, 0x3484_0010), (0x1a, 0x3c04_8000), (0x1e, 0x6484_0010), (0x35, 0xbd04_0040),
+                           (0x36, 0xdd04_0008), (0x3f, 0x4084_6000), (0x40, 0x0c00_1234), (0x41, 0x03e0_0008),
+                           (0x41, 0x0800_1234), (0x71, 0x0481_0004), (0, 0)] {
+            assert_eq!((l1i_encode(f) >> 29, l1i_decode(l1i_encode(f))), (class, Ok(f)), "{f:#x}");
+        }
+        for f in [0x0009_20c0, 0x2884_0010, 0x4422_3000] { // sll, slti, mtc1: no class
+            assert_eq!((l1i_encode(f), l1i_decode(L1I_RAW | f as u64)), (L1I_RAW | f as u64, Ok(f)));
+        }
+        assert_eq!((l1i_decode(1), l1i_decode(0x2a << 29)), (Err(0), Err(0x2a)));
+    }
+
+    /// TagLo of a valid primary instruction line for `pa`'s page.
+    fn pi_valid(pa: u64) -> u64 { (pa >> 12) << 8 | PI_VALID }
+
+    /// A valid primary instruction line puts the instructions its words
+    /// predecode into the page, leaving memory's word for one it cannot
+    /// decode, and Index Store Data (I) writes through.
+    #[test]
+    fn a_primary_instruction_line_puts_its_instructions_in_the_page() {
+        let (c, space, bank) = windowed();
+        bank.write32(0x9008, 0x1111_1111);
+        let va = 0x8000_9001u64; // way 1
+        c.cache_op(C_R10K_ISD | CACH_PI, va, 0x3_4420_0004);
+        c.cache_op(C_R10K_ISD | CACH_PI, va + 8, 0x2a << 29);
+        c.cache_op(C_IST | CACH_PI, va, pi_valid(0x9000));
+        assert_eq!(space.held_line_pages(0), vec![0x9000]);
+        assert_eq!([0x9000, 0x9008].map(|a| c.read::<4>(0, a).data), [0x2404_0002, 0x1111_1111]);
+        c.cache_op(C_R10K_ISD | CACH_PI, va + 4, l1i_encode(0x03e0_0008));
+        assert_eq!(c.read::<4>(0, 0x9004).data, 0x03e0_0008);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, va, 0), 0x3_4420_0004, "Index Load Data (I) reads the array");
+        assert_eq!(bank.read32(0x9000).data, 0, "memory never saw it");
+        c.cache_op(C_IST | CACH_PI, va, 0);
+        assert!(space.held_line_pages(0).is_empty());
+    }
+
+    /// A held secondary line answers Index Load Data (I) in the primary sets
+    /// it maps to, as the predecoded words a refill would leave, until Index
+    /// Store Data (I) writes the set or the line goes. A held primary line
+    /// answers for itself.
+    #[test]
+    fn index_load_data_i_reads_a_refill_until_the_guest_writes_the_set() {
+        let (c, _space, _bank) = windowed();
+        c.cache_op(C_IST | CACH_SD, 0x8000_4f00, sd_tag(0x4f00, 2) | 1 << 7); // VA[13:12] = 1
+        c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_4f10, 0x0140_0008); // jr $10 at 0x4f10
+        let set = |off: u64| 0x8000_1f00 | off;
+        for va in [set(0x10), set(0x10) | 1] {
+            assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, va, 0), l1i_encode(0x0140_0008), "either way");
+        }
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, 0x8000_0f10, 0), 0, "another set: the array");
+        c.cache_op(C_R10K_ISD | CACH_PI, set(0x10), 0x5_5555_5555);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, set(0x10), 0), 0x5_5555_5555, "the guest's pattern");
+        c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_4f10, 0x0140_0008);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, set(0x10), 0), l1i_encode(0x0140_0008), "restaged: a refill again");
+        c.cache_op(C_R10K_ISD | CACH_PI, set(0x10), 0x3_4420_0004);
+        c.cache_op(C_IST | CACH_PI, set(0x10), pi_valid(0x1_4000));
+        c.cache_op(C_R10K_ISD | CACH_SD, 0x8000_4f10, 0x0140_0008);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, set(0x10), 0), 0x3_4420_0004, "a held primary line answers for itself");
+        c.cache_op(C_IST | CACH_PI, set(0x10), 0);
+        c.cache_op(C_IST | CACH_SD, 0x8000_4f00, 0);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, set(0x10), 0), 0x3_4420_0004, "gone with the line: the array");
     }
 }

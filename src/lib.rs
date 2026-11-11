@@ -164,6 +164,7 @@ pub mod build_features {
 
 pub mod validate_config;
 pub mod config;
+pub mod identity;
 pub mod traits;
 #[macro_use]
 pub mod devlog;
@@ -190,6 +191,8 @@ pub mod ip27_onyx2;
 pub mod ip27_origin2000;
 /// Fuel has an IP34 board and uses the IP35 software platform and processor views.
 pub mod ip35;
+pub mod ip34_machine;
+pub mod ip53_machine;
 pub mod machine_state;
 pub mod platform;
 pub mod physical;

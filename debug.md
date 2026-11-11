@@ -369,6 +369,13 @@ widget's link, refused Crossbow accesses, and accesses to physical addresses
 nothing is mapped at, with the PC; a device's own refusal is not listed). The
 `phys` commands work on the Octane as well.
 
+On the Fuel the one controller is a two-channel ISP12160: `scsi` (or
+`scsi0`) and `cow` act on channel 0, `scsi1` and `cow1` on channel 1, and
+ids run 0 to 15 on each (`[scsi.17]` is id 1 on channel 1). `scsi notes`
+shows the whole chip's command total and anything odd the driver did, and
+has no `scsi1` form; `regs`, `wdt`, `defer`, `debug` and `dayna` are not
+there.
+
 Queue position `[0]` is the mounted disc, `[1]` the next on eject. A disc
 change reaches IRIX as a Unit Attention ("medium changed") on its next
 TEST UNIT READY; IRIX's `mediad` may still need a manual remount
@@ -388,7 +395,7 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 | `rex jit <on\|off\|status\|list>` | REX3 shader JIT (`rex-jit`): switch, counters, compiled and failed shaders |
 | `rex jit <disable\|enable> <dm0> <dm1>` | Take one draw mode out of (or back into) JIT dispatch |
 | `rex trace <file> [gfifo,cpu\|all]` / `rex trace off\|flush` | Annotated register trace (also `IRIS_REX3_TRACE=<file>`) |
-| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); replay with `REX3_REPLAY=<file> cargo test --release rex3_replay_file`, or add `REX3_REPLAY_ENGINE=gpu` and Cargo `--features rex-gpu` for the experimental host-GPU path |
+| `rex rec <file>[.txt]` / `rex rec mark\|off` | Replayable bus recording (also `IRIS_REX3_REC=<file>`); optional replay with `REX3_REPLAY=<file> cargo test -p iris --lib --features gputrace rex3_replay_file -- --ignored`, or add `REX3_REPLAY_ENGINE=gpu` and Cargo `--features rex-gpu` for the experimental host-GPU path |
 | `rex fbdump [DIR]` | Framebuffers as files in `DIR` (default `.`) |
 | `rex cmap <on\|off>` | CMAP access trace |
 | `rex debug <on\|off>` | REX3 register trace **[DEV]** |
@@ -496,7 +503,8 @@ guest. `y = 0` is the top display line throughout.
 | `vpro rec <file>` / `vpro rec mark\|off` / `vpro rec` | Replayable recording (record.rs; also `IRIS_ODSY_REC=<file>` from power-on): every bus store and load and the DMA reads, gzip. A start, a `mark` and `off` wait for the board to go idle and write the memory hash (`vpro hash`) into the file, so a replay can check board memory at those points; a recording started mid-session cannot reproduce the live memory and says so when replayed, but still replays deterministically. Alone, the recording's state. Replay: `VPRO_REPLAY=<file> cargo test --release --lib odyssey::golden::replay -- --nocapture` (see `src/dev/odyssey/testdata/README.md`) |
 
 `iris-ci screenshot` captures the composed screen from any board, also
-headless.
+headless. `iris-ci screen-wait GOLDEN.png` takes screenshots until one
+matches a PNG and, on a timeout, leaves the last one and a diff image behind.
 
 **Screen, pointer and keyboard (any board)**
 
@@ -575,7 +583,7 @@ a forced termination; a normal stop saves them automatically.
 |---|---|
 | `phys mem <addr> [n]` / `mm` | Dump physical memory |
 | `phys dis <addr> [n]` / `md` | Disassemble physical memory |
-| `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2, Octane) |
+| `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2, Octane, Fuel) |
 | `phys trace <on\|off>` / `trace <on\|off>` | Log physical bus accesses |
 | `phys error <on\|off>` | Stop on bus errors |
 | `phys hole <on\|off>` | Stop on accesses to unmapped addresses |
@@ -594,7 +602,7 @@ Per-module logging; all of it needs a developer build to produce output.
 | `log <module> file <path\|off>` | Send a module's log to a file |
 
 Modules: `net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap
-xmap bt445 scc ps2 rtc eeprom l1i l1d l2c bedrock pci bridge heart nvme`. `pci` logs every
+xmap bt445 scc ps2 rtc eeprom l1i l1d l2c bedrock pci bridge heart nvme l1 usb`. `pci` logs every
 configuration cycle on a PCI bus (MACE's, the Octane Bridge's) and
 whether a function answered it. `bridge` logs the Octane Bridge's
 register and translation-table accesses by name, and any transfer a PCI
@@ -605,7 +613,8 @@ interrupt vector raised or lowered. Mask categories: `pdma` —
 `hal enet scsi`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
 miss op`; `nvme` — `state admin regs io` ([docs/nvme.md](docs/nvme.md#tracing));
 every module also takes `on`/`all`, `off`/`none` or a hex mask.
-`bedrock` covers the Fuel's devices on its Bedrock hub.
+`bedrock` covers the Fuel's devices on its Bedrock hub, `l1` its system
+controller and `usb` its USB host controller.
 `IRIS_DEBUG_LOG` or `[debug] debug_log` set the same thing at startup.
 
 ### Performance and locks

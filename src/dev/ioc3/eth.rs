@@ -1,8 +1,10 @@
 //! The Ethernet MAC inside IOC3, with the Octane ICS1890 or Fuel DP83843
 //! transceiver on its management bus.
 //!
-//! IOC3 forwards the register offsets 0xf0..=0x150 of its register BAR here
-//! through [`Ioc3EthPort`]. The MAC is SGI's own design with no vendor
+//! The IOC3 forwards the register offsets 0xf0..=0x150 of its register BAR
+//! here. The MAC is a child of the IOC3, as Linux's `ioc3-eth` cell is: the
+//! parent builds it, and it reaches memory and the PCI interrupt pin through
+//! the parent's shared state. The MAC is SGI's own design with no vendor
 //! document, so what it does is the contract the public drivers (Linux and
 //! OpenBSD) depend on:
 //!
@@ -13,30 +15,25 @@
 //! - one interrupt status/enable pair, receive sources low, transmit high;
 //! - the management interface to the PHY.
 //!
-//! Memory is reached through the [`PciDma`] IOC3 hands over in `connect`.
+//! Memory is reached through the DMA the parent holds.
 //! Ring entries and descriptor words are big-endian bytes at bus addresses,
 //! frame bytes are in wire order; the Bridge applies any programmed swap.
 //!
 //! Frames use iris's shared network link. The machine attaches it through
 //! [`Ioc3Eth::attach`].
 //!
-//! Approximations (the QEMU model this was ported from has the same ones,
-//! plus one it dropped):
-//! - Receive completions are published as soon as the frame is in memory.
-//!   The QEMU model holds each one back for a modelled minimum arrival
-//!   latency; this port has no such delay.
+//! Approximations:
+//! - Receive completions are published as soon as the frame is in memory,
+//!   with no modelled minimum arrival latency.
 //! - A non-zero receive timer reload is stored but not timed; only the
 //!   "interrupt immediately" setting every public driver uses is modelled.
-//! - The PHY's 100 ms negotiation delay is wall-clock time (the QEMU model
-//!   used virtual time) and the synthetic peer never faults.
+//! - The PHY's 100 ms negotiation delay is wall-clock time and the synthetic
+//!   peer never faults.
 //! - Quick Poll status (PHY register 0x11) reports live state without the
 //!   per-bit latches the datasheet describes.
-//! - A PHY register the model does not implement reads 0. The QEMU model
-//!   answers 0xffff, and the ICS1890 datasheet has an unanswered management
-//!   read float to all ones.
-//! - Frames go to the wire only while the PHY reports link. The QEMU model
-//!   sends whenever the PHY's data path is open (not powered down or
-//!   isolated), link or not.
+//! - A PHY register the model does not implement reads 0, though the
+//!   ICS1890 datasheet has an unanswered management read float to all ones.
+//! - Frames go to the wire only while the PHY reports link.
 //!
 //! Ported from hw/net/sgi-ioc3-eth.c in jamesbraid/qemu-sgi-origami. The
 //! Octane PHY model lives in `ics1890.rs`.
@@ -47,8 +44,11 @@ use std::sync::{Arc, OnceLock, Weak};
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::dev::ioc3_port::Ioc3EthPort;
+use super::Core;
+use crate::dev::dp83840::Dp83840;
+use crate::dev::dp83843::Dp83843;
 use crate::dev::ics1890::Ics1890;
+use crate::dev::mii::MiiPhy;
 use crate::pci::{PciDma, PciDmaStatus};
 use crate::snapshot::{field, field_bool, field_u16, field_u32, field_u32s, field_u64, StateTable};
 use crate::traits::{Device, Resettable, Saveable};
@@ -166,21 +166,25 @@ pub const ORIGIN200_PHY_ADDR: u8 = 31;
 /// How long the synthetic link partner takes to complete negotiation.
 pub const NEGOTIATION_DELAY: Duration = Duration::from_millis(100);
 
-/// The management and packet-path behavior that varies between IOC3 PHYs.
-pub(crate) trait MiiPhy: Send {
-    fn address(&self) -> u8;
-    fn deadline(&self) -> Option<Instant>;
-    fn wire_enabled(&self) -> bool;
-    fn in_loopback(&self) -> bool;
-    fn sync(&mut self, now: Instant);
-    fn read(&mut self, register: u8, now: Instant) -> u16;
-    fn write(&mut self, register: u8, value: u16, now: Instant);
-    fn set_backend_link(&mut self, up: bool, now: Instant);
-    fn power_on(&mut self);
-    /// The transceiver's registers and negotiation progress for a snapshot;
-    /// its deadline is saved as the time it had left.
-    fn save_state(&self, now: Instant) -> toml::Value;
-    fn load_state(&mut self, v: &toml::Value, now: Instant) -> Result<(), String>;
+/// The transceiver a board fits on the MAC's management bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phy {
+    /// The Octane's ICS1890, at MII address 1.
+    Ics1890,
+    /// The Origin 200, 2000 and Onyx2 boards' DP83840A, at address 31.
+    Dp83840,
+    /// The Fuel's DP83843, at address 1.
+    Dp83843,
+}
+
+impl Phy {
+    fn build(self) -> Box<dyn MiiPhy> {
+        match self {
+            Phy::Ics1890 => Box::new(Ics1890::new(PHY_ADDR, NEGOTIATION_DELAY)),
+            Phy::Dp83840 => Box::new(Dp83840::new(ORIGIN200_PHY_ADDR)),
+            Phy::Dp83843 => Box::new(Dp83843::new(PHY_ADDR)),
+        }
+    }
 }
 
 fn ridx(off: u32) -> usize {
@@ -289,6 +293,10 @@ fn dma_write(dma: &dyn PciDma, addr: u64, data: &[u8]) -> bool {
 
 struct State {
     regs: [u32; NREGS],
+    /// Where the PCI pin is driven, which happens under this lock: the
+    /// registers change and the pin follows in one step, so the Bridge sees
+    /// the edges the registers made, in order.
+    core: Arc<Core>,
     /// Sources raised while the same status bit was already set and
     /// unacknowledged: the guest's next write-one-to-clear of that bit must
     /// turn into a real edge for this one too rather than clearing both.
@@ -298,25 +306,24 @@ struct State {
     /// Apart from its index: an index-only write must not disarm.
     rx_timer_armed: bool,
     phy: Box<dyn MiiPhy>,
+    /// The level last driven onto the pin.
     irq_asserted: bool,
-    /// Level changes not yet delivered to the callback, in order.
-    irq_events: Vec<bool>,
     frame: Vec<u8>,
     tx_frames: u64,
     rx_frames: u64,
 }
 
 impl State {
-    fn new(phy: Box<dyn MiiPhy>) -> Self {
+    fn new(phy: Box<dyn MiiPhy>, core: Arc<Core>) -> Self {
         Self {
             regs: [0; NREGS],
+            core,
             int_deferred: 0,
             mii_data: MII_ABSENT,
             mii_data_w: 0,
             rx_timer_armed: false,
             phy,
             irq_asserted: false,
-            irq_events: Vec::new(),
             frame: vec![0; FRAME_MAX],
             tx_frames: 0,
             rx_frames: 0,
@@ -330,8 +337,7 @@ impl State {
         self.mii_data = MII_ABSENT;
         self.mii_data_w = 0;
         self.rx_timer_armed = false;
-        self.irq_asserted = false;
-        self.irq_events.clear();
+        self.update_irq();
         self.frame.fill(0);
         self.tx_frames = 0;
         self.rx_frames = 0;
@@ -344,11 +350,23 @@ impl State {
         self.regs[ridx(off)] = v;
     }
 
+    /// The pin's level: a source is both raised and enabled.
+    fn output(&self) -> bool {
+        self.get(INT_STATUS) & self.get(INT_ENABLE) != 0
+    }
+
+    fn drive(&self, level: bool) {
+        if let Some(line) = self.core.inta.get() {
+            line.set(level);
+        }
+    }
+
+    /// Put the pin where the registers say, if that moved it.
     fn update_irq(&mut self) {
-        let level = self.get(INT_STATUS) & self.get(INT_ENABLE) != 0;
+        let level = self.output();
         if level != self.irq_asserted {
             self.irq_asserted = level;
-            self.irq_events.push(level);
+            self.drive(level);
         }
     }
 
@@ -619,8 +637,7 @@ impl State {
         match off {
             INT_STATUS => {
                 let deferred = self.int_deferred & val;
-                let i = ridx(INT_STATUS);
-                self.regs[i] &= !val;
+                self.set(INT_STATUS, self.get(INT_STATUS) & !val);
                 self.int_deferred &= !val;
                 self.update_irq();
                 if deferred != 0 {
@@ -629,8 +646,15 @@ impl State {
                     // deferred ones now raises the line again as a real edge,
                     // rather than the single write silently absorbing both.
                     // All three public drivers write back what they read.
-                    self.regs[i] |= deferred;
-                    self.update_irq();
+                    self.set(INT_STATUS, self.get(INT_STATUS) | deferred);
+                    if self.irq_asserted && self.output() {
+                        // Other sources held the pin up through the
+                        // acknowledge: it still takes a fall and a rise.
+                        self.drive(false);
+                        self.drive(true);
+                    } else {
+                        self.update_irq();
+                    }
                 }
             }
             INT_ENABLE => {
@@ -710,22 +734,18 @@ impl State {
     }
 }
 
-/// How the MAC drives its interrupt line: called with each new level.
-type IrqFn = Box<dyn Fn(bool) + Send + Sync>;
-
 /// IOC3's Ethernet.
 ///
-/// Lock order: `link`, then `st`; `irq_order` before `st` and before `irq`. The receive thread delivers a frame into guest memory
+/// Lock order: `link`, then `st`, then the Bridge's (the PCI pin is driven with
+/// `st` held, so the Bridge sees the registers' edges in order; it never calls
+/// back into this device while holding a lock of its own).
+/// The receive thread delivers a frame into guest memory
 /// with `st` held, as a register write does a transmit: the DMA goes down
 /// through the Bridge and HEART, which never call back into this device.
 pub struct Ioc3Eth {
     mac: [u8; 6],
-    thread_prefix: &'static str,
+    core: Arc<Core>,
     st: Mutex<State>,
-    dma: Mutex<Option<Arc<dyn PciDma>>>,
-    irq: Mutex<Option<IrqFn>>,
-    /// Serialises delivery of level changes to the interrupt callback.
-    irq_order: Mutex<()>,
     link: Mutex<Option<crate::net::Rings>>,
     rx_wake: Mutex<Option<Arc<crate::net::Wake>>>,
     /// Between `start` and `stop`; the NAT engine watches it too.
@@ -749,36 +769,18 @@ pub struct Ioc3Eth {
 const RX_IDLE: Duration = Duration::from_secs(60);
 
 impl Ioc3Eth {
-    /// `mac` is the station address the board's one-wire chip carries. The
-    /// guest programs the receive filter itself; this is kept for the
-    /// integrator (`mac()`).
-    pub fn new(mac: [u8; 6]) -> Arc<Self> {
-        Self::with_negotiation_delay(mac, NEGOTIATION_DELAY)
+    /// The MAC a board fits behind `phy`. `mac` is the station address the
+    /// board's one-wire chip carries; the guest programs the receive filter
+    /// itself, and this is kept for the integrator (`mac()`).
+    pub(super) fn new(core: Arc<Core>, mac: [u8; 6], phy: Phy) -> Arc<Self> {
+        Self::with_phy(core, mac, phy.build())
     }
 
-    /// As [`Ioc3Eth::new`], with the PHY's synthetic negotiation delay set.
-    pub fn with_negotiation_delay(mac: [u8; 6], delay: Duration) -> Arc<Self> {
-        Self::with_phy(mac, Box::new(Ics1890::new(PHY_ADDR, delay)), "ip30-eth")
-    }
-
-    /// Fuel uses the DP83843 at management address 1.
-    pub fn new_fuel(mac: [u8; 6]) -> Arc<Self> {
-        Self::with_phy(mac, Box::new(crate::dev::dp83843::Dp83843::new(PHY_ADDR)), "ioc3-eth")
-    }
-
-    /// The Origin 200 System Board's DP83840A, at management address 31.
-    pub fn new_origin200(mac: [u8; 6]) -> Arc<Self> {
-        Self::with_phy(mac, Box::new(crate::dev::dp83840::Dp83840::new(ORIGIN200_PHY_ADDR)), "ioc3-eth")
-    }
-
-    fn with_phy(mac: [u8; 6], phy: Box<dyn MiiPhy>, thread_prefix: &'static str) -> Arc<Self> {
+    fn with_phy(core: Arc<Core>, mac: [u8; 6], phy: Box<dyn MiiPhy>) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             mac,
-            thread_prefix,
-            st: Mutex::new(State::new(phy)),
-            dma: Mutex::new(None),
-            irq: Mutex::new(None),
-            irq_order: Mutex::new(()),
+            core: core.clone(),
+            st: Mutex::new(State::new(phy, core)),
             link: Mutex::new(None),
             rx_wake: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
@@ -806,36 +808,28 @@ impl Ioc3Eth {
     }
 
     /// A machine reset: the MAC's registers and the PHY as at power-on,
-    /// the interrupt dropped. The network link stays. The drop is delivered
-    /// under `irq_order`, so a raise the receive thread was delivering
-    /// lands before it rather than after, which would leave the line high
-    /// with the state saying low.
+    /// the interrupt dropped. The network link stays.
     pub fn reset(&self) {
-        let _order = self.irq_order.lock();
         self.st.lock().power_on();
-        if let Some(cb) = self.irq.lock().as_ref() {
-            cb(false);
-        }
         self.wake_rx();
     }
 
     fn dma(&self) -> Arc<dyn PciDma> {
-        self.dma.lock().clone().unwrap_or_else(|| Arc::new(NullDma))
+        self.core.dma().cloned().unwrap_or_else(|| Arc::new(NullDma))
     }
 
-    /// Deliver queued interrupt level changes, in order, with no lock held
-    /// that the callback could need.
-    fn irq_flush(&self) {
-        let _order = self.irq_order.lock();
-        let events = std::mem::take(&mut self.st.lock().irq_events);
-        if events.is_empty() {
-            return;
-        }
-        if let Some(cb) = self.irq.lock().as_ref() {
-            for level in events {
-                cb(level);
-            }
-        }
+    /// Drive the pin to the level it is at, changed or not: for when the
+    /// pin is first connected or the parent's state was just restored. The
+    /// Bridge ignores a level it already has.
+    pub(super) fn republish(&self) {
+        let st = self.st.lock();
+        st.drive(st.irq_asserted);
+    }
+
+    /// Raise interrupt sources as the receive path does, for tests.
+    #[cfg(test)]
+    pub(super) fn raise_for_test(&self, sources: u32) {
+        self.st.lock().raise_int(sources);
     }
 
     fn send(&self, frames: Vec<Vec<u8>>) {
@@ -880,7 +874,7 @@ impl Ioc3Eth {
     fn spawn_nat(&self) {
         let slot = self.backend.clone();
         let Some(mut engine) = slot.lock().take() else { return };
-        let thread_name = format!("{}-net", self.thread_prefix);
+        let thread_name = "ioc3-eth-net".to_string();
         let t = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
@@ -918,7 +912,6 @@ impl Ioc3Eth {
         for (what, probe) in [
             ("st", (|e: &Ioc3Eth| e.st.is_locked()) as fn(&Ioc3Eth) -> bool),
             ("link", |e| e.link.is_locked()),
-            ("irq_order", |e| e.irq_order.is_locked()),
         ] {
             let me = Arc::downgrade(self);
             crate::locks::register_lock(format!("ioc3-eth::{what}"), move || me.upgrade().is_some_and(|e| probe(&e)));
@@ -971,7 +964,6 @@ impl Ioc3Eth {
                     self.blink(crate::dev::ng1::rex3::Rex3::HB_ENET_RX);
                 }
             }
-            self.irq_flush();
         }
         moved
     }
@@ -987,7 +979,7 @@ impl Device for Ioc3Eth {
         }
         let wake = self.rx_wake.lock().get_or_insert_with(crate::net::Wake::new).clone();
         let (me, running) = (self.me.clone(), self.running.clone());
-        let thread_name = format!("{}-rx", self.thread_prefix);
+        let thread_name = "ioc3-eth-rx".to_string();
         let rx = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || Self::rx_loop(me, running, wake))
@@ -1046,17 +1038,26 @@ impl Drop for Ioc3Eth {
     }
 }
 
-impl Ioc3EthPort for Ioc3Eth {
-    fn read32(&self, off: u32) -> u32 {
+#[cfg(test)]
+impl Ioc3Eth {
+    /// Replace the Octane's transceiver with one whose negotiation ends at
+    /// once, for tests of a whole machine.
+    pub(crate) fn negotiate_at_once(&self) {
+        self.st.lock().phy = Box::new(Ics1890::new(PHY_ADDR, Duration::ZERO));
+    }
+}
+
+impl Ioc3Eth {
+    /// A 32-bit read of the MAC register at `off` in the chip's BAR.
+    pub(super) fn read32(&self, off: u32) -> u32 {
         if !(MAC_CONTROL..=MII_DATA_W).contains(&off) || off & 3 != 0 {
             return 0;
         }
-        let v = self.st.lock().read(off, Instant::now());
-        self.irq_flush();
-        v
+        self.st.lock().read(off, Instant::now())
     }
 
-    fn write32(&self, off: u32, val: u32) {
+    /// A 32-bit write of the MAC register at `off`.
+    pub(super) fn write32(&self, off: u32, val: u32) {
         if !(MAC_CONTROL..=MII_DATA_W).contains(&off) || off & 3 != 0 {
             return;
         }
@@ -1071,16 +1072,9 @@ impl Ioc3EthPort for Ioc3Eth {
             wake |= st.phy.deadline() != before;
         }
         self.send(wire);
-        self.irq_flush();
         if wake {
             self.wake_rx();
         }
-    }
-
-    fn connect(&self, dma: Arc<dyn PciDma>, irq: Box<dyn Fn(bool) + Send + Sync>) {
-        *self.dma.lock() = Some(dma);
-        *self.irq.lock() = Some(irq);
-        self.irq_flush();
     }
 }
 
@@ -1093,7 +1087,12 @@ impl Saveable for Ioc3Eth {
     fn save_state(&self) -> toml::Value {
         let st = self.st.lock();
         StateTable::new()
-            .u32s("regs", &st.regs)
+            .u32s("regs", &{
+                let mut regs = st.regs;
+                regs[ridx(INT_STATUS)] = st.get(INT_STATUS);
+                regs[ridx(INT_ENABLE)] = st.get(INT_ENABLE);
+                regs
+            })
             .u32("int_deferred", st.int_deferred)
             .u16("mii_data", st.mii_data)
             .u16("mii_data_w", st.mii_data_w)
@@ -1117,11 +1116,12 @@ impl Saveable for Ioc3Eth {
             st.rx_timer_armed = field_bool(v, "rx_timer_armed")?;
             st.tx_frames = field_u64(v, "tx_frames")?;
             st.rx_frames = field_u64(v, "rx_frames")?;
-            // Publish the loaded level whatever the line was left at.
-            st.irq_asserted = field_bool(v, "irq_asserted")?;
-            st.irq_events = vec![st.irq_asserted];
+            field_bool(v, "irq_asserted")?;
+            // The pin is where the loaded registers put it, whatever it was
+            // left at.
+            st.irq_asserted = st.output();
+            st.drive(st.irq_asserted);
         }
-        self.irq_flush();
         Ok(())
     }
 }

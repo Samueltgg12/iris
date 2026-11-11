@@ -703,6 +703,9 @@ struct SpaceState {
     bits: u64,
     /// Each CPU's cached view of memory: see [`PpMemSpace::add_cached_view`].
     views: Vec<View>,
+    /// Ranges where a held page may stand with no memory mapped behind it:
+    /// see [`PpMemSpace::allow_unbacked_lines`].
+    unbacked: Vec<(u64, u64)>,
 }
 
 /// One CPU's cached view of memory: a window of its own, with every mapping
@@ -733,12 +736,15 @@ struct OwnBitmap(Box<u64>);
 //     `set_bitmap_sink2` — is reached only from `Physical::remap_banks`, which
 //     the MC invokes synchronously inside the CPU's store to MEMCFG. That is
 //     always a CPU thread, and with several CPUs the others are parked for it
-//     (`smp::World::stop_others`, wired where HEART's descriptors reach memory).
+//     (`smp::World::stop_others`, wired where HEART's descriptors reach memory
+//     and where Bedrock's MD takes a bank configuration write).
 //   * Device threads (MC-DMA, seeq, VINO) reach RAM through `BusDevice` on the
 //     individual `PpMemory` banks. They never touch `PpMemSpace`.
 //   * `hold_line_page`/`release_line_page` run on a CPU thread at a CACHE
 //     instruction and change only that CPU's own view. They read the mapping
 //     list and the bitmap, which only a remap changes, with the others parked.
+//     They never read another view, which its CPU changes meanwhile: each
+//     view puts its own mark on the page's atomic counter (`mark`).
 //   * `mapped_bitmap()` reads the sink and is likewise CPU-thread-only; the
 //     hot-path reader is the CPU's own inline `MipsCore::ppmem_bitmap` field,
 //     which is a plain `u64` and never goes through here.
@@ -777,6 +783,7 @@ impl PpMemSpace {
                 sink2,
                 bits: 0,
                 views: Vec::new(),
+                unbacked: Vec::new(),
             }),
         })
     }
@@ -964,7 +971,7 @@ impl PpMemSpace {
         let st = unsafe { &mut *self.state.get() };
         let gran = granularity() as u64;
         let page = pa & !(gran - 1);
-        if !st.mappings.iter().any(|m| m.at <= page && m.at + m.len >= page + gran) {
+        if !self.backs(page) && !st.unbacked.iter().any(|&(a, b)| page >= a && page + gran <= b) {
             return None;
         }
         let shift = window_shift(st.window);
@@ -975,9 +982,7 @@ impl PpMemSpace {
         if !bitmap_maps_at(st.bits, shift, page) && !st.views[v].held.keys().any(|&p| p >> shift == page >> shift) {
             self.scrub_region_gaps(st, v, page >> shift << shift, 1u64 << shift);
         }
-        if !Self::held_anywhere(st, page) {
-            self.mark(st, page, true);
-        }
+        self.mark(st, page, true);
         let view = &st.views[v];
         let at = unsafe { view.space.base().add(page as usize) };
         let mut bytes = vec![0u8; gran as usize];
@@ -989,6 +994,23 @@ impl PpMemSpace {
         st.views[v].held.insert(page, 1);
         Self::publish_view(st, v);
         Some(true)
+    }
+
+    /// Whether memory is mapped behind the whole page holding `pa`. A page
+    /// [`Self::hold_line_page`] takes without it starts as zeros, for the
+    /// caller to fill.
+    pub fn backs(&self, pa: u64) -> bool {
+        let st = unsafe { &*self.state.get() };
+        let gran = granularity() as u64;
+        let page = pa & !(gran - 1);
+        st.mappings.iter().any(|m| m.at <= page && m.at + m.len >= page + gran)
+    }
+
+    /// Let held pages in `[start, end)` stand with no memory mapped behind
+    /// them: a PROM that keeps its stack and code in cache lines before it
+    /// has set up memory.
+    pub fn allow_unbacked_lines(&self, start: u64, end: u64) {
+        unsafe { (*self.state.get()).unbacked.push((start, end)) };
     }
 
     /// One line of [`Self::hold_line_page`]'s page is no longer valid.
@@ -1005,9 +1027,7 @@ impl PpMemSpace {
             return false;
         }
         st.views[v].held.remove(&page);
-        if !Self::held_anywhere(st, page) {
-            self.mark(st, page, false);
-        }
+        self.mark(st, page, false);
         let _ = unsafe { st.views[v].space.scrub(page as usize, gran as usize) };
         for m in st.mappings.iter().filter(|m| m.at < page + gran && m.at + m.len > page) {
             let _ = self.lay(st, v, m, page.max(m.at), (page + gran).min(m.at + m.len));
@@ -1016,12 +1036,9 @@ impl PpMemSpace {
         true
     }
 
-    fn held_anywhere(st: &SpaceState, page: u64) -> bool {
-        st.views.iter().any(|view| view.held.contains_key(&page))
-    }
-
-    /// A page some view holds carries one `GEN_HELD` in its generation
-    /// counters while memory backs it, so jitv2 does not compile it.
+    /// A page carries one `GEN_HELD` in its generation counters for each
+    /// view that holds it while memory backs it, so jitv2 does not compile
+    /// it until the last view lets go.
     #[cfg_attr(not(feature = "jitv2"), allow(unused_variables))]
     fn mark(&self, st: &SpaceState, page: u64, on: bool) {
         #[cfg(feature = "jitv2")]
@@ -1048,11 +1065,11 @@ impl PpMemSpace {
         result
     }
 
-    /// Every held page's mark, off before a mapping change and on after.
+    /// Every view's marks, off before a mapping change and on after. The
+    /// other CPUs are parked for a remap, so every view can be read.
     fn marks(&self, on: bool) {
         let st = unsafe { &*self.state.get() };
-        let pages: std::collections::BTreeSet<u64> = st.views.iter().flat_map(|v| v.held.keys().copied()).collect();
-        for page in pages {
+        for page in st.views.iter().flat_map(|v| v.held.keys().copied()) {
             self.mark(st, page, on);
         }
     }
@@ -1971,7 +1988,7 @@ mod tests {
         assert_eq!(word(space.window_base(), 0x2040), 0x1234_5678);
         assert_eq!(word(base, 0x2044), 0, "the page does not see later memory writes");
         assert!(!space.release_line_page(v, 0x2040), "one line left");
-        assert_eq!(space.held_line_pages(v), vec![0x2000]);
+        assert_eq!(space.held_line_pages(v), vec![0x2000 & !(granularity() as u64 - 1)], "the host granule");
         assert!(space.release_line_page(v, 0x2080));
         assert!(space.held_line_pages(v).is_empty());
         assert_eq!(word(base, 0x2040), 0x1234_5678, "memory again");
@@ -2036,8 +2053,8 @@ mod tests {
         assert_eq!(*field, 0);
     }
 
-    /// A held page's counter carries one `GEN_HELD` however many views hold
-    /// it, and the mark follows the page to the counter that backs it after
+    /// A held page's counter carries one `GEN_HELD` for each view that holds
+    /// it, and the marks follow the page to the counter that backs it after
     /// a remap, leaving none on the old one.
     #[cfg(feature = "jitv2")]
     #[test]
@@ -2050,14 +2067,86 @@ mod tests {
         let at = || unsafe { space.gen_window_base().add(0x2000 >> 12) as *const AtomicU64 };
         space.hold_line_page(a, 0x2000);
         space.hold_line_page(b, 0x2040);
-        assert_eq!(gen(at()) / GEN_HELD, 1, "one mark for two CPUs");
+        assert_eq!(gen(at()) / GEN_HELD, 2, "a mark for each CPU");
         space.clear_mappings();
         space.map_bank(1, 0, 64 * MB as u64, 64 * MB as u64).unwrap();
-        assert_eq!(gen(at()) / GEN_HELD, 1, "on the counter that backs the page now");
+        assert_eq!(gen(at()) / GEN_HELD, 2, "on the counter that backs the page now");
         assert_eq!(gen(banks[0].gen_ptr(0x2000)) / GEN_HELD, 0, "and off the old one");
         space.release_line_page(a, 0x2000);
         assert_eq!(gen(at()) / GEN_HELD, 1);
         space.release_line_page(b, 0x2040);
         assert_eq!(gen(at()) / GEN_HELD, 0);
+    }
+
+    /// With no memory behind it a page is refused unless the machine allows
+    /// lines there, and then its region is the view's until the page goes.
+    #[test]
+    fn an_unbacked_page_needs_the_machines_leave() {
+        let (space, _banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+        let (v, field) = view_of(&space);
+        assert_eq!(space.hold_line_page(v, 0x10_0000), None);
+        space.allow_unbacked_lines(0, 64 * MB as u64);
+        assert!(!space.backs(0x10_0000));
+        assert_eq!(space.hold_line_page(v, 0x10_0000), Some(true));
+        assert_eq!(*field, 1);
+        assert_eq!(space.mapped_bitmap(), 0, "the shared window is unchanged");
+        assert_eq!(word(space.view_base(v), 0x3ff_fffc), 0, "the region is safe to touch");
+        space.release_line_page(v, 0x10_0000);
+        assert_eq!(*field, 0);
+    }
+
+    /// Two views hold a page before memory is mapped behind it: nothing is
+    /// there to mark. The remap that maps memory gives the page a mark for
+    /// each view, and each view's release takes its own off again.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn an_unbacked_page_is_marked_once_memory_arrives() {
+        use crate::cpu::jitv2::jitv2::GEN_HELD;
+        let (space, _banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+        space.allow_unbacked_lines(0, 64 * MB as u64);
+        let ((a, _fa), (b, _fb)) = (view_of(&space), view_of(&space));
+        let gen = || unsafe { (*(space.gen_window_base().add(0x10_0000 >> 12) as *const AtomicU64)).load(Ordering::Relaxed) };
+        assert_eq!(space.hold_line_page(a, 0x10_0000), Some(true));
+        assert_eq!(space.hold_line_page(b, 0x10_0040), Some(true));
+        assert_eq!(gen() / GEN_HELD, 0, "no memory, no mark");
+        space.map_bank(0, 0, 64 * MB as u64, 64 * MB as u64).unwrap();
+        assert_eq!(gen() / GEN_HELD, 2, "a mark for each view once memory backs the page");
+        space.release_line_page(a, 0x10_0000);
+        assert_eq!(gen() / GEN_HELD, 1);
+        space.release_line_page(b, 0x10_0040);
+        assert_eq!(gen() / GEN_HELD, 0);
+    }
+
+    /// Two CPUs take and give back pages in their own views at once, as
+    /// their cache instructions do while both run. Neither reads the other's
+    /// view, and once both have let go no page keeps a mark.
+    #[test]
+    fn two_views_take_and_give_back_pages_at_once() {
+        let (space, banks) = PpMemSpace::with_bank_sizes(&[64]).unwrap();
+        space.map_bank(0, 0, 64 * MB as u64, 64 * MB as u64).unwrap();
+        let ((a, _fa), (b, _fb)) = (view_of(&space), view_of(&space));
+        let page = granularity() as u64;
+        std::thread::scope(|s| {
+            for v in [a, b] {
+                let space = &space;
+                s.spawn(move || {
+                    for _ in 0..2000 {
+                        for n in 0..64 {
+                            space.hold_line_page(v, n * page);
+                        }
+                        for n in 0..64 {
+                            space.release_line_page(v, n * page);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(space.held_line_pages(a).is_empty() && space.held_line_pages(b).is_empty());
+        #[cfg(feature = "jitv2")]
+        for n in 0..64 {
+            let gen = unsafe { (*banks[0].gen_ptr(n * page)).load(Ordering::Relaxed) };
+            assert!(gen < crate::cpu::jitv2::jitv2::GEN_HELD, "page {n} keeps a mark");
+        }
+        let _ = banks;
     }
 }

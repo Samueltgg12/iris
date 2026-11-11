@@ -1045,6 +1045,14 @@ enum BusErrorOp {
 pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub core: MipsCore,
     pub sysad: Arc<dyn BusDevice>,
+    /// Where the JIT reads code and generation counters, and the bus its
+    /// compile pool is started on: cacheable memory at plain physical
+    /// addresses. The same object as `sysad` unless the board's uncached
+    /// connection decodes a plain address as something other than memory (the
+    /// Fuel's decodes it as Hub-special space, with RAM only in its first
+    /// 256 MiB), in which case [`Self::set_cached_bus`] gives it the view the
+    /// cache fills from.
+    cached_bus: Arc<dyn BusDevice>,
     /// cheritest convention (`--cheritest-dump-hook`): a guest write to CP0 26
     /// dumps machine state via the test device. Off unless asked for — CP0 26
     /// is ECC on a real R4400 and the PROM writes it during cache init.
@@ -1303,6 +1311,15 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// reach EntryLo and come out as physical address bits 32 and up. All
     /// ones (no fold) by default; each machine sets its own.
     pub phys_mask: u64,
+    /// A window of physical addresses the board decodes differently for an
+    /// uncached instruction fetch, `(base, size, target)`: the fetch is
+    /// presented to the bus at `target` plus the offset into the window. The
+    /// Fuel's reset PROM answers uncached fetches at 0x1fc00000 whatever the
+    /// cached view holds there, and gives that device an address of its own,
+    /// so the code page for it is keyed, read and invalidated by address like
+    /// any other. None on the other machines, whose uncached and cached
+    /// instruction fetches reach the same bytes.
+    uncached_fetch_alias: Option<Box<FetchAlias<T, C>>>,
     /// Where the machine has memory, from [`MipsCpuConfig::memory`].
     pub memory: Arc<crate::memory_map::MemoryMap>,
     /// Frames the JIT's page table has, the end of `memory` in pages. Kept
@@ -1424,6 +1441,31 @@ fn translate_64_supervisor<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u
 }
 fn translate_64_user<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
     e.translate_64bit_impl::<false, {crate::cpu::mips_core::PRIV_USER}>(va, at)
+}
+
+/// A window whose uncached instruction fetch the board decodes apart, and the
+/// translation it wraps (`MipsExecutor::set_uncached_fetch_alias`).
+struct FetchAlias<T: Tlb, C: CpuModel> {
+    base: u64,
+    size: u64,
+    target: u64,
+    inner: fn(&mut MipsExecutor<T, C>, u64, AccessType) -> TranslateResult,
+}
+
+/// The translation wrappers above for a board that decodes an uncached
+/// instruction fetch apart. Only a fetch that comes out uncached is changed.
+fn translate_fetch_aliased<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
+    let inner = e.uncached_fetch_alias.as_ref().map_or(translate_32_kernel::<T, C> as fn(&mut MipsExecutor<T, C>, u64, AccessType) -> TranslateResult, |a| a.inner);
+    let mut result = inner(e, va, at);
+    if at == AccessType::Fetch && !result.is_exception() && !result.is_cached() {
+        if let Some(alias) = e.uncached_fetch_alias.as_ref() {
+            let offset = result.phys.wrapping_sub(alias.base);
+            if offset < alias.size {
+                result.phys = alias.target + offset;
+            }
+        }
+    }
+    result
 }
 
 /// Free-standing trampoline for the CP0 Status callback installed by `install_status_cb`.
@@ -1877,7 +1919,7 @@ unsafe extern "C" fn jit_cvt_to_int<T: Tlb, C: CpuModel>(
     rm: u32,
 ) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    cvt_to_int_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER, src_f64 != 0, dst_i64 != 0, rm as u8) as u32
+    cvt_to_int_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, C::SINGLE_CLEARS_UPPER, C::CVT_UNREPRESENTABLE_UNIMPLEMENTED, C::CVT_L_51_BITS, src_f64 != 0, dst_i64 != 0, rm as u8) as u32
 }
 
 /// Single-implementation CVT.S.W/D.W/S.L/D.L — see `cvt_int_to_float_and_commit`'s
@@ -2226,9 +2268,11 @@ fn cvt_f32_to_int_by_value(x: f32, dst_bits: u32) -> (u64, bool, bool) {
         return (max_pos as u64, true, false);
     }
     // x is already integral (post-rounding); out-of-range iff it can't fit
-    // in the destination width at all.
+    // in the destination width at all. `i32::MAX as f32` rounds up to 2^31,
+    // which does not fit, so the word bound is 2^31 exclusive like the long
+    // one below.
     let in_range = if dst_bits == 32 {
-        x >= i32::MIN as f32 && x <= i32::MAX as f32
+        x >= -2147483648.0f32 && x < 2147483648.0f32
     } else {
         // i64::MAX isn't exactly representable in f32/f64; compare against
         // 2^63 (exact in both formats) the same way real hardware's range
@@ -2290,8 +2334,11 @@ fn cvt_f64_to_int_by_value(x: f64, dst_bits: u32) -> (u64, bool, bool) {
 /// D-format (else S); destination is L (else W). `rm`: MIPS FCSR.RM
 /// encoding (0=nearest-even, 1=toward-zero, 2=toward+inf, 3=toward-inf) —
 /// callers pass a fixed mode for ROUND/TRUNC/CEIL/FLOOR or FCSR's live low
-/// 2 bits for plain CVT.W/CVT.L.
-fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool, src_f64: bool, dst_i64: bool, rm: u8) -> bool {
+/// 2 bits for plain CVT.W/CVT.L. `unrep_traps`: an unrepresentable result
+/// takes Unimplemented Operation rather than Invalid
+/// (`CpuModel::CVT_UNREPRESENTABLE_UNIMPLEMENTED`). `l_51`: a long result
+/// outside [-2^51, 2^51) takes Unimplemented Operation (`CpuModel::CVT_L_51_BITS`).
+fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, clears_upper: bool, unrep_traps: bool, l_51: bool, src_f64: bool, dst_i64: bool, rm: u8) -> bool {
     let dst_bits = if dst_i64 { 64 } else { 32 };
     // Inexact is judged against the source, not the rounded intermediate:
     // the by-value helpers only ever see an integral value, so their own
@@ -2311,6 +2358,11 @@ fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
     };
 
     core.fpu_fcsr &= !FCSR_CM;
+    let too_wide = l_51 && dst_i64 && !invalid && !(-(1i64 << 51)..(1i64 << 51)).contains(&(result as i64));
+    if (invalid && unrep_traps) || too_wide {
+        core.fpu_fcsr |= FCSR_CE;
+        return true;
+    }
     let write_result = |core: &mut MipsCore| {
         if dst_i64 {
             if fr1 { core.write_fpr_l(fd_reg, result) } else { write_fpr_l_fr0(core, fd_reg, result) }
@@ -2630,6 +2682,17 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             size * 8, self.core.pc, virt_addr, phys_addr, val, status, self.fault_note(phys_addr, size));
     }
 
+    /// The bus the JIT reads code from and its compile pool is started on.
+    pub fn cached_bus(&self) -> &Arc<dyn BusDevice> {
+        &self.cached_bus
+    }
+
+    /// Give the JIT a cacheable view of memory that differs from `sysad` (see
+    /// the field). A board that does so builds the cache on the same view.
+    pub fn set_cached_bus(&mut self, bus: Arc<dyn BusDevice>) {
+        self.cached_bus = bus;
+    }
+
     /// Create a new executor from a config and a bus (sysad) and a TLB.
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
     pub fn new(sysad: Arc<dyn BusDevice>, mut tlb: T, cfg: &MipsCpuConfig) -> Self
@@ -2785,6 +2848,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
 
         let mut executor = Self {
             core,
+            cached_bus: sysad.clone(),
             sysad,
             cheritest_dump_hook: false,
             tlb,
@@ -2906,6 +2970,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             batch_hook: None,
             phys_alias: None,
             phys_mask: u64::MAX,
+            uncached_fetch_alias: None,
             memory: cfg.memory.clone(),
             #[cfg(feature = "jitv2")]
             jitv2_frames: crate::cpu::jitv2::jitv2::frames_for(&cfg.memory),
@@ -3074,6 +3139,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 core: if self.core.smp || std::env::var_os("IRIS_JIT_PIC").is_some() { None } else { core::num::NonZeroUsize::new(core_addr) },
                 lwr_keeps_upper: C::PARTIAL_LWR_KEEPS_UPPER,
                 single_clears_upper: C::SINGLE_CLEARS_UPPER,
+                cvt_l_51_bits: C::CVT_L_51_BITS,
             };
             *j.jit_consts.lock() = consts;
             // The inline-compile path (`jitv2_compile_inline`) takes this
@@ -3480,7 +3546,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[cfg(feature = "jitv2")]
     pub(crate) fn jitv2_flush_from_here(&mut self, only_if_exhausted: bool) {
         crate::pf_scope!(crate::perfetto::events::JIT_CPU_FLUSH);
-        let bus = self.sysad.clone();
+        let bus = self.cached_bus.clone();
         let jit = self.jitv2.clone();
         let flush = || {
             let mut j = jit.lock();
@@ -3507,6 +3573,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.memory.contains(paddr).then(|| self.jitv2_frame(paddr)).flatten().ok_or_else(|| format!(
             "{:#x} is not in this machine's memory ({}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
             paddr, self.memory))
+    }
+
+    /// The code page the last fetch landed on, or null. For tests.
+    #[cfg(all(test, feature = "jitv2"))]
+    pub fn jitv2_current_page(&self) -> *mut crate::cpu::jitv2::PhysicalCodePage {
+        self.pcp
     }
 
     #[cfg(feature = "jitv2")]
@@ -3556,7 +3628,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline(always)]
     fn jitv2_track_pcp(&mut self, phys_addr: u64) {
         // Code above the JIT's pfn map gets no page and runs in the
-        // interpreter (`step_jit` checks for the null page).
+        // interpreter (`step_jit` checks for the null page). That includes
+        // uncached attributes 1 to 3: their bits 58:57 sit in `phys_addr`,
+        // so the frame range check rejects them.
         let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(phys_addr, self.jitv2_frames) else {
             self.clear_pcp();
             return;
@@ -3622,7 +3696,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let (mut jit, lookup) = {
             crate::pf_scope!(crate::perfetto::events::JIT_CPU_TRACK);
             let mut jit = self.jitv2.lock();
-            let lookup = jit.page_for(pfn, page_base, self.sysad.as_ref(), fr1);
+            let lookup = jit.page_for(pfn, page_base, self.cached_bus.as_ref(), fr1);
             (jit, lookup)
         };
         match lookup {
@@ -3663,7 +3737,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 // exact page this fetch already landed on.
                 self.clear_pcp();
                 let mut jit = self.jitv2.lock();
-                let slot = jit.page_for(pfn, page_base, self.sysad.as_ref(), fr1)
+                let slot = jit.page_for(pfn, page_base, self.cached_bus.as_ref(), fr1)
                     .expect("flush must leave room for at least one page");
                 // Direct assignment for the same borrow reason as the
                 // hit path above; `pfn` is what `set_pcp` would mirror.
@@ -3699,6 +3773,37 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // A partial LWR keeps the upper word below this offset: 3 in 64-bit mode
         // on the R10000 family, else 0.
         self.core.lwr_upper_below = if C::PARTIAL_LWR_KEEPS_UPPER { wide } else { 0 };
+        // A board that decodes an uncached instruction fetch apart wraps the
+        // translation itself, so the fetch paths of the other machines stay
+        // as they are.
+        if C::FETCH_ALIAS && self.uncached_fetch_alias.is_some() {
+            self.wrap_translate_fn(translate_fn);
+        }
+    }
+
+    /// `update_translate_fn`'s choice, wrapped for `uncached_fetch_alias`.
+    /// Out of line so the update itself stays as small as it was; the wrapper
+    /// reaches the choice through a pointer so that the translation bodies keep
+    /// the one caller they inline into.
+    #[cold]
+    #[inline(never)]
+    fn wrap_translate_fn(&mut self, inner: fn(&mut Self, u64, AccessType) -> TranslateResult) {
+        if let Some(alias) = self.uncached_fetch_alias.as_mut() {
+            alias.inner = inner;
+        }
+        self.translate_fn = translate_fetch_aliased::<T, C>;
+    }
+
+    /// Present an uncached instruction fetch of the window `base..base+size`
+    /// to the bus at `target` plus the offset (see [`Self::uncached_fetch_alias`]).
+    pub fn set_uncached_fetch_alias(&mut self, base: u64, size: u64, target: u64) {
+        assert!(C::FETCH_ALIAS, "{} has no uncached fetch alias", C::NAME);
+        // Never called: `update_translate_fn` replaces it below.
+        fn placeholder<T: Tlb, C: CpuModel>(_: &mut MipsExecutor<T, C>, _: u64, _: AccessType) -> TranslateResult {
+            unreachable!("the translation wrapper is installed before it is used")
+        }
+        self.uncached_fetch_alias = Some(Box::new(FetchAlias { base, size, target, inner: placeholder::<T, C> }));
+        self.update_translate_fn();
     }
 
     /// Re-derive `fpr_read_d/write_d/read_l/write_l` from STATUS_FR.
@@ -8154,6 +8259,13 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.handle_exec_complete()
     }
 
+    /// A COP1 format code no format uses, on a part that answers it with
+    /// Unimplemented Operation rather than Reserved Instruction.
+    fn exec_cop1_undefined_format(&mut self, _d: &DecodedInstr) -> ExecStatus {
+        if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
+        self.fpu_unimplemented()
+    }
+
     /// Unimplemented Operation (Cause.E): R4000/VR5000 manuals, ch 7/9.4.6 —
     /// "no Enable bit and no Flag bit; whenever this exception occurs, an
     /// unimplemented exception trap is taken" and "the result register is
@@ -8553,10 +8665,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let tf = ((d.raw >> 16) & 0x1) != 0;
         let cc_value = self.core.get_fpu_cc(cc);
         let taken = cc_value == tf;
-        if taken {
-            let val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-            (self.fpr_write_w)(&mut self.core, fd_reg, (val).to_bits());
-        }
+        self.fmov_s_if(taken, fs_reg, fd_reg);
         if mips_log(MIPS_LOG_FPU) {
             dlog_dev!(LogModule::Mips, "FPU fmov{}.s PC={:016x} cc{}={} taken={}",
                 if tf { "t" } else { "f" }, self.core.pc, cc, cc_value, taken);
@@ -8566,20 +8675,28 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     fn exec_fmovz_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
-        if self.core.read_gpr(ft_reg) == 0 {
-            let val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-            (self.fpr_write_w)(&mut self.core, fd_reg, (val).to_bits());
-        }
+        self.fmov_s_if(self.core.read_gpr(ft_reg) == 0, fs_reg, fd_reg);
         self.handle_exec_complete()
     }
     fn exec_fmovn_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
-        if self.core.read_gpr(ft_reg) != 0 {
-            let val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-            (self.fpr_write_w)(&mut self.core, fd_reg, (val).to_bits());
-        }
+        self.fmov_s_if(self.core.read_gpr(ft_reg) != 0, fs_reg, fd_reg);
         self.handle_exec_complete()
+    }
+    /// The body of MOVF.S, MOVT.S, MOVZ.S and MOVN.S: fd = fs when `taken`.
+    /// The R10000 "always clears the upper 32 bits of the destination register
+    /// even though the condition is false" (R10000 UM v2.0, p. 313), so an
+    /// untaken move still writes fd. NEC U10278EJ4V0UM p. 279 calls that upper
+    /// half "undefined ..., even if no move occurs"; zeroing it on the R12000
+    /// and R14000 too is a model choice.
+    #[inline(always)]
+    fn fmov_s_if(&mut self, taken: bool, fs_reg: u32, fd_reg: u32) {
+        if taken || C::SINGLE_CLEARS_UPPER {
+            let src = if taken { fs_reg } else { fd_reg };
+            let val = (self.fpr_read_w)(&self.core, src);
+            (self.fpr_write_w)(&mut self.core, fd_reg, val);
+        }
     }
     fn exec_frecip_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -8626,7 +8743,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     fn fpu_cvt_to_int(&mut self, fs_reg: u32, fd_reg: u32, src_f64: bool, dst_i64: bool, rm: u8) -> ExecStatus {
         let fr1 = (self.core.cp0_status & STATUS_FR) != 0;
-        if cvt_to_int_and_commit(&mut self.core, fs_reg, fd_reg, fr1, C::SINGLE_CLEARS_UPPER, src_f64, dst_i64, rm) {
+        if cvt_to_int_and_commit(&mut self.core, fs_reg, fd_reg, fr1, C::SINGLE_CLEARS_UPPER, C::CVT_UNREPRESENTABLE_UNIMPLEMENTED, C::CVT_L_51_BITS, src_f64, dst_i64, rm) {
             let s = exec_exception(EXC_FPE);
             self.handle_exception(s)
         } else {
@@ -9375,7 +9492,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             .is_some_and(|c| c.packing_stats().1 > crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         if over_threshold {
             let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.cached_bus.clone()); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
@@ -9397,10 +9514,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             #[cfg(feature = "developer")]
             {
                 let stats = self.jitv2.lock().stats.clone();
-                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen, &stats);
+                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.cached_bus, &mut self.jitv2_inline_analyzer, codegen, &stats);
             }
             #[cfg(not(feature = "developer"))]
-            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen); }
+            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.cached_bus, &mut self.jitv2_inline_analyzer, codegen); }
         }
         *self.jitv2.lock().codegen.lock() = codegen;
         {
@@ -9411,7 +9528,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if ran_out_of_memory {
             let page = unsafe { &mut *self.pcp };
             let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.cached_bus.clone()); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
@@ -10391,6 +10508,10 @@ pub fn decode_into<T: Tlb, C: CpuModel>(ins: &mut DecodedInstr) {
                 FUNCT_FCVT_D => MipsExecutor::<T,C>::exec_fcvt_d_l,
                 _            => MipsExecutor::<T,C>::exec_reserved,
             },
+            // rs 16-31 is a format. The R10000 family takes Unimplemented
+            // Operation for one it lacks, keeping Reserved Instruction for an
+            // undefined rs below 16 (R10000 UM v2.0 p. 357).
+            fmt if C::R10K_FAMILY && fmt & 0x10 != 0 => MipsExecutor::<T,C>::exec_cop1_undefined_format,
             _ => MipsExecutor::<T,C>::exec_reserved,
         },
         // The entire COP1X opcode (LWXC1/LDXC1/SWXC1/SDXC1/PREFX and the
