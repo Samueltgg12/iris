@@ -148,6 +148,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::config::AudioConfig;
 use crate::dev::host_pcm::{CardClock, PcmOut};
+use crate::host_audio::{Meter, Output, Skip};
 use crate::devlog::LogModule;
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
 use crate::pci::{Bar, PciConfig, PciConfigPolicy, PciFunction, PciFunctionState, PciRegisterPolicy, PCI_COMMAND_IO, PCI_INTA};
@@ -324,7 +325,7 @@ pub enum Variant {
 }
 
 impl Variant {
-    fn eeprom_fitted(self) -> bool {
+    fn eeprom_attached(self) -> bool {
         self == Variant::Dm8
     }
 }
@@ -471,7 +472,7 @@ struct State {
 impl State {
     fn new(variant: Variant) -> Self {
         let mut eeprom = [0xff; EEPROM_SIZE];
-        if variant.eeprom_fitted() {
+        if variant.eeprom_attached() {
             eeprom[..EEPROM_IMAGE.len()].copy_from_slice(&EEPROM_IMAGE);
         }
         let mut s = Self {
@@ -514,7 +515,7 @@ impl State {
         self.ccs[CCS_GPIO_MASK_LO as usize] = 0xff;
         self.ccs[CCS_GPIO_MASK_LO as usize + 1] = 0xff;
         self.ccs[CCS_GPIO_MASK_HI as usize] = 0xff;
-        if variant.eeprom_fitted() {
+        if variant.eeprom_attached() {
             self.ccs[CCS_I2C_STATUS as usize] = CCS_I2C_EEPROM;
         }
         self.mt[MT_MASK as usize] = 0xff;
@@ -686,6 +687,8 @@ pub struct Inner {
     /// `[audio]` settings once host output is enabled.
     audio_cfg: Mutex<Option<AudioConfig>>,
     sink: Mutex<Option<PcmOut>>,
+    /// The frames the engines skipped; what they moved is `State::stats`.
+    meter: Arc<Meter>,
     /// Accesses that nothing establishes, counted.
     unexpected: AtomicU64,
     /// The messages behind them, for tests.
@@ -723,7 +726,7 @@ impl Inner {
                 registers: &CONFIG_REGISTERS,
             },
         );
-        let id = if variant.eeprom_fitted() { SUBSYSTEM_DM8 } else { SUBSYSTEM_NO_EEPROM };
+        let id = if variant.eeprom_attached() { SUBSYSTEM_DM8 } else { SUBSYSTEM_NO_EEPROM };
         config.set_subsystem_identity(u32::from(id) << 16 | u32::from(PCI_VENDOR_ICE));
         let pci = PciFunctionState::new(config);
         // The chip powers up with 0xff in the interrupt line.
@@ -737,6 +740,7 @@ impl Inner {
             timers: OnceLock::new(),
             audio_cfg: Mutex::new(None),
             sink: Mutex::new(None),
+            meter: Meter::new("ICE1724", &["analog in", "analog out", "S/PDIF out"]),
             unexpected: AtomicU64::new(0),
             #[cfg(test)]
             seen: Mutex::new(Vec::new()),
@@ -918,7 +922,9 @@ impl Inner {
         };
         let host = crate::host_audio::open_output(&cfg, "ICE1724 audio", channels, rate, "IRIS_ICE1724_AUDIO_CAPTURE");
         crate::dlog!(LogModule::Ice1724, "ice1724: host audio {}", if host.is_some() { "open" } else { "failed to open" });
-        *sink = Some(PcmOut::new(host));
+        let mut out = PcmOut::new(host);
+        out.dump = crate::dev::audio_dump::AudioDump::from_env();
+        *sink = Some(out);
     }
 
     // ---- interrupts ----
@@ -1021,6 +1027,13 @@ impl Inner {
         s.scratch = buf;
     }
 
+    /// Engine `idx` skipped `frames` of its clock (the recording engine is the
+    /// card's analog input, the playback engines its outputs).
+    fn skip(&self, idx: usize, frames: u64) {
+        let output = match idx { ENG_RDMA0 => 0, ENG_PDMAI => 1, ENG_PDMA4 => 2, _ => return };
+        self.meter.skipped(output, Skip::Stale, frames);
+    }
+
     /// Move the frames an engine's clock has made due since its anchor.
     fn advance(&self, s: &mut MutexGuard<'_, State>, idx: usize, now: i64) {
         let frame = s.frame_dwords(idx);
@@ -1030,6 +1043,7 @@ impl Inner {
             // Approximation: a clock jump of more than a second is not
             // replayed through memory; the engine resumes at the present.
             self.note(format_args!("DMA clock jump skipped"));
+            self.skip(idx, due - s.eng[idx].frames);
             s.eng[idx].frames = due;
             return;
         }
@@ -1041,7 +1055,9 @@ impl Inner {
                 // Wait for the guest. Clock time held back past the bound
                 // is dropped, so a late poll does not let it out in one run.
                 let reached = e.anchor + (u128::from(limit) * NS_PER_SEC).div_ceil(u128::from(rate)) as i64;
-                e.anchor += (now - reached - MAX_STEER_BACKLOG_NS).max(0);
+                let dropped = (now - reached - MAX_STEER_BACKLOG_NS).max(0);
+                e.anchor += dropped;
+                self.skip(idx, (u128::from(dropped as u64) * u128::from(rate) / NS_PER_SEC) as u64);
                 limit
             }
             _ => due,
@@ -1184,7 +1200,7 @@ impl Inner {
         let write = cmd & 1 != 0;
         // Approximation: a transfer finishes at once; one nothing answers
         // is logged and leaves the data register alone.
-        if device != EEPROM_I2C_ADDRESS || !self.variant.eeprom_fitted() {
+        if device != EEPROM_I2C_ADDRESS || !self.variant.eeprom_attached() {
             self.note(format_args!("I2C {} of device {device:#04x} has no answer modelled", if write { "write" } else { "read" }));
             return;
         }
@@ -1664,27 +1680,19 @@ impl Device for Ice1724 {
         0
     }
 
-    fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("ice1724".into(), "ICE1724 audio controller: ice1724 status".into())]
-    }
-
-    fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
-        use std::io::Write as _;
-        if cmd != "ice1724" || args != ["status"] {
-            return Err("Usage: ice1724 status".into());
+    fn audio_report(&self) -> Option<String> {
+        let i = &self.inner;
+        let (rates, st) = {
+            let s = i.state.lock();
+            ([ENG_RDMA0, ENG_PDMAI, ENG_PDMA4].map(|idx| s.eng[idx].active.then_some(s.rate)), s.stats)
+        };
+        // The frames moved are the engines' own saved counts, not a second counter.
+        for (output, frames) in [st.capture_frames, st.analog_frames, st.spdif_frames].into_iter().enumerate() {
+            i.meter.set(output, frames);
         }
-        let st = self.stats();
-        let _ = writeln!(
-            w,
-            "frames: analog {} (last dword {:#010x}), S/PDIF {}, capture {}, dropped by the host {}",
-            st.analog_frames, st.analog_last, st.spdif_frames, st.capture_frames, st.dropped_frames
-        );
-        let _ = writeln!(
-            w,
-            "converter writes: front {}, surround {}, refused {}; accesses nothing establishes: {}",
-            st.ak4381_writes, st.ak4355_writes, st.codec_rejects, self.unexpected()
-        );
-        Ok(())
+        let sink = i.sink.lock();
+        let outs: Vec<&Output> = sink.iter().filter_map(|sk| sk.host.as_ref()).collect();
+        Some(i.meter.report(&rates, &outs))
     }
 }
 

@@ -21,6 +21,21 @@ pub use bus::{ScsiBus, ScsiIdentities, ScsiTarget, Targets};
 
 use crate::block_node::{Background, ChangerNode, Removable, BlockNode};
 
+/// Attach the tables of a machine whose Ethernet is built in, and return its scratch
+/// image. A `daynaport` entry is refused, naming `machine`.
+pub fn attach_without_daynaport<'a>(
+    cfg: &crate::config::MachineConfig,
+    table: &str,
+    machine: &str,
+    route: &dyn Fn(u8) -> Result<&'a ScsiBus, String>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let attached = attach_from_config(cfg, Some(table), route)?;
+    match attached.daynaports.first() {
+        Some(d) => Err(format!("{}: kind = \"daynaport\" is not available on the {machine}", crate::config::scsi_label(d.controller, d.id))),
+        None => Ok(attached.scratch),
+    }
+}
+
 /// Get the standard CDB length based on the opcode's group code
 pub fn get_cdb_length(opcode: u8) -> usize {
     let group = (opcode >> 5) & 0x7;
@@ -423,7 +438,7 @@ impl ScsiDevice {
             return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
         }
         let block_size = self.logical_block_size as u32;
-        // FFFFFFFFh tells the host the last LBA does not fit, and to ask READ
+        // FFFFFFFFh tells the host the last LBA is too large, and to ask READ
         // CAPACITY(16). A last LBA of exactly FFFFFFFFh gets the same answer,
         // as the host could not tell it from that marker.
         let last_lba = (self.size() / self.logical_block_size).saturating_sub(1).min(u64::from(u32::MAX)) as u32;
@@ -601,7 +616,7 @@ impl ScsiDevice {
         let block_desc: Vec<u8> = if dbd {
             vec![]
         } else {
-            // All ones when the count does not fit the field.
+            // All ones when the count exceeds the field.
             let total_blocks = (self.size() / self.logical_block_size).min(0x00ff_ffff) as u32;
             vec![
                 0x00,                               // density code
@@ -1907,7 +1922,7 @@ mod tests {
         (ScsiDevice::new(Box::new(node), false, "sparse".into(), Vec::new(), identity), last_write)
     }
 
-    /// Past 2 TiB the last LBA does not fit READ CAPACITY(10)'s four bytes.
+    /// Past 2 TiB the last LBA is beyond READ CAPACITY(10)'s four bytes.
     /// It answers FFFFFFFFh, which tells the host to ask READ CAPACITY(16).
     #[test]
     fn a_disk_over_2_tib_answers_read_capacity_16() {
@@ -1942,7 +1957,7 @@ mod tests {
     }
 
     /// MODE SENSE's block descriptor holds the block count in three bytes; a
-    /// count that does not fit reads as all ones, not as its low 24 bits.
+    /// count that is beyond the field reads as all ones, not as its low 24 bits.
     #[test]
     fn mode_sense_saturates_the_block_count() {
         let (mut dev, _) = sparse_disk(3u64 << 31);

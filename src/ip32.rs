@@ -462,7 +462,7 @@ pub struct Ip32Bus {
     /// what the driver asked it for.
     pub scsi: Mutex<Vec<Arc<crate::dev::aic7880::Aic7880>>>,
     /// The NVMe card in the "PCI option" slot (`[nvme]`), set once when
-    /// the machine fits it.
+    /// the machine attaches it.
     pub nvme: std::sync::OnceLock<Arc<crate::dev::nvme::Nvme>>,
 }
 
@@ -831,6 +831,10 @@ impl crate::traits::Device for Ip32Bus {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         self.devices().iter().flat_map(|d| d.register_commands()).collect()
+    }
+
+    fn audio_report(&self) -> Option<String> {
+        self.devices().iter().find_map(|d| d.audio_report())
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {

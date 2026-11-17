@@ -737,6 +737,25 @@ fn fewer_slots_play_on_their_own_speakers() {
     }
 }
 
+/// The recorder holds the front pair of each frame the card made, at the
+/// card's rate, whatever width the host stream folds it to.
+#[test]
+fn the_dump_holds_the_front_pair_whatever_the_host_width() {
+    for host_channels in [8, 2] {
+        let r = rig(Variant::Dm8);
+        let tap = tapped(&r, host_channels);
+        let (dump, bytes) = crate::dev::audio_dump::tests::dump();
+        r.sink.lock().as_mut().unwrap().dump = Some(dump);
+        fill_slot_numbers(&r, 8);
+        mt_wl(&r, 0x10, BUFFER as u32);
+        mt_ww(&r, 0x14, 959);
+        mt_wb(&r, 0x18, 0x01);
+        step(&r, 1_000_000);
+        assert_eq!(tap.lock().len(), 48 * host_channels);
+        assert_eq!(bytes.records(), [(48000, vec![(0x100, 0x200); 48])], "{host_channels} host channels");
+    }
+}
+
 #[test]
 fn a_stereo_host_gets_a_downmix_of_all_eight_slots() {
     let r = rig(Variant::Dm8);
@@ -1063,6 +1082,7 @@ fn a_long_look_away_is_not_replayed_through_memory() {
     step(&r, 3_000_000_000);
     assert_eq!(r.stats().analog_frames, 48, "the frames of the gap were skipped");
     assert!(seen(&r, "DMA clock jump skipped"));
+    assert!(r.audio_report().unwrap().contains("skipped: stale 144000,"), "and counted");
     step(&r, 1_000_000);
     assert_eq!(r.stats().analog_frames, 96, "and the clock goes on from the present");
 }
@@ -1440,22 +1460,9 @@ fn the_monitor_reports_what_the_engines_did() {
     program_playback(&r);
     mt_wb(&r, 0x18, 0x01);
     step(&r, 5_000_000);
-    struct Out(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Out {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-    r.execute_command("ice1724", &["status"], Box::new(Out(buf.clone()))).unwrap();
-    let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert!(text.contains("analog 240 (last dword 0x010001df)"), "{text}");
-    assert!(r.execute_command("ice1724", &[], Box::new(Out(buf))).is_err());
-    assert_eq!(r.register_commands().len(), 1);
+    let text = r.audio_report().unwrap();
+    assert!(text.contains("analog out: 240 moved, guest rate 48000 Hz"), "{text}");
+    assert!(r.register_commands().is_empty(), "audio status is the monitor's");
 }
 
 // ---- save and restore ----

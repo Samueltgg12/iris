@@ -75,6 +75,16 @@ hashes are given where a change is easiest to understand by reading the commit.
   default); `[audio] channels` sets its speakers. [Guide](docs/tezro-ip53.md)
 - Onyx2: MediaIO sound no longer drops every other second, panics the kernel
   on the first sound, or makes the driver report "RAD UST not incrementing".
+- The monitor's `audio status` lists every sound card (HAL2, MACE audio,
+  RAD1, ICE1724): frames moved and skipped (stale, dry, ring full) and the
+  host stream's counts. It replaces `hal2 status` and `ice1724 status`.
+- `[audio] file` now holds the card's frames exactly at 48 kHz and converts
+  them at a fixed ratio otherwise. A host too slow to keep the guest at full
+  speed leaves gaps in the file.
+- `IRIS_AUDIO_DUMP=FILE` records what any sound card plays at the card's own
+  rate, before conversion, with no sound device needed (layout in
+  `src/dev/audio_dump.rs`). It replaces `IRIS_O2_AUDIO_DUMP` and
+  `IRIS_OCTANE_AUDIO_WAV`.
 
 ### Origin 3200
 

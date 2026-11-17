@@ -217,7 +217,7 @@ impl O2Machine {
         // The NVMe card, in the "PCI option" slot.
         if !cfg.nvme.path.is_empty() {
             let card = crate::dev::nvme::Card::open(&cfg.nvme)?;
-            card.fit(bus.mace.pci.bus(), crate::dev::mace_pci::IP32_OPTION_SLOT);
+            card.attach(bus.mace.pci.bus(), crate::dev::mace_pci::IP32_OPTION_SLOT);
             let _ = bus.nvme.set(card.nvme);
         }
         let scratch_path = attached.scratch;
@@ -262,6 +262,9 @@ impl O2Machine {
         let memory = Arc::new(crate::ip32::memory_map());
         let cpu: Arc<dyn CpuDevice> = crate::with_cpu!(part, true, true, C =>
             Self::build_cpu::<C>(memory.clone(), sysad, &timer_manager, arcs_fpu, count_hz, boot.clone(), part.prid()));
+        let world = Arc::new(crate::cpu::smp::World::new());
+        world.set_slots(vec![cpu.park_slot()]);
+        bus.ram.set_world(world);
 
         // ppmem: the CPU's cache and the JIT reach RAM through a cached view
         // of the memory's window, publishing its bitmap into the CPU's own
@@ -288,6 +291,7 @@ impl O2Machine {
         // geometry once, as it starts, and without the windows that geometry
         // has no inline load or store path.
         #[cfg(feature = "jitv2")]
+<<<<<<< HEAD
         {
             let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
             let jit = cpu.jitv2();
@@ -306,6 +310,9 @@ impl O2Machine {
                 crate::cpu::jitv2::jitv2::start_compiling(&*cpu, &jit, cfg.jitv2.compile, bus.phys.clone() as Arc<dyn BusDevice>);
             }
         }
+=======
+        crate::cpu::jitv2::jitv2::attach_pool(&cpu, cfg.jitv2_pool_size(), cfg.jitv2.compile, bus.phys.clone(), None);
+>>>>>>> d4fea4a20c85d08504aa03046b62cdde0e13f62c
 
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.mace.ust.use_host_clock();
@@ -1359,7 +1366,7 @@ mod drop_tests {
     /// `[nvme]` puts a card in the "PCI option" slot and records its disk;
     /// the bus's disk flush reaches its namespace.
     #[test]
-    fn an_nvme_card_is_fitted_in_the_option_slot() {
+    fn an_nvme_card_is_attached_in_the_option_slot() {
         let dir = scratch("o2-nvme");
         let disk = dir.join("nvme.raw");
         std::fs::write(&disk, vec![0u8; 1 << 20]).unwrap();
