@@ -1,0 +1,300 @@
+{
+  "version": 1,
+  "thoughts": [],
+  "pinnedFiles": [
+    {
+      "path": "/home/samuel/.config/Code - OSS/Workspaces/1788899757273/workspace.json",
+      "pinnedBy": "auto:editor",
+      "pinnedAt": 1794877156911,
+      "auto": "recent-edit",
+      "expiresAt": 1794880756911
+    },
+    {
+      "path": "/home/samuel/iris/.gitignore",
+      "pinnedBy": "auto:backfill",
+      "pinnedAt": 1794877157175,
+      "auto": "recent-edit",
+      "expiresAt": 1794880757174
+    },
+    {
+      "path": "/home/samuel/iris/src/workstation.rs",
+      "pinnedBy": "auto:backfill",
+      "pinnedAt": 1794877157175,
+      "auto": "recent-edit",
+      "expiresAt": 1794880757174
+    },
+    {
+      "path": "/home/samuel/iris/src/window_map.rs",
+      "pinnedBy": "auto:backfill",
+      "pinnedAt": 1794877157175,
+      "auto": "recent-edit",
+      "expiresAt": 1794880757174
+    },
+    {
+      "path": "/home/samuel/iris/src/xtalk.rs",
+      "pinnedBy": "auto:backfill",
+      "pinnedAt": 1794877157175,
+      "auto": "recent-edit",
+      "expiresAt": 1794880757174
+    },
+    {
+      "path": "/home/samuel/iris/src/traits.rs",
+      "pinnedBy": "auto:backfill",
+      "pinnedAt": 1794877157175,
+      "auto": "recent-edit",
+      "expiresAt": 1794880757174
+    },
+    {
+      "path": "/home/samuel/iris/src/sn/tests.rs",
+      "pinnedBy": "auto:backfill",
+      "pinnedAt": 1794877157175,
+      "auto": "recent-edit",
+      "expiresAt": 1794880757174
+    },
+    {
+      "path": "/home/samuel/iris/wsl/verify-phase3.ps1",
+      "pinnedBy": "auto:backfill",
+      "pinnedAt": 1794877157175,
+      "auto": "recent-edit",
+      "expiresAt": 1794880757174
+    },
+    {
+      "path": "/home/samuel/iris/wsl/run-iris-premiere.bat",
+      "pinnedBy": "auto:backfill",
+      "pinnedAt": 1794877157175,
+      "auto": "recent-edit",
+      "expiresAt": 1794880757174
+    },
+    {
+      "path": "/home/samuel/iris/CLAUDE.md",
+      "pinnedBy": "auto:spec",
+      "note": "Claude Code instructions",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/iris-audio/CLAUDE.md",
+      "pinnedBy": "auto:spec",
+      "note": "Claude Code instructions (iris-audio)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/AGENTS.md",
+      "pinnedBy": "auto:spec",
+      "note": "Multi-agent instructions",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/iris-audio/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (iris-audio)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/wsl/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (wsl)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/third_party/winit-0.30.13/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (third_party/winit-0.30.13)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/third_party/block-0.1.6/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (third_party/block-0.1.6)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/test/dhrystone/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (test/dhrystone)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/test/tftp/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (test/tftp)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/test/memstress/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (test/memstress)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/irix-extract/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (irix-extract)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/cpu-tests/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (cpu-tests)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/iris-hostgl/tools/khronos/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (iris-hostgl/tools/khronos)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/cpu-tests/oracle/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (cpu-tests/oracle)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/iris-gui/locales/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (iris-gui/locales)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/docs/graphics/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (docs/graphics)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/docs/datasheets/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (docs/datasheets)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/src/dev/odyssey/testdata/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (src/dev/odyssey/testdata)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/bench/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (bench)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/bench/prebuilt/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (bench/prebuilt)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/src/dev/ng1/testdata/README.md",
+      "pinnedBy": "auto:spec",
+      "note": "Project README (src/dev/ng1/testdata)",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    },
+    {
+      "path": "/home/samuel/iris/cpu-tests/PLAN.md",
+      "pinnedBy": "auto:spec",
+      "note": "Spec: cpu-tests/PLAN.md",
+      "pinnedAt": 1794877162205,
+      "auto": "spec",
+      "role": "spec"
+    }
+  ],
+  "skills": [
+    {
+      "id": "claude-skill.irix-kernel-debug",
+      "name": "irix-kernel-debug",
+      "description": ">-",
+      "status": "ENABLED",
+      "source": "auto",
+      "sourceUri": "/home/samuel/iris/.claude/skills/irix-kernel-debug/SKILL.md",
+      "origin": "claude-skill",
+      "scope": "workspace",
+      "updatedAt": 1794877182289
+    },
+    {
+      "id": "claude-skill.irix-inst-packaging",
+      "name": "irix-inst-packaging",
+      "description": ">-",
+      "status": "ENABLED",
+      "source": "auto",
+      "sourceUri": "/home/samuel/iris/.claude/skills/irix-inst-packaging/SKILL.md",
+      "origin": "claude-skill",
+      "scope": "workspace",
+      "updatedAt": 1794877182289
+    },
+    {
+      "id": "claude-skill.irix-guest-loop",
+      "name": "irix-guest-loop",
+      "description": ">-",
+      "status": "ENABLED",
+      "source": "auto",
+      "sourceUri": "/home/samuel/iris/.claude/skills/irix-guest-loop/SKILL.md",
+      "origin": "claude-skill",
+      "scope": "workspace",
+      "updatedAt": 1794877182289
+    },
+    {
+      "id": "claude-skill.irix-gfx-loop",
+      "name": "irix-gfx-loop",
+      "description": ">-",
+      "status": "ENABLED",
+      "source": "auto",
+      "sourceUri": "/home/samuel/iris/.claude/skills/irix-gfx-loop/SKILL.md",
+      "origin": "claude-skill",
+      "scope": "workspace",
+      "updatedAt": 1794877182289
+    }
+  ],
+  "updatedAt": 1794877182289
+}

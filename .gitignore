@@ -43,3 +43,4 @@ pcp_dump_pfn_*.bin
 data/proms/*
 !data/proms/*.deflate
 !data/proms/proms.toml
+.copilot-specs-cache/
