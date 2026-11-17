@@ -1,0 +1,46 @@
+CHANGELOG.md
+  h_29152101935181 400-401,403-405
+FEATURES.md
+  h_29152101935181 422,647,1049-1050
+HACKING.md
+  h_29152101935181 356,1185-1188
+HELP.md
+  h_29152101935181 776,903
+clanker/INDEX.md
+  h_29152101935181 70
+clanker/jitv2/compile-pool-size-on-small-hosts.md
+  h_29152101935181 3-5,32-34,41-44,51-52,74,91-125,130,133-134,139-144
+clanker/jitv2/jit-v2-design.md
+  h_29152101935181 25-29
+debug.md
+  h_29152101935181 311
+docs/octane-ip30-multiprocessor.md
+  h_29152101935181 18-19
+docs/tezro-ip53.md
+  h_29152101935181 356-357
+iris-gui-README.md
+  h_29152101935181 224
+iris-gui/locales/en/config.ftl
+  h_29152101935181 67
+iris-gui/src/config_ui.rs
+  h_29152101935181 2022-2023
+iris-gui/src/machines.rs
+  h_29152101935181 501-502
+src/config.rs
+  h_29152101935181 1803-1805,1851-1864,1871-1874,1877,2463,3246-3248,3257-3258,4929-4934,4942-4948,4950,4956-4957
+src/cpu/jitv2/jitv2.rs
+  h_29152101935181 3100-3102
+wsl/README.md
+  h_29152101935181 40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dff27ca929a9988549ee68f1a1832df2470f3c0a",
+  "prompts": {},
+  "humans": {
+    "h_29152101935181": {
+      "author": "Samueltgg12 <samuelhjf4@gmail.com>"
+    }
+  }
+}
