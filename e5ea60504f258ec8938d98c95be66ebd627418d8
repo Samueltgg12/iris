@@ -1,0 +1,14 @@
+.gitignore
+  h_29152101935181 24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e5ea60504f258ec8938d98c95be66ebd627418d8",
+  "prompts": {},
+  "humans": {
+    "h_29152101935181": {
+      "author": "Samueltgg12 <samuelhjf4@gmail.com>"
+    }
+  }
+}
