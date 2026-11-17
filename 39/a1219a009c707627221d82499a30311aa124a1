@@ -1,0 +1,30 @@
+CHANGELOG.md
+  h_29152101935181 46-51
+HACKING.md
+  h_29152101935181 768-776
+clanker/INDEX.md
+  h_29152101935181 435
+clanker/perf/window-presents-only-what-changed.md
+  h_29152101935181 1-59
+src/compositor.rs
+  h_29152101935181 39-42,50-61,75-79,106-112,120-122,296-304,331-333,337-338,343-344,351-396
+src/dev/mgras/disp.rs
+  h_29152101935181 280-286
+src/dev/mgras/frame.rs
+  h_29152101935181 588-629,635-683
+src/gl_compositor.rs
+  h_29152101935181 198-204,232-234,484-501,519-520,677-678,682-683,727-728
+src/ui.rs
+  h_29152101935181 144-148,417-422,424-432,454,456-458,469-471,478-479,491,524-526,617-619,654-657,689-692,699-702,717,725-726,777-778,1253
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "39a1219a009c707627221d82499a30311aa124a1",
+  "prompts": {},
+  "humans": {
+    "h_29152101935181": {
+      "author": "Samueltgg12 <samuelhjf4@gmail.com>"
+    }
+  }
+}
